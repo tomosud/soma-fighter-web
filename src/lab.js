@@ -43,7 +43,7 @@ const camera = stage.camera;
 const worker = new Worker(new URL('./infer.worker.js', import.meta.url), { type: 'module' });
 const scheduler = new Scheduler(rig, worker);
 
-const settings = { vmax: 2.4, stiff: 2.6, physics: true, feedback: true, balance: true, gaze: true, breath: true };
+const settings = { vmax: 2.4, stiff: 2.6, physics: true, feedback: true, balance: true, gaze: true, breath: true, lead: true };
 for (const [id, key, fmt] of [['vmax', 'vmax', v => v.toFixed(1)], ['stiff', 'stiff', v => v.toFixed(1)], ['physics', 'physics']]) {
   const el = $(id);
   const read = () => { settings[key] = el.type === 'checkbox' ? el.checked : Number(el.value); if ($(`${id}-v`)) $(`${id}-v`).textContent = fmt(settings[key]); };
@@ -376,12 +376,15 @@ function harvestReaction(frames, key) {
   reactions.set(key, list);
   showLibrary();
 }
-/** Move the upper body part of the way toward a stored reaction of the same kind (legs and placement stay). */
+const TRUNK_UP = ['Spine1', 'Spine2', 'Chest', 'Neck1', 'Neck2', 'Head'].map(n => I[n]);
+const ARM_JOINTS = side => ['Shoulder', 'Arm', 'ForeArm', 'Hand'].map(n => I[side + n]);
+/** Move the trunk (and the grabbed arm) part of the way toward a stored reaction of the same kind. */
 function blendReaction(pose, key, w = 0.35) {
   const list = key && reactions.get(key);
   if (!list?.length) return pose;
   const L = toLocal(pose), Lr = toLocal(list[Math.floor(Math.random() * list.length)]);
-  for (const j of REACT_JOINTS) L[j].slerp(Lr[j], w);
+  const joints = drag?.part.endsWith('Hand') ? [...TRUNK_UP, ...ARM_JOINTS(sideOf(drag.part))] : TRUNK_UP;
+  for (const j of joints) L[j].slerp(Lr[j], w);
   const out = fromLocal(pose.root, L);
   if (pose.contact) out.contact = pose.contact;
   return out;
@@ -424,7 +427,7 @@ function gaze(p, L, weight = 1) {
 function horizonFor(stretch, moving) {
   if (ctrl.stumble > 0) return 0.55;
   if (!drag) return moving ? 0.9 : 1.2;
-  return clamp(0.5 + 0.45 * stretch, 0.5, 1.4);
+  return stretch > 0 ? clamp(0.55 + 0.45 * stretch, 0.55, 1.4) : 0.45; // in reach: get there soon
 }
 function tokensFor(horizon) {
   const k = Math.round((horizon * FPS + 6) / 4);
@@ -446,10 +449,28 @@ function planTarget(pose, walking, key = null) {
   let p = pose;
   if (drag && !walking) p = blendReaction(p, key);
   p = withDeviation(p);
-  if (drag) p = reach(p, drag.part, drag.point);
+  if (drag?.part.endsWith('Hand') && drag.freeArm && !walking) p = holdFreeArm(p);
+  if (drag) p = reach(p, drag.part, leadPoint);
   if (drag || look.detached) { p = clonePose(p); gaze(p, look.smooth); p = rig.fixRigid(p); }
   if (pose.contact) p.contact = pose.contact;
   return p;
+}
+
+/** The arm that is not being pulled goes back to how it was when the pull began (SOMA tends to bring both). */
+function holdFreeArm(pose) {
+  const L = toLocal(pose);
+  drag.freeArm.joints.forEach((j, k) => L[j].slerp(drag.freeArm.local[k], 0.8));
+  const out = fromLocal(pose.root, L);
+  if (pose.contact) out.contact = pose.contact;
+  return out;
+}
+
+// where the pointer will be when the target is reached (now + latency + horizon), at most 45 cm ahead
+let leadPoint = new Vector3();
+function lead(horizon) {
+  leadPoint = drag.point.clone();
+  if (drag.vel && settings.lead) leadPoint.add(drag.vel.clone().multiplyScalar(scheduler.latency + horizon).clampLength(0, 0.45));
+  leadPoint.y = Math.max(0.02, leadPoint.y);
 }
 
 let lastKey = null;
@@ -459,6 +480,7 @@ function locoReq(mode = 'now') {
     build(tr, a, ctx) {
       const from = ctx[3];
       const horizon = horizonFor(ctrl.stretch, ctrl.vel.length() > 0.3);
+      if (drag) lead(horizon);
       const path = predict(from, horizon);
       const end = path[0];
       const speed = end.vel.length();
@@ -484,8 +506,9 @@ function locoReq(mode = 'now') {
       }
       ghostPose = free ? null : targets[0];
       const standingPull = drag && speed < 0.3;
+      // an arm reaching in place moves faster than a walking body: play those motions a little quicker
       return {
-        targets, tokens: tokensFor(horizon), rate: 1, tag: { kind: free ? 'idle' : 'move' }, fixEnd: !free,
+        targets, tokens: tokensFor(horizon), rate: standingPull ? 1.3 : 1, tag: { kind: free ? 'idle' : 'move' }, fixEnd: !free,
         after: (_tr, _a, frames) => { harvest(frames); if (standingPull) harvestReaction(frames, key); },
       };
     },
@@ -592,6 +615,7 @@ canvas.addEventListener('pointerdown', e => {
     const h = handles.find(x => x.mesh === hit.object);
     const pos = h.mesh.position.clone();
     drag = { part: h.part, point: pos.clone(), sent: null, screen: { x: e.clientX, y: e.clientY }, height: pos.y, ground: e.shiftKey, offset: new Vector3() };
+    drag.freeArm = freeArmOf(h.part);
     // keep the plane's offset from the hips along the camera's view so it starts through the grabbed part
     const view = camera.getWorldDirection(new Vector3()).setY(0).normalize();
     drag.offset = view.multiplyScalar(flat(pos.clone().sub(shownP[0])).dot(view));
@@ -609,6 +633,12 @@ canvas.addEventListener('pointermove', e => {
   lookKnob.scale.setScalar(hit?.object === lookKnob ? 1.4 : 1);
   canvas.style.cursor = hit ? 'grab' : '';
 });
+function freeArmOf(part) {
+  if (!part.endsWith('Hand')) return null;
+  const joints = ARM_JOINTS(otherSide(sideOf(part)));
+  const L = toLocal(shown);
+  return { joints, local: joints.map(j => L[j].clone()) };
+}
 const release = () => {
   if (drag) planTimer = 0;
   drag = null;
@@ -733,6 +763,11 @@ function deviationSize() {
 
 function simulate(dt) {
   if (drag && !drag.scripted) { const pt = pointOn(drag); if (pt) drag.point.copy(pt); }
+  if (drag) { // how fast the pointer moves (smoothed): targets aim where it will be when SOMA gets there
+    drag.vel ??= new Vector3();
+    if (drag.prev) drag.vel.lerp(drag.point.clone().sub(drag.prev).divideScalar(dt), 1 - Math.exp(-dt * 8));
+    drag.prev = drag.point.clone();
+  }
   look.yaw += wrap(rig.heading(shownP) - look.yaw) * (1 - Math.exp(-dt * 3));
   if (lookDrag) {
     const pt = pointOn(lookDrag);
@@ -745,7 +780,7 @@ function simulate(dt) {
   if (scheduler.ready && !track.busy) {
     const moving = ctrl.vel.length() > 0.05 || ctrl.want.length() > 0.05;
     const pointerMoved = drag && (!drag.sent || drag.sent.distanceTo(drag.point) > 0.04);
-    const pushed = deviation && Math.abs(deviationSize() - lastPlannedDev) > 0.04; // the physics expects a new lean
+    const pushed = deviation && Math.abs(deviationSize() - lastPlannedDev) > 0.08; // the physics expects a clearly new lean
     if ((moving || pointerMoved || pushed || lookDrag) && planTimer <= 0) {
       if (drag) drag.sent = drag.point.clone();
       lastPlannedDev = deviationSize();
@@ -898,7 +933,7 @@ if (params.has('debug')) {
     track, scheduler, simulate, settings, ctrl, library, reactions, rig, stage, look, cascade, ragdoll, get planned() { return planned; }, get deviation() { return deviation; }, get pushedUntil() { return pushedUntil; }, get clock() { return clock; },
     get shownP() { return shownP; }, get drag() { return drag; },
     // a scripted pull: `point` is used as is (no screen ray)
-    pull(part, point) { drag = part ? { part, point, sent: null, scripted: true } : null; if (!part) planTimer = 0; },
+    pull(part, point) { drag = part ? { part, point, sent: null, scripted: true, freeArm: freeArmOf(part) } : null; if (!part) planTimer = 0; },
     draw: () => frame(performance.now()),
   };
 }
