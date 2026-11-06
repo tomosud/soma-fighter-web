@@ -18,7 +18,7 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { Quaternion, Vector3 } from 'three';
 import { Rig, placePose, clonePose, emptyBatch, encodeRequest, FPS } from './soma.js';
-import { rotateSubtree, twoBoneIK, KeyBook } from './poses.js';
+import { rotateSubtree, setWorldRot, twoBoneIK, KeyBook } from './poses.js';
 import { Track, Scheduler, BATCH } from './motion.js';
 import { Stage, Mannequin } from './render.js';
 import { Ragdoll } from './ragdoll.js';
@@ -203,6 +203,9 @@ function showLibrary() {
     el.insertAdjacentHTML('beforeend', `<span>${b.name}</span><div class="bar"><div class="fill" style="width:${Math.min(100, (n / (PER_KEY * 8)) * 100)}%"></div></div><span class="n">${n}</span>`);
   });
   el.insertAdjacentHTML('beforeend', `<span>引かれた反応</span><div class="bar"><div class="fill" style="width:${Math.min(100, (nr / 96) * 100)}%"></div></div><span class="n">${nr}</span>`);
+  let nb = 0;
+  if (typeof poseBook !== 'undefined') for (const v of poseBook.values()) nb += v.length;
+  el.insertAdjacentHTML('beforeend', `<span>作ったポーズ</span><div class="bar"><div class="fill" style="width:${Math.min(100, (nb / 64) * 100)}%"></div></div><span class="n">${nb}</span>`);
 }
 
 // ---------------------------------------------------------------- the leash
@@ -210,15 +213,18 @@ function showLibrary() {
 const ctrl = { vel: new Vector3(), want: new Vector3(), stretch: 0, stumble: 0 };
 const SLACK = { LeftHand: 0.5, RightHand: 0.5, Hips: 0.12, Head: 0.3, LeftFoot: 0.9, RightFoot: 0.9 };
 const ANCHOR = { LeftHand: 'LeftArm', RightHand: 'RightArm', Hips: 'Hips', Head: 'Head', LeftFoot: 'LeftLeg', RightFoot: 'RightLeg' };
+// a little past the slack the body first steps toward the pull (a lunge), and only further away it walks
+const STEP_BAND = 0.15;
 
 function pullVelocity(P) {
   ctrl.stretch = 0;
-  if (!drag || drag.struck || isKick()) return new Vector3();
+  if (!drag || drag.struck || isKick() || holding()) return new Vector3();
   const d = flat(drag.point.clone().sub(P[I[ANCHOR[drag.part]]]));
   const stretch = d.length() - SLACK[drag.part];
   ctrl.stretch = Math.max(0, stretch);
-  if (stretch <= 0) return new Vector3();
-  return d.normalize().multiplyScalar(Math.min(settings.vmax, stretch * settings.stiff));
+  const band = drag.part.endsWith('Foot') ? 0 : STEP_BAND;
+  if (stretch <= band) return new Vector3();
+  return d.normalize().multiplyScalar(Math.min(settings.vmax, (stretch - band) * settings.stiff));
 }
 
 function approach(v, want, dt) {
@@ -265,10 +271,11 @@ function predict(anchorPose, horizon) {
  * arm, then the collarbone, the spine and the hips (feet stay where they are, knees bend), the other arm swinging
  * the other way. `walking` leaves the hips and legs to the gait.
  */
-function cascade(src, part, G, walking = false) {
+function cascade(src, part, G, walking = false, opt = {}) {
   const p = clonePose(src);
   let P = rig.positions(p);
-  const feet = [P[I.LeftFoot].clone(), P[I.RightFoot].clone()];
+  const feet = opt.feet ?? [P[I.LeftFoot].clone(), P[I.RightFoot].clone()];
+  const seed = opt.seed ?? { k: 1, crouch: 1, spread: 1 };
   const fwd = facing(P);
   if (part.endsWith('Hand')) {
     const side = sideOf(part), arm = chain(side, ARM), sh = I[side + 'Shoulder'];
@@ -290,12 +297,12 @@ function cascade(src, part, G, walking = false) {
         p.root.x += d.x; p.root.z += d.z;
         p.root.y += clamp(d.y * 1.2, -0.3, 0.02);
       }
-      if (G.y < 0.8) p.root.y -= Math.min(0.38, (0.8 - G.y) * 0.75); // reaching low: knees bend
+      if (G.y < 0.8) p.root.y -= Math.min(0.38, (0.8 - G.y) * 0.75 * seed.crouch); // reaching low: knees bend
       legsTo(p, feet);
     }
     const k2 = clamp(ex + 0.25, 0, 0.6); // the other arm balances
     const pull = flat(G.clone().sub(P[0]));
-    if (k2 > 0 && pull.lengthSq() > 1e-6) rotateSubtree(rig, p, I[otherSide(side) + 'Arm'], new Quaternion().setFromAxisAngle(new Vector3().crossVectors(UP, pull.normalize()), 0.6 * k2));
+    if (k2 > 0 && pull.lengthSq() > 1e-6) rotateSubtree(rig, p, I[otherSide(side) + 'Arm'], new Quaternion().setFromAxisAngle(new Vector3().crossVectors(UP, pull.normalize()), 0.6 * k2 * seed.spread));
     P = rig.positions(p);
     const to = G.clone().sub(P[arm[0]]);
     const tip = to.length() > reach * 0.995 ? P[arm[0]].clone().addScaledVector(to.normalize(), reach * 0.995) : G.clone();
@@ -310,12 +317,12 @@ function cascade(src, part, G, walking = false) {
       p.root.y -= 0.04 * lift;
     }
     const away = flat(P[leg[0]].clone().sub(G));
-    if (away.lengthSq() > 1e-6) rotateSubtree(rig, p, I.Spine1, new Quaternion().setFromAxisAngle(new Vector3().crossVectors(UP, away.normalize()), 0.3 * lift));
-    for (const [s2, sign] of [['Left', 1], ['Right', -1]]) rotateSubtree(rig, p, I[s2 + 'Arm'], new Quaternion().setFromAxisAngle(fwd, sign * 0.45 * lift));
+    if (away.lengthSq() > 1e-6) rotateSubtree(rig, p, I.Spine1, new Quaternion().setFromAxisAngle(new Vector3().crossVectors(UP, away.normalize()), 0.3 * lift * seed.k));
+    for (const [s2, sign] of [['Left', 1], ['Right', -1]]) rotateSubtree(rig, p, I[s2 + 'Arm'], new Quaternion().setFromAxisAngle(fwd, sign * 0.45 * lift * seed.spread));
     if (!walking) legsTo(p, side === 'Left' ? [feet[0], feet[1]] : [feet[0], feet[1]]);
     P = rig.positions(p);
     const goal = G.clone();
-    goal.y = clamp(goal.y, ANKLE, P[leg[0]].y - 0.12);
+    goal.y = clamp(goal.y, ANKLE, P[leg[0]].y + 0.1); // a held leg can come up to about the hips
     const reach = reachOf(P, leg) * 0.98;
     const to = goal.clone().sub(P[leg[0]]);
     const tip = to.length() > reach ? P[leg[0]].clone().addScaledVector(to.normalize(), reach) : goal;
@@ -347,6 +354,33 @@ function cascade(src, part, G, walking = false) {
     }
   }
   return rig.fixRigid(p);
+}
+
+/**
+ * The pose at the grab, carried to where the body stands now and facing as it does now. The cascade is applied to
+ * this (not to SOMA's last frame), so leaning and crouching do not pile up from one plan to the next.
+ */
+function neutralBase(from) {
+  const s = drag.start;
+  const dy = wrap(rig.heading(rig.positions(from)) - rig.heading(rig.positions(s)));
+  const t = placePose(s, dy, flat(s.root), flat(from.root).sub(flat(s.root)));
+  // a hand, the head or a foot pulled from a crouch: the base stands up (the cascade bends the knees again if needed)
+  if (drag.part !== 'Hips') t.root.y = Math.max(t.root.y, HIPS_Y - 0.03);
+  return t;
+}
+const feetOf = pose => { const P = rig.positions(pose); return [P[I.LeftFoot].clone(), P[I.RightFoot].clone()]; };
+/** Mix the whole-body cascade (weight w) into a target, the feet kept where the target has them. */
+function cascadeMix(pose, from, part, G, w) {
+  if (w <= 0) return pose;
+  const feet = feetOf(pose);
+  const c = cascade(neutralBase(from), part, G, false, { feet, seed: drag.seed });
+  const L = toLocal(pose), Lc = toLocal(c);
+  L.forEach((q, j) => q.slerp(Lc[j], w));
+  const out = fromLocal(pose.root.clone().lerp(c.root, w), L);
+  legsTo(out, feet);
+  const res = rig.fixRigid(out);
+  if (pose.contact) res.contact = pose.contact;
+  return res;
 }
 
 // ---------------------------------------------------------------- reach (the grabbed limb only)
@@ -418,6 +452,69 @@ function blendReaction(pose, key, w = 0.35) {
   return out;
 }
 
+// Poses made by pulling: when the pointer has been held still for a moment and SOMA's body has settled, that frame is kept by what was
+// pulled, which way (relative to the body) and how high. A later pull of the same kind starts its target from a mix
+// of them: the trunk of one, the free arms of another. What SOMA makes from that can be kept again, so poses grow
+// out of poses. Only balanced, grounded, not-stooped frames are kept, and a new one replaces its nearest neighbour.
+const poseBook = new Map();
+const BOOK_PER_KEY = 8;
+function bookKey(part, P, G) {
+  const d = flat(G.clone().sub(P[I[ANCHOR[part]]]));
+  const dir = d.length() < 0.15 ? 'c' : (Math.round(wrap(Math.atan2(d.x, d.z) - rig.heading(P)) / (Math.PI / 4)) + 8) % 8;
+  const lo = part.endsWith('Foot') ? [0.35, 0.7] : [0.75, 1.45];
+  return `${part}:${dir}:${G.y < lo[0] ? 'lo' : G.y < lo[1] ? 'mid' : 'hi'}`;
+}
+const FEAT_PARTS = ['LeftHand', 'RightHand', 'LeftFoot', 'RightFoot', 'Head'].map(n => I[n]);
+function featOf(canon) {
+  const P = rig.positions(canon);
+  return [canon.root.y, ...FEAT_PARTS.flatMap(j => { const v = P[j].clone().sub(P[0]); return [v.x, v.y, v.z]; })];
+}
+const featDist = (a, b) => Math.sqrt(a.reduce((s2, x, k) => s2 + (x - b[k]) ** 2, 0));
+function poseOk(pose) {
+  const P = rig.positions(pose);
+  if (P.some(v => !Number.isFinite(v.x + v.y + v.z))) return false;
+  if (trunkLean(P) > 35 * Math.PI / 180) return false;
+  if (pose.root.y < HIPS_Y - 0.45 || pose.root.y > HIPS_Y + 0.06) return false;
+  if (Math.min(P[I.LeftFoot].y, P[I.RightFoot].y) > ANKLE + 0.05) return false; // one foot on the floor at least
+  return flat(P[I.LeftFoot].clone().sub(P[I.RightFoot])).length() < 0.9;
+}
+function keepPose(key, pose) {
+  if (!key || !poseOk(pose)) return false;
+  const canon = canonicalize([pose])[0];
+  const entry = { pose: canon, feat: featOf(canon), uses: 0 };
+  const list = poseBook.get(key) ?? [];
+  let near = -1, nd = Infinity;
+  list.forEach((e, k) => { const d = featDist(e.feat, entry.feat); if (d < nd) { nd = d; near = k; } });
+  if (near >= 0 && nd < 0.12) { list[near].uses++; return false; } // nearly the same pose as one already kept
+  if (list.length < BOOK_PER_KEY) list.push(entry); else list[near] = entry;
+  poseBook.set(key, list);
+  showLibrary();
+  return true;
+}
+/** Mix kept poses into a target: the trunk (and the grabbed arm) of one of the same kind, the free arms of another. */
+function bookSeed(pose, key, w, grabbedArm = true) {
+  const list = key && poseBook.get(key);
+  if (!list?.length || !drag) return pose;
+  if (drag.seedKey !== key) { // chosen once per kind of pull within a grab (no flicker between re-plans)
+    const same = [...poseBook].filter(([k]) => k.startsWith(drag.part + ':')).flatMap(([, v]) => v);
+    const a = list[Math.floor(Math.random() * list.length)];
+    const b = same[Math.floor(Math.random() * same.length)];
+    a.uses++;
+    drag.seedKey = key; drag.seedPair = [a, b];
+  }
+  const [a, b] = drag.seedPair;
+  const L = toLocal(pose), La = toLocal(a.pose), Lb = toLocal(b.pose);
+  const grabbed = drag.part.endsWith('Hand') ? sideOf(drag.part) : null;
+  for (const j of TRUNK_UP) L[j].slerp(La[j], w);
+  for (const side of ['Left', 'Right']) {
+    if (side === grabbed && !grabbedArm) continue;
+    for (const j of ARM_JOINTS(side)) L[j].slerp((side === grabbed ? La : Lb)[j], w);
+  }
+  const out = fromLocal(pose.root, L);
+  if (pose.contact) out.contact = pose.contact;
+  return out;
+}
+
 // ---------------------------------------------------------------- kicks
 
 // Left-right mirror (swap Left*/Right* joints, reflect across the body's plane; the rest pose maps to itself), so the
@@ -432,9 +529,76 @@ function mirror(pose) {
   return rig.fixRigid({ root: new Vector3(-pose.root.x, pose.root.y, pose.root.z), rot });
 }
 
-/** A foot pulled up above the knee is a kick. */
+/**
+ * A foot lifted fast is a kick (once it is above the knee); lifted at an ordinary pace it is held: it follows the
+ * pointer and the body balances on the other leg. Decided once each time the foot leaves the floor.
+ */
 const KICK_Y = 0.3;
-const isKick = () => !!drag && drag.part.endsWith('Foot') && drag.point.y > KICK_Y;
+const FOOT_LIFT = ANKLE + 0.1;
+const KICK_FAST = 1.5; // m/s of the pointer
+const isKick = () => !!drag && drag.part.endsWith('Foot') && drag.footMode === 'kick' && drag.point.y > KICK_Y;
+const holding = () => !!drag && !drag.struck && drag.footMode === 'hold';
+function footMode() {
+  if (!drag?.part.endsWith('Foot') || drag.struck) return;
+  const y = drag.point.y;
+  if (!drag.footMode) { if (y > FOOT_LIFT) drag.footMode = (drag.fast ?? 0) > KICK_FAST ? 'kick' : 'hold'; return; }
+  if (y < ANKLE + 0.04) { drag.footMode = null; return; } // back on the floor: the next lift decides again
+  // lifted fast but stopped low: hold it after all
+  if (drag.footMode === 'kick' && y <= KICK_Y && drag.vel.length() < 0.3) drag.footMode = 'hold';
+}
+
+/** The held foot: weight over the other foot (which stays put), the leg on the pointer, arms and trunk balancing. */
+function holdTarget(from, part, G) {
+  const feet = feetOf(from);
+  let t = cascade(neutralBase(from), part, G, false, { feet, seed: drag.seed });
+  // the upper body partly SOMA's own (so it stays alive), partly a pose it made before for this kind of pull
+  const L = toLocal(t), Lf = toLocal(from);
+  for (const j of [...TRUNK_UP, ...ARM_JOINTS('Left'), ...ARM_JOINTS('Right')]) L[j].slerp(Lf[j], 0.3);
+  t = fromLocal(t.root, L);
+  t = bookSeed(t, bookKey(part, rig.positions(from), G), 0.35, false);
+  t = clonePose(t);
+  gaze(t, look.smooth);
+  return rig.fixRigid(t);
+}
+function holdReq(mode = 'now') {
+  return {
+    kind: 'move', mode,
+    build(tr, a, ctx) {
+      if (!holding()) return locoReq(mode).build(tr, a, ctx);
+      const t = holdTarget(ctx[3], drag.part, drag.point);
+      ghostPose = t;
+      return { targets: [t], tokens: mode === 'now' ? [6, 7] : [9, 10, 11], rate: 1, tag: { kind: 'move' } };
+    },
+  };
+}
+/** Letting go of a held foot: it is put down under where it is (a comfortable stance), and stays there. */
+function placeFootReq(part, start) {
+  return {
+    kind: 'idle', mode: 'now', interrupt: true,
+    build(tr, a, ctx) {
+      const from = ctx[3];
+      const P = rig.positions(from);
+      const side = sideOf(part), support = otherSide(side) + 'Foot';
+      const sp = P[I[support]].clone(), fp = P[I[part]];
+      let off = flat(fp.clone().sub(sp));
+      const right = new Vector3().crossVectors(facing(P), UP);
+      if (off.length() < 1e-3) off = right.clone().multiplyScalar(side === 'Right' ? 1 : -1);
+      const spot = sp.clone().add(off.clone().setLength(clamp(off.length(), 0.2, 0.6)));
+      spot.y = sp.y;
+      const p = clonePose(from);
+      const mid = flat(sp).lerp(flat(spot), 0.5);
+      p.root.set(mid.x, start.root.y, mid.z);
+      legsTo(p, side === 'Left' ? [spot, sp] : [sp, spot]);
+      // the foot that comes down lands flat, as it was before it was lifted
+      const dy = rig.heading(P) - rig.heading(rig.positions(start));
+      setWorldRot(rig, p, I[part], new Quaternion().setFromAxisAngle(UP, dy).multiply(start.rot[I[part]]));
+      const L = toLocal(p), Ls = toLocal(start);
+      L[I[side + 'ToeBase']].copy(Ls[I[side + 'ToeBase']]);
+      ghostPose = null;
+      return { targets: [fromLocal(p.root, L)], tokens: [8, 9, 10], rate: 1, tag: { kind: 'idle' } };
+    },
+  };
+}
 
 /**
  * A kick toward G: a kick key (mid or high by height, mirrored for the left foot), turned so its kick points at G,
@@ -565,15 +729,37 @@ function freeTarget(pos, yaw) {
  * A target made from one of SOMA's own frames: a stored reaction mixed in, the body's response the (unseen)
  * physics predicts, the grabbed limb reaching, and the gaze. SOMA makes every frame in between.
  */
-function planTarget(pose, walking, key = null) {
+function planTarget(pose, walking, key = null, from = null) {
   let p = pose;
   if (drag && !walking) p = blendReaction(p, key);
+  if (drag && !walking && from) {
+    p = bookSeed(p, bookKey(drag.part, rig.positions(from), drag.point), 0.3);
+    if (!drag.part.endsWith('Foot')) p = cascadeMix(p, from, drag.part, leadPoint, clamp(0.5 * drag.seed.k, 0.3, 0.7));
+  }
   p = withDeviation(p);
   if (drag?.part.endsWith('Hand') && drag.freeArm && !walking) p = holdFreeArm(p);
   if (drag) p = reach(p, drag.part, leadPoint);
   if (drag || look.detached) { p = clonePose(p); gaze(p, look.smooth); p = rig.fixRigid(p); }
   if (pose.contact) p.contact = pose.contact;
   return p;
+}
+
+/** One step toward dir: the foot nearer the pull goes out (farther the harder the pull), the hips follow half way. */
+function stepToward(from, dir, stretch) {
+  if (dir.lengthSq() < 1e-6) return from;
+  dir = dir.clone().normalize();
+  const P = rig.positions(from);
+  const feet = feetOf(from);
+  const k = flat(P[I.LeftFoot]).dot(dir) - flat(P[I.RightFoot]).dot(dir) >= 0 ? 0 : 1; // the one already ahead
+  const len = clamp(0.22 + 1.4 * stretch, 0.22, 0.5);
+  feet[k].addScaledVector(dir, len);
+  const p = clonePose(from);
+  p.root.addScaledVector(dir, len * 0.5);
+  p.root.y = Math.min(p.root.y, drag.start.root.y) - 0.04 - 0.1 * clamp(stretch / STEP_BAND, 0, 1); // the front knee bends
+  legsTo(p, feet);
+  const out = rig.fixRigid(p);
+  if (from.contact) out.contact = from.contact;
+  return out;
 }
 
 /** The arm that is not being pulled goes back to how it was when the pull began (SOMA tends to bring both). */
@@ -639,7 +825,14 @@ function locoReq(mode = 'now') {
       } else if (drag || look.detached || deviation) {
         // standing: SOMA's own current pose, moved along the short path, shaped by the pull
         const h0 = rig.heading(rig.positions(from));
-        targets = path.map(p => planTarget(placePose(from, wrap(p.yaw - h0), flat(from.root), flat(p.pos).sub(flat(from.root))), false, key));
+        let base = from;
+        // pulled a little past the slack: one step toward the pull (a lunge), at most once a second and only when
+        // the pointer moved (not while it is held still)
+        if (mode === 'now' && drag && !drag.part.endsWith('Foot') && ctrl.stretch > 0.03 && clock - (drag.steppedAt ?? -9) > 1) {
+          base = stepToward(from, flat(drag.point.clone().sub(rig.positions(from)[I[ANCHOR[drag.part]]])), ctrl.stretch);
+          drag.steppedAt = clock;
+        }
+        targets = path.map(p => planTarget(placePose(base, wrap(p.yaw - h0), flat(from.root), flat(p.pos).sub(flat(from.root))), false, key, from));
       } else {
         targets = [freeTarget(end.pos, end.yaw)];
         free = true;
@@ -758,6 +951,7 @@ canvas.addEventListener('pointerdown', e => {
     drag = { part: h.part, point: pos.clone(), sent: null, screen: { x: e.clientX, y: e.clientY }, height: pos.y, ground: e.shiftKey, offset: new Vector3() };
     drag.freeArm = freeArmOf(h.part);
     drag.start = clonePose(shown);
+    drag.seed = grabSeed();
     // keep the plane's offset from the hips along the camera's view so it starts through the grabbed part
     const view = camera.getWorldDirection(new Vector3()).setY(0).normalize();
     drag.offset = view.multiplyScalar(flat(pos.clone().sub(shownP[0])).dot(view));
@@ -775,6 +969,8 @@ canvas.addEventListener('pointermove', e => {
   lookKnob.scale.setScalar(hit?.object === lookKnob ? 1.4 : 1);
   canvas.style.cursor = hit ? 'grab' : '';
 });
+// how this grab tends to move (fixed within a grab, different each time): how far the body gives, crouches, balances
+const grabSeed = () => ({ k: rand(0.7, 1.3), crouch: rand(0.6, 1.5), spread: rand(0.5, 1.5) });
 function freeArmOf(part) {
   if (!part.endsWith('Hand')) return null;
   const joints = ARM_JOINTS(otherSide(sideOf(part)));
@@ -782,7 +978,14 @@ function freeArmOf(part) {
   return { joints, local: joints.map(j => L[j].clone()) };
 }
 let settleTo = null, settleUntil = 0;
-function releaseFoot() { if (drag?.part.endsWith('Foot') && drag.start && !drag.struck) settleTo = drag.start; }
+let placeFoot = null;
+function releaseFoot() {
+  if (!drag?.part.endsWith('Foot') || !drag.start || drag.struck) return;
+  if (drag.footMode === 'hold') {
+    keepPose(bookKey(drag.part, shownP, drag.point), shown);
+    placeFoot = { part: drag.part, start: drag.start };
+  } else settleTo = drag.start;
+}
 /** Back to the pose SOMA had before the foot was pulled, where the body is now and facing as it does now. */
 function settleReq(start, mode = 'now') {
   return {
@@ -841,6 +1044,7 @@ let pushedUntil = 0;
 const TRUNK = new Set(['Hips', 'Spine1', 'Spine2', 'Chest', 'LeftLeg', 'LeftShin', 'LeftFoot', 'LeftToeBase', 'RightLeg', 'RightShin', 'RightFoot', 'RightToeBase'].map(n => I[n]));
 const LEGS = new Set(['LeftLeg', 'LeftShin', 'LeftFoot', 'LeftToeBase', 'RightLeg', 'RightShin', 'RightFoot', 'RightToeBase'].map(n => I[n]));
 function measureDeviation(anim, body) {
+  if (holding()) { deviation = null; return; } // standing on one leg on purpose: nothing to recover from
   if (drag || ctrl.stumble > 0) pushedUntil = clock + 1.0;
   if (!settings.feedback || clock > pushedUntil) { deviation = null; return; }
   const La = toLocal(anim), Lb = toLocal(body);
@@ -894,11 +1098,11 @@ function outside(p, pts) {
   for (let i = 0; i < H.length; i++) d = Math.min(d, segDist(H[i], H[(i + 1) % H.length]));
   return Math.max(0, d - 0.03);
 }
-let stumbleWait = 0;
+let stumbleWait = 0, placedAt = -9;
 function balance(dt) {
   stumbleWait -= dt;
   ctrl.stumble -= dt;
-  if (!settings.physics || !settings.balance || stumbleWait > 0 || isKick()) return;
+  if (!settings.physics || !settings.balance || stumbleWait > 0 || isKick() || holding() || clock - placedAt < 0.8) return;
   const pts = ragdoll.support();
   if (!pts.length) return;
   const { pos, vel } = ragdoll.com();
@@ -932,6 +1136,8 @@ function simulate(dt) {
       const raw = drag.point.clone().sub(drag.prev).divideScalar(dt);
       drag.vel.lerp(raw, 1 - Math.exp(-dt * 8));
       drag.peak = Math.max(drag.peak ?? 0, raw.length()); // fastest the pointer has moved since the grab
+      drag.vf = (drag.vf ?? new Vector3()).lerp(raw, 1 - Math.exp(-dt * 20));
+      drag.fast = Math.max(drag.vf.length(), (drag.fast ?? 0) * Math.exp(-dt * 3)); // recent top speed
     }
     drag.prev = drag.point.clone();
   }
@@ -944,7 +1150,9 @@ function simulate(dt) {
   ctrl.want.copy(pullVelocity(shownP));
   approach(ctrl.vel, ctrl.want, dt);
   planTimer -= dt; idleTimer -= dt;
-  // a foot pulled above the knee kicks (one shot)
+  footMode();
+  keepWhenStill(dt);
+  // a foot lifted fast kicks once it is above the knee (one shot)
   if (scheduler.ready && drag && !drag.struck) {
     // a kick is aimed once the foot's pull has (nearly) arrived: when the pointer stops, or a quarter second after
     // it passed the knee
@@ -957,12 +1165,14 @@ function simulate(dt) {
     }
   }
   if (scheduler.ready && settleTo && !drag) { track.request(settleReq(settleTo)); settleTo = null; idleTimer = 2.5; settleUntil = clock + 1.2; }
+  if (scheduler.ready && placeFoot && !drag) { track.request(placeFootReq(placeFoot.part, placeFoot.start)); placeFoot = null; idleTimer = 3; settleUntil = clock + 1.0; placedAt = clock; }
   // while the foot comes down after a kick, nothing re-plans from the raised leg
   if (scheduler.ready && !track.busy && !drag?.struck && (drag || clock >= settleUntil)) {
     const moving = ctrl.vel.length() > 0.05 || ctrl.want.length() > 0.05;
     // re-plan when where the target would aim has moved (the pointer, or its lead as a flick slows down and stops)
-    const aimNow = drag ? drag.point.clone().add((drag.vel ?? new Vector3()).clone().multiplyScalar(scheduler.latency + 0.5).clampLength(0, 0.45)) : null;
-    const pointerMoved = drag && (!drag.sent || drag.sent.distanceTo(aimNow) > 0.04);
+    const hold = holding();
+    const aimNow = drag ? (hold ? drag.point.clone() : drag.point.clone().add((drag.vel ?? new Vector3()).clone().multiplyScalar(scheduler.latency + 0.5).clampLength(0, 0.45))) : null;
+    const pointerMoved = drag && (!drag.sent || drag.sent.distanceTo(aimNow) > (hold ? 0.06 : 0.04));
     const pushed = !isKick() && deviation && Math.abs(deviationSize() - lastPlannedDev) > 0.08; // the physics expects a clearly new lean
     // walking steadily, plans follow the steps: one at each foot strike (or at once when the heading turns), so the
     // footing is never swapped in the middle of a step
@@ -974,8 +1184,11 @@ function simulate(dt) {
       if (drag) drag.sent = aimNow;
       stepStrike = false;
       lastPlannedDev = deviationSize();
-      track.request(!moving && !drag && lookDrag ? idleReq('now') : locoReq('now'));
-      planTimer = 0.18 + 0.12 * Math.min(1, ctrl.stretch);
+      track.request(hold ? holdReq('now') : !moving && !drag && lookDrag ? idleReq('now') : locoReq('now'));
+      planTimer = hold ? 0.3 : 0.18 + 0.12 * Math.min(1, ctrl.stretch);
+    } else if (drag && !moving) {
+      // held still: keep SOMA going from the same kind of target (it holds the pose, alive) instead of freezing
+      if (track.remaining / FPS < scheduler.latency + 0.3) track.request(hold ? holdReq('end') : locoReq('end'));
     } else if (!moving && !drag) {
       if (track.remaining / FPS < scheduler.latency + 0.3) track.request(idleReq('end'));
       else if (idleTimer <= 0) { track.request(idleReq('now', true)); idleTimer = rand(2.5, 5); }
@@ -998,6 +1211,24 @@ function simulate(dt) {
     measureDeviation(shown, planned);
     balance(dt);
   } else deviation = null;
+}
+
+/** The pointer held still and SOMA's body settled: keep that frame in the pose book (once per stop). */
+let prevP = null, bodyMotion = 0;
+function keepWhenStill(dt) {
+  if (prevP) {
+    const m = FEAT_PARTS.reduce((a, j) => a + shownP[j].distanceTo(prevP[j]), shownP[0].distanceTo(prevP[0])) / dt;
+    bodyMotion += (m - bodyMotion) * (1 - Math.exp(-dt * 6));
+  }
+  prevP = shownP.map(v => v.clone());
+  if (!drag || drag.struck || isKick()) return;
+  drag.still = (drag.vel?.length() ?? 1) < 0.1 ? (drag.still ?? 0) + dt : 0;
+  if (drag.still === 0) drag.kept = false;
+  // (SOMA's standing body always sways a little: about 0.5-1.3 m/s summed over the hips, hands, feet and head)
+  if (!drag.kept && drag.still > 0.9 && bodyMotion < 1.5 && ctrl.vel.length() < 0.1) {
+    keepPose(bookKey(drag.part, shownP, drag.point), shown);
+    drag.kept = true;
+  }
 }
 
 function frame(now) {
@@ -1123,9 +1354,10 @@ requestAnimationFrame(frame);
 if (params.has('debug')) {
   window.lab = {
     track, scheduler, simulate, settings, ctrl, library, reactions, rig, mirror, kickTarget, camera, stage, look, cascade, ragdoll, get planned() { return planned; }, get deviation() { return deviation; }, get pushedUntil() { return pushedUntil; }, get clock() { return clock; },
-    get shownP() { return shownP; }, get drag() { return drag; },
+    get shownP() { return shownP; }, get drag() { return drag; }, get bodyMotion() { return bodyMotion; },
     // a scripted pull: `point` is used as is (no screen ray)
-    pull(part, point) { if (!part) releaseFoot(); drag = part ? { part, point, sent: null, scripted: true, freeArm: freeArmOf(part), start: clonePose(shown) } : null; if (!part) planTimer = 0; },
+    pull(part, point) { if (!part) releaseFoot(); drag = part ? { part, point, sent: null, scripted: true, freeArm: freeArmOf(part), start: clonePose(shown), seed: grabSeed() } : null; if (!part) planTimer = 0; },
+    poseBook,
     draw: () => frame(performance.now()),
   };
 }
