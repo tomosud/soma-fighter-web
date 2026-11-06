@@ -320,7 +320,19 @@ function cascade(src, part, G, walking = false) {
 
 // ---------------------------------------------------------------- gaze
 
-const look = { detached: false, point: new Vector3(0, 1.6, 1.2), smooth: new Vector3(0, 1.6, 1.2) };
+// `detached`: the knob was moved and keeps its place relative to the body (left, height above the hips, ahead),
+// measured on a smoothed body facing so the gait's sway does not shake it
+const look = { detached: false, local: new Vector3(0, 0.6, 1.2), point: new Vector3(0, 1.6, 1.2), smooth: new Vector3(0, 1.6, 1.2), yaw: 0 };
+const bodyAxes = yaw => ({ fwd: new Vector3(Math.sin(yaw), 0, Math.cos(yaw)), left: new Vector3(Math.cos(yaw), 0, -Math.sin(yaw)) });
+function lookToLocal(pt, hips) {
+  const { fwd, left } = bodyAxes(look.yaw);
+  const d = pt.clone().sub(hips);
+  return new Vector3(d.dot(left), d.y, d.dot(fwd));
+}
+function lookFromLocal(local, hips) {
+  const { fwd, left } = bodyAxes(look.yaw);
+  return hips.clone().addScaledVector(left, local.x).addScaledVector(fwd, local.z).setY(hips.y + local.y);
+}
 
 /** Turn the head (45%), neck (30%) and chest (25%) toward L, as far as a person would. */
 function gaze(p, L, weight = 1) {
@@ -394,7 +406,7 @@ function locoReq(mode = 'now') {
   };
 }
 
-/** Standing: shift the weight a little, or turn on the feet toward where the eyes look. */
+/** Standing: shift the weight a little now and then. */
 function idleReq(mode = 'end', fidget = false) {
   return {
     kind: 'idle', mode,
@@ -403,10 +415,6 @@ function idleReq(mode = 'end', fidget = false) {
       const h = rig.heading(rig.positions(from));
       const A = flat(from.root);
       let yaw = h;
-      const L = look.point;
-      const toLook = Math.atan2(L.x - A.x, L.z - A.z);
-      const d = wrap(toLook - h);
-      if (look.detached && Math.abs(d) > 1.2) yaw = h + d - Math.sign(d) * 0.45; // turn the body, the head does the rest
       if (fidget) { yaw += rand(-0.12, 0.12); const ang = rand(0, Math.PI * 2); A.add(new Vector3(Math.sin(ang), 0, Math.cos(ang)).multiplyScalar(rand(0.02, 0.06))); }
       ghostPose = null;
       return { targets: [freeTarget(A, yaw)], tokens: [10, 11, 12, 13, 14], rate: 1, fixEnd: false, tag: { kind: 'idle' } };
@@ -436,7 +444,7 @@ const handles = HANDLE_PARTS.map(part => {
   scene.add(mesh);
   return { part, mesh };
 });
-// gaze knob colours: cyan = in front of the face (follows the body), pink = fixed in space
+// gaze knob colours: cyan = straight ahead, pink = a direction kept relative to the body
 const LOOK_FRONT = 0x7fe3ff, LOOK_FIXED = 0xff7ad9;
 const lookKnob = new THREE.Mesh(new THREE.SphereGeometry(0.07, 16, 12), new THREE.MeshBasicMaterial({ color: LOOK_FRONT, depthTest: false, transparent: true, opacity: 0.85 }));
 lookKnob.renderOrder = 10;
@@ -607,15 +615,19 @@ function overlay(base, contact, dt) {
 
 const STEP = 1 / 60;
 let acc = 0, last = performance.now(), fpsAcc = 0, fpsN = 0, fps = 0;
-let planTimer = 0, idleTimer = 3, turnTimer = 0;
+let planTimer = 0, idleTimer = 3;
 
 function simulate(dt) {
   if (drag && !drag.scripted) { const pt = pointOn(drag); if (pt) drag.point.copy(pt); }
-  if (lookDrag) { const pt = pointOn(lookDrag); if (pt) look.point.copy(pt); }
-  if (!look.detached) look.point.copy(shownP[I.Head]).add(facing(shownP).multiplyScalar(1.2)).setY(shownP[I.Head].y - 0.05);
+  look.yaw += wrap(rig.heading(shownP) - look.yaw) * (1 - Math.exp(-dt * 3));
+  if (lookDrag) {
+    const pt = pointOn(lookDrag);
+    if (pt) { look.point.copy(pt); look.local.copy(lookToLocal(pt, shownP[0])); }
+  } else if (look.detached) look.point.copy(lookFromLocal(look.local, shownP[0]));
+  else look.point.copy(shownP[I.Head]).addScaledVector(bodyAxes(look.yaw).fwd, 1.2).setY(shownP[I.Head].y - 0.05);
   ctrl.want.copy(pullVelocity(shownP));
   approach(ctrl.vel, ctrl.want, dt);
-  planTimer -= dt; idleTimer -= dt; turnTimer -= dt;
+  planTimer -= dt; idleTimer -= dt;
   if (scheduler.ready && !track.busy) {
     const moving = ctrl.vel.length() > 0.05 || ctrl.want.length() > 0.05;
     const pointerMoved = drag && (!drag.sent || drag.sent.distanceTo(drag.point) > 0.04);
@@ -624,10 +636,7 @@ function simulate(dt) {
       track.request(locoReq('now'));
       planTimer = 0.18 + 0.12 * Math.min(1, ctrl.stretch);
     } else if (!moving && !drag) {
-      const h = rig.heading(shownP);
-      const d = Math.abs(wrap(Math.atan2(look.point.x - shownP[0].x, look.point.z - shownP[0].z) - h));
-      if (look.detached && d > 1.3 && turnTimer <= 0) { track.request(idleReq('now')); turnTimer = 1.2; }
-      else if (track.remaining / FPS < scheduler.latency + 0.3) track.request(idleReq('end'));
+      if (track.remaining / FPS < scheduler.latency + 0.3) track.request(idleReq('end'));
       else if (idleTimer <= 0) { track.request(idleReq('now', true)); idleTimer = rand(2.5, 5); }
     }
   }
@@ -656,7 +665,7 @@ function frame(now) {
     lookKnob.material.color.setHex(lookColor);
     lookLine.material.color.setHex(lookColor);
     const el = $('look-mode');
-    el.textContent = look.detached ? '空間に固定' : '正面（体についてくる）';
+    el.textContent = look.detached ? '体に対して固定' : '正面';
     el.className = look.detached ? 'fixed' : 'front';
   }
   lookLine.geometry.setFromPoints([shownP[I.Head], look.point]);
