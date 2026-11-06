@@ -222,8 +222,16 @@ function pullVelocity(P) {
 }
 
 function approach(v, want, dt) {
+  const s = v.length(), w = want.length();
+  if (s > 0.2 && w > 0.2) {
+    // turn the heading of the velocity toward the wanted one (up to 4.5 rad/s), and change the speed separately
+    const a = Math.atan2(v.x, v.z), b = Math.atan2(want.x, want.z);
+    const heading = a + clamp(wrap(b - a), -4.5 * dt, 4.5 * dt);
+    const speed = s + clamp(w * Math.cos(clamp(wrap(b - a), -Math.PI / 2, Math.PI / 2)) - s, -3.5 * dt, 2.5 * dt);
+    return v.set(Math.sin(heading) * speed, 0, Math.cos(heading) * speed);
+  }
   const diff = want.clone().sub(v);
-  const acc = (want.length() < v.length() ? 3.5 : 2.5) * dt;
+  const acc = (w < s ? 3.5 : 2.5) * dt;
   if (diff.length() > acc) diff.setLength(acc);
   return v.add(diff);
 }
@@ -243,7 +251,7 @@ function predict(anchorPose, horizon) {
     if (s > 0.3) {
       const travel = Math.atan2(v.x, v.z);
       const back = Math.cos(travel - yaw) < -0.3 && s < 1.2;
-      yaw += clamp(wrap((back ? yaw : travel) - yaw), -3 / FPS, 3 / FPS);
+      yaw += clamp(wrap((back ? yaw : travel) - yaw), -4.5 / FPS, 4.5 / FPS);
     }
     if (k > steps - 4) out.push({ pos: p.clone(), yaw, vel: v.clone() });
   }
@@ -496,8 +504,8 @@ function punchReq(part, G, vel, start) {
       t = rig.fixRigid(t);
       ghostPose = t;
       lastPunch = kind;
-      const rate = clamp(1.4 + 0.35 * vel.length(), 1.6, 2.6);
-      return { targets: [t], tokens: [6], rate, tag: { kind: 'move' }, after: (tr2, a0, frames) => afterStrike(tr2, frames, rate, start) };
+      const rate = clamp(1.2 + 0.1 * vel.length(), 1.3, 1.8);
+      return { targets: [t], tokens: [6], rate, tag: { kind: 'move' }, after: (tr2, a0, frames) => afterStrike(tr2, frames, rate, start, 0.2) };
     },
   };
 }
@@ -514,9 +522,12 @@ function kickReq(part, G, start) {
 }
 
 /** A strike is one shot: when it has landed, the limb comes back down to the pose before the grab. */
-function afterStrike(tr, frames, rate, start) {
+function afterStrike(tr, frames, rate, start, hold = 0) {
+  // hold the strike's end (full extension) for a moment, so it reads as a punch before the limb comes back
+  const end = tr.frames[tr.frames.length - 1];
+  for (let k = 0; k < Math.round(hold * FPS); k++) tr.frames.push({ pose: end.pose, rate: 1, tag: end.tag });
   if (start) tr.request(settleReq(start, 'end'));
-  settleUntil = clock + frames.length / FPS / rate + 1.0;
+  settleUntil = clock + frames.length / FPS / rate + hold + 1.0;
 }
 let lastPunch = null;
 
@@ -545,10 +556,16 @@ function gaze(p, L, weight = 1) {
   const body = facing(P);
   const yaw = wrap(Math.atan2(want.x, want.z) - Math.atan2(body.x, body.z));
   const pitch = Math.atan2(want.y, Math.hypot(want.x, want.z));
-  const y = clamp(yaw, -1.5, 1.5), pt = clamp(pitch, -0.6, 0.5);
-  const dir = new Vector3(Math.sin(Math.atan2(body.x, body.z) + y) * Math.cos(pt), Math.sin(pt), Math.cos(Math.atan2(body.x, body.z) + y) * Math.cos(pt));
-  const q = qpow(turn(fwdHead, dir), weight);
-  for (const [j, share] of [['Chest', 0.25], ['Neck1', 0.3], ['Head', 0.45]]) rotateSubtree(rig, p, I[j], qpow(q, share));
+  const y = clamp(yaw, -1.5, 1.5), pt = clamp(pitch, -0.35, 0.45);
+  const b = Math.atan2(body.x, body.z);
+  // the chest only turns about the vertical (it does not bow to look down)
+  const curYaw = Math.atan2(fwdHead.x, fwdHead.z);
+  rotateSubtree(rig, p, I.Chest, new Quaternion().setFromAxisAngle(UP, wrap(b + y - curYaw) * 0.25 * weight));
+  // the neck and head take the rest, up/down included
+  const fwd2 = new Vector3(0, 0, 1).applyQuaternion(p.rot[I.Head].clone().multiply(rig.restRot[I.Head].clone().invert()));
+  const dir = new Vector3(Math.sin(b + y) * Math.cos(pt), Math.sin(pt), Math.cos(b + y) * Math.cos(pt));
+  const q = qpow(turn(fwd2, dir), weight);
+  for (const [j, share] of [['Neck1', 0.4], ['Head', 0.6]]) rotateSubtree(rig, p, I[j], qpow(q, share));
   return p;
 }
 
@@ -772,7 +789,7 @@ canvas.addEventListener('pointerdown', e => {
     const view = camera.getWorldDirection(new Vector3()).setY(0).normalize();
     drag.offset = view.multiplyScalar(flat(pos.clone().sub(shownP[0])).dot(view));
   }
-  canvas.setPointerCapture(e.pointerId);
+  try { canvas.setPointerCapture(e.pointerId); } catch { /* a synthetic or lost pointer */ }
   e.stopImmediatePropagation();
   e.preventDefault();
 });
@@ -923,7 +940,7 @@ function balance(dt) {
 
 const STEP = 1 / 60;
 let acc = 0, last = performance.now(), fpsAcc = 0, fpsN = 0, fps = 0;
-let planTimer = 0, idleTimer = 3, lastPlannedDev = 0, lastPlanDir = null, stepStrike = false, lastStance = 'D';
+let planTimer = 0, idleTimer = 3, lastPlannedDev = 0, lastPlanDir = null, stepStrike = false, lastStance = 'D', lastStrikeAt = -9;
 function deviationSize() {
   if (!deviation) return 0;
   return deviation.root.length() + deviation.rot.reduce((a, q) => a + 2 * Math.acos(Math.min(1, Math.abs(q.w))), 0) * 0.25;
@@ -934,7 +951,11 @@ function simulate(dt) {
   if (drag) { // how fast the pointer moves (smoothed): targets aim where it will be when SOMA gets there
     drag.age = (drag.age ?? 0) + dt;
     drag.vel ??= new Vector3();
-    if (drag.prev) drag.vel.lerp(drag.point.clone().sub(drag.prev).divideScalar(dt), 1 - Math.exp(-dt * 8));
+    if (drag.prev) {
+      const raw = drag.point.clone().sub(drag.prev).divideScalar(dt);
+      drag.vel.lerp(raw, 1 - Math.exp(-dt * 8));
+      drag.peak = Math.max(drag.peak ?? 0, raw.length()); // fastest the pointer has moved since the grab
+    }
     drag.prev = drag.point.clone();
   }
   look.yaw += wrap(rig.heading(shownP) - look.yaw) * (1 - Math.exp(-dt * 3));
@@ -970,8 +991,8 @@ function simulate(dt) {
     const pushed = !isKick() && deviation && Math.abs(deviationSize() - lastPlannedDev) > 0.08; // the physics expects a clearly new lean
     // walking steadily, plans follow the steps: one at each foot strike (or at once when the heading turns), so the
     // footing is never swapped in the middle of a step
-    const steady = ctrl.vel.length() > 0.5 && ctrl.want.length() > 0.5;
-    const turned = steady && lastPlanDir && ctrl.want.clone().normalize().dot(lastPlanDir) < Math.cos(0.45);
+    const steady = ctrl.vel.length() > 0.5 && ctrl.want.length() > 0.5 && clock - lastStrikeAt < 0.8 && track.remaining / FPS > scheduler.latency + 0.25;
+    const turned = steady && lastPlanDir && ctrl.want.clone().normalize().dot(lastPlanDir) < Math.cos(0.3);
     const due = steady ? (stepStrike || turned || planTimer < -0.7) : planTimer <= 0;
     if ((moving || pointerMoved || pushed || lookDrag) && due) {
       lastPlanDir = ctrl.want.lengthSq() > 1e-6 ? ctrl.want.clone().normalize() : null;
@@ -989,12 +1010,12 @@ function simulate(dt) {
   scheduler.tick([track]);
   const f = track.frames[Math.min(track.frames.length - 1, Math.floor(track.t))].pose;
   const st = stanceFoot(f.contact);
-  if ((st === 'L' || st === 'R') && st !== lastStance) { stepStrike = true; lastStance = st; }
+  if ((st === 'L' || st === 'R') && st !== lastStance) { stepStrike = true; lastStance = st; lastStrikeAt = clock; }
   shown = clonePose(track.display); // SOMA's output, untouched
   shown.contact = f.contact;
   shownP = rig.positions(shown);
   clock += dt;
-  const lookAt = look.detached || !drag ? look.point : drag.point;
+  const lookAt = look.detached || !drag || !(drag.part.endsWith('Hand') || drag.part === 'Head') ? look.point : drag.point;
   look.smooth.lerp(lookAt, 1 - Math.exp(-dt * 6));
   if (settings.physics) {
     ragdoll.step(dt, shown, f.contact, drag ? { name: drag.part, point: drag.point } : null);
@@ -1126,7 +1147,7 @@ $('physics').addEventListener('input', () => ragdoll.reset(shown));
 requestAnimationFrame(frame);
 if (params.has('debug')) {
   window.lab = {
-    track, scheduler, simulate, settings, ctrl, library, reactions, rig, mirror, kickTarget, get lastPunch() { return lastPunch; }, stage, look, cascade, ragdoll, get planned() { return planned; }, get deviation() { return deviation; }, get pushedUntil() { return pushedUntil; }, get clock() { return clock; },
+    track, scheduler, simulate, settings, ctrl, library, reactions, rig, mirror, kickTarget, get lastPunch() { return lastPunch; }, camera, stage, look, cascade, ragdoll, get planned() { return planned; }, get deviation() { return deviation; }, get pushedUntil() { return pushedUntil; }, get clock() { return clock; },
     get shownP() { return shownP; }, get drag() { return drag; },
     // a scripted pull: `point` is used as is (no screen ray)
     pull(part, point) { if (!part) releaseFoot(); drag = part ? { part, point, sent: null, scripted: true, freeArm: freeArmOf(part), start: clonePose(shown) } : null; if (!part) planTimer = 0; },
