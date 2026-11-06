@@ -3,8 +3,8 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>SOMA Pose Lab</title>
-  <meta name="description" content="MotionBricks（SOMA）で生成した動きの途中のポーズを変異させてストックし、だんだん展開していくラボ。手足を引っ張るとついてくる">
+  <title>SOMA Pull</title>
+  <meta name="description" content="人形の手・腰・頭・足をつかんで引っ張ると、MotionBricks（SOMA）が人間らしい足運びでついてくる動きをその場で生成する">
   <link rel="stylesheet" href="src/style.css">
   <link rel="stylesheet" href="src/lab.css">
   <script type="importmap">
@@ -18,33 +18,29 @@
   <canvas id="view"></canvas>
 
   <header class="lab-bar">
-    <strong>SOMA Pose Lab</strong>
-    <label>モード <select id="mode"><option value="dance" selected>ダンス</option><option value="free">自由</option></select></label>
-    <label class="toggle"><input type="checkbox" id="auto" checked> 自動展開</label>
-    <label>BPM <input type="range" id="bpm" min="80" max="140" step="1" value="110"> <span id="bpm-v">110</span></label>
-    <label class="toggle"><input type="checkbox" id="sound" checked> 音</label>
-    <label>変異 <input type="range" id="strength" min="0" max="1" step="0.05" value="0.45"> <span id="strength-v">0.45</span></label>
-    <label>速さ（自由） <input type="range" id="rate" min="0.6" max="2.4" step="0.1" value="1.2"> <span id="rate-v">1.2</span></label>
-    <button id="reset" class="small">ストックを戻す</button>
+    <strong>SOMA Pull</strong>
+    <label>最高速度 <input type="range" id="vmax" min="1" max="3" step="0.1" value="2.4"> <span id="vmax-v">2.4</span> m/s</label>
+    <label>ひもの強さ <input type="range" id="stiff" min="1.5" max="4" step="0.1" value="2.6"> <span id="stiff-v">2.6</span></label>
+    <label class="toggle"><input type="checkbox" id="footlock" checked> 足を床に固定</label>
+    <button id="home" class="small">真ん中に戻す</button>
     <a href="./" class="small-link">格闘ゲームへ</a>
   </header>
 
-  <aside class="stock">
-    <div class="stock-head">ストック <span id="stock-n">0</span> · 世代 <span id="gen">0</span></div>
-    <div id="stock-grid"></div>
+  <aside class="gait">
+    <div class="stock-head">歩きのポーズ集（モデルの出力から育つ）</div>
+    <div id="gait-bins"></div>
   </aside>
 
   <footer class="help">
-    <span>手・足・頭・腰の球をドラッグ：引っ張る</span>
+    <span>手・腰・頭・足の球をドラッグ：引っ張る（強く・遠くへ引くと歩き、走る）</span>
     <span>空いた所をドラッグ：視点</span>
-    <span>ストックをクリック：次にその姿勢へ</span>
     <span id="stats"></span>
   </footer>
 
   <section id="overlay">
     <div class="card">
-      <h1>SOMA Pose Lab</h1>
-      <p>MotionBricks（SOMA）が、ストックから選んで変異させた姿勢へ向かう動きを次々に生成します。生成された動きの途中の姿勢を取り出し、さらに変異させてストックに加えるので、姿勢はだんだん人間離れしていきます。手足を引っ張ると、引っ張られた人のように体がついてきます。</p>
+      <h1>SOMA Pull</h1>
+      <p>人形の手・腰・頭・足をつかんで引っ張ってください。ひもで引かれたように体が向きを変え、歩いたり走ったりしてついてきます。動きはすべて NVIDIA の MotionBricks（SOMA）がブラウザの中でその場で生成します。目標にする歩きのポーズは、モデル自身が出した動きから集めて育てます。</p>
       <fieldset>
         <legend>モデル</legend>
         <label><input type="radio" name="model" value="fp16" checked> Mixed FP16（380 MB、おすすめ）</label>

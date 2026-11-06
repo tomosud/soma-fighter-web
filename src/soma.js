@@ -177,7 +177,9 @@ export function decodeRequest(rig, motions, tokensOut, b, align) {
     const root = new Vector3(motions[o], motions[o + 1], motions[o + 2]).applyQuaternion(align.q).add(align.origin);
     const rot = [];
     for (let j = 0; j < NJ; j++) rot.push(rot6d(motions, o + 92 + j * 6, new Quaternion()).premultiply(align.q));
-    frames.push(rig.fixRigid({ root, rot }));
+    // foot contacts: left heel, left toe, right heel, right toe (0..1)
+    const contact = [0, 1, 2, 3].map(k => Math.max(0, Math.min(1, motions[o + FEAT - 4 + k])));
+    frames.push(rig.fixRigid({ root, rot, contact }));
   }
   return { frames, tokens };
 }
@@ -206,6 +208,7 @@ export function correctEndpoints(rig, frames, lastContext, firstTarget, fixEnd =
       const local = de.multiply(ds).multiply(L[j]);
       out.rot.push(rig.parents[j] < 0 ? local : out.rot[rig.parents[j]].clone().multiply(local));
     }
+    if (fr.contact) out.contact = fr.contact;
     return rig.fixRigid(out);
   });
 }
