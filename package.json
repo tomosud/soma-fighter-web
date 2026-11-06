@@ -1,0 +1,15 @@
+{
+  "name": "soma-fighter-web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Browser fighting game driven by NVIDIA MotionBricks (SOMA) on WebGPU",
+  "scripts": {
+    "serve": "node tools/serve.mjs",
+    "smoke": "node tools/smoke.mjs"
+  },
+  "devDependencies": {
+    "onnxruntime-node": "1.23.0",
+    "three": "0.186.1"
+  }
+}
