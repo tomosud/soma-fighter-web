@@ -213,7 +213,7 @@ const ANCHOR = { LeftHand: 'LeftArm', RightHand: 'RightArm', Hips: 'Hips', Head:
 
 function pullVelocity(P) {
   ctrl.stretch = 0;
-  if (!drag || drag.struck || isKick() || (drag.part.endsWith('Hand') && (drag.age ?? 1) < 0.35)) return new Vector3();
+  if (!drag || drag.struck || isKick()) return new Vector3();
   const d = flat(drag.point.clone().sub(P[I[ANCHOR[drag.part]]]));
   const stretch = d.length() - SLACK[drag.part];
   ctrl.stretch = Math.max(0, stretch);
@@ -458,62 +458,6 @@ function kickTarget(from, part, G) {
   return rig.fixRigid(t);
 }
 
-// ---------------------------------------------------------------- punches
-
-// A hand flicked fast is a punch toward where it is heading: up = uppercut, across the body = hook, otherwise a jab
-// (left) or a cross (right). The keys are Mixamo-derived (jab and uppercut thrown with the left hand, cross and
-// hook with the right) and mirrored for the other hand. SOMA makes the wind-up and the strike.
-const PUNCH_SPEED = 1.3; // m/s of the pointer, within PUNCH_WINDOW s of grabbing the hand
-const PUNCH_WINDOW = 0.5;
-// key pose and the hand it is thrown with (the other hand mirrors it)
-const PUNCH_KEYS = { jab: ['punch_straight', 'Right'], cross: ['punch_straight', 'Right'], hook: ['punch_hook', 'Right'], uppercut: ['punch_uppercut', 'Left'] };
-
-function punchKind(part, vel, P) {
-  const s = vel.length();
-  if (vel.y > 0.6 * s) return 'uppercut';
-  const side = P[I.LeftArm].clone().sub(P[I.RightArm]).setY(0).normalize(); // toward the body's left
-  const across = vel.clone().setY(0).dot(side) / Math.max(1e-6, s);
-  if ((part === 'RightHand' && across > 0.6) || (part === 'LeftHand' && across < -0.6)) return 'hook';
-  return part === 'LeftHand' ? 'jab' : 'cross';
-}
-
-function punchReq(part, G, vel, start) {
-  return {
-    kind: 'attack', mode: 'now', interrupt: true,
-    build(tr, a, ctx) {
-      const from = ctx[3];
-      const P = rig.positions(from);
-      const kind = punchKind(part, vel, P);
-      const [keyName, keySide] = PUNCH_KEYS[kind];
-      let base = clonePose(book.keys[keyName][0]); // facing +Z, hips over the origin, at the moment it lands
-      if (keySide !== sideOf(part)) base = mirror(base);
-      const hips = flat(from.root);
-      const fwd = facing(P);
-      let ahead = flat(G.clone().sub(hips));
-      if (ahead.lengthSq() < 1e-4 || ahead.clone().normalize().dot(fwd) < 0.3) ahead = fwd.clone(); else ahead.normalize();
-      const aimAt = hips.clone().addScaledVector(ahead, 0.75).setY(kind === 'uppercut' ? 1.55 : 1.45);
-      // the whole key at the moment it lands, turned so its fist points at the target, stepping in when far
-      const side = sideOf(part);
-      const hand = rig.positions(base)[I[part]];
-      const d = flat(aimAt.clone().sub(hips));
-      const dist = d.length();
-      const step = clamp(dist - Math.hypot(hand.x, hand.z), -0.15, 0.35);
-      const at = dist > 1e-3 ? hips.clone().addScaledVector(d.clone().normalize(), step) : hips;
-      let t = placePose(base, Math.atan2(d.x, d.z) - Math.atan2(hand.x, hand.z), ZERO, at);
-      // straights are pointed at the target at the arm's own reach; hooks and uppercuts keep the key's bent arm
-      const Pt = rig.positions(t), sh = Pt[I[side + 'Arm']];
-      const fist = sh.clone().addScaledVector(aimAt.clone().sub(sh).normalize(), Pt[I[part]].distanceTo(sh));
-      if (kind === 'jab' || kind === 'cross') t = reach(t, part, fist);
-      t = clonePose(t);
-      gaze(t, fist);
-      t = rig.fixRigid(t);
-      ghostPose = t;
-      lastPunch = kind;
-      const rate = clamp(1.2 + 0.1 * vel.length(), 1.3, 1.8);
-      return { targets: [t], tokens: [6], rate, tag: { kind: 'move' }, after: (tr2, a0, frames) => afterStrike(tr2, frames, rate, 0.2, null, start && { start, side }) };
-    },
-  };
-}
 function kickReq(part, G, standing, speed = 0) {
   return {
     kind: 'attack', mode: 'now', interrupt: true,
@@ -527,14 +471,14 @@ function kickReq(part, G, standing, speed = 0) {
 }
 
 /** A strike is one shot: after its top (held `hold` s), SOMA brings the body back; only the striking part is given. */
-function afterStrike(tr, frames, rate, hold, legsFrom = null, arm = null) {
+function afterStrike(tr, frames, rate, hold, legsFrom = null) {
   const end = tr.frames[tr.frames.length - 1];
   for (let k = 0; k < Math.round(hold * FPS); k++) tr.frames.push({ pose: end.pose, rate: 1, tag: end.tag });
-  tr.request(recoverReq(legsFrom, arm));
+  tr.request(recoverReq(legsFrom));
   settleUntil = clock + frames.length / FPS / rate + hold + 1.2;
 }
 const LEG_JOINTS = ['Leg', 'Shin', 'Foot', 'ToeBase'].flatMap(n => [I['Left' + n], I['Right' + n]]);
-function recoverReq(legsFrom, arm) {
+function recoverReq(legsFrom) {
   return {
     kind: 'idle', mode: 'end',
     build(tr, a, ctx) {
@@ -554,19 +498,11 @@ function recoverReq(legsFrom, arm) {
         t = placePose(t, 0, ZERO, flat(P[foot]).sub(flat(rig.positions(t)[foot])));
         return { targets: [t], tokens: [8, 9, 10], rate: 1, tag: { kind: 'idle' } };
       }
-      if (arm) {
-        // after a punch: everything as SOMA left it, only the punching arm back to how it hung before
-        const L = toLocal(from), Ls = toLocal(arm.start);
-        for (const j of ARM_JOINTS(arm.side)) L[j].copy(Ls[j]);
-        for (const j of ['Spine1', 'Spine2', 'Chest'].map(n => I[n])) L[j].slerp(Ls[j], 0.7); // untwist the trunk
-        return { targets: [fromLocal(from.root, L)], tokens: [8, 9, 10], rate: 1, tag: { kind: 'idle' } };
-      }
       const at = flat(from.root).lerp(flat(P[foot]), 0.5);
       return { targets: [freeTarget(at, rig.heading(P))], tokens: [8, 9, 10], rate: 1, fixEnd: false, tag: { kind: 'idle' } };
     },
   };
 }
-let lastPunch = null;
 
 // ---------------------------------------------------------------- gaze
 
@@ -1008,16 +944,14 @@ function simulate(dt) {
   ctrl.want.copy(pullVelocity(shownP));
   approach(ctrl.vel, ctrl.want, dt);
   planTimer -= dt; idleTimer -= dt;
-  // strikes: a hand flicked right after it is grabbed punches; a foot pulled above the knee kicks. One shot each.
+  // a foot pulled above the knee kicks (one shot)
   if (scheduler.ready && drag && !drag.struck) {
-    const flick = drag.part.endsWith('Hand') && drag.age < PUNCH_WINDOW && drag.vel?.length() > PUNCH_SPEED;
     // a kick is aimed once the foot's pull has (nearly) arrived: when the pointer stops, or a quarter second after
     // it passed the knee
     if (isKick()) drag.kickArmed ??= clock; else drag.kickArmed = null;
     const kickNow = drag.kickArmed != null && (drag.vel.length() < 0.6 || clock - drag.kickArmed > 0.25);
-    if (flick || kickNow) {
-      track.request(flick ? punchReq(drag.part, drag.point.clone(), drag.vel.clone(), drag.start)
-        : kickReq(drag.part, drag.point.clone().add(drag.vel.clone().multiplyScalar(0.15).clampLength(0, 0.3)), drag.start, drag.peak ?? 0));
+    if (kickNow) {
+      track.request(kickReq(drag.part, drag.point.clone().add(drag.vel.clone().multiplyScalar(0.15).clampLength(0, 0.3)), drag.start, drag.peak ?? 0));
       drag.struck = true;
       ctrl.vel.set(0, 0, 0);
     }
@@ -1188,7 +1122,7 @@ $('physics').addEventListener('input', () => ragdoll.reset(shown));
 requestAnimationFrame(frame);
 if (params.has('debug')) {
   window.lab = {
-    track, scheduler, simulate, settings, ctrl, library, reactions, rig, mirror, kickTarget, get lastPunch() { return lastPunch; }, camera, stage, look, cascade, ragdoll, get planned() { return planned; }, get deviation() { return deviation; }, get pushedUntil() { return pushedUntil; }, get clock() { return clock; },
+    track, scheduler, simulate, settings, ctrl, library, reactions, rig, mirror, kickTarget, camera, stage, look, cascade, ragdoll, get planned() { return planned; }, get deviation() { return deviation; }, get pushedUntil() { return pushedUntil; }, get clock() { return clock; },
     get shownP() { return shownP; }, get drag() { return drag; },
     // a scripted pull: `point` is used as is (no screen ray)
     pull(part, point) { if (!part) releaseFoot(); drag = part ? { part, point, sent: null, scripted: true, freeArm: freeArmOf(part), start: clonePose(shown) } : null; if (!part) planTimer = 0; },
