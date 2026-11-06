@@ -151,7 +151,8 @@ export function encodeRequest(rig, batch, b, context, targets, tokens) {
     }
     const given = f < 4 + nT ? 1 : 0;
     batch.has_global_root_values[b * 8 + f] = given;
-    batch.has_local_poses[b * 8 + f] = given;
+    // a target marked `free` constrains only where the hips go and which way they face; the body is the model's
+    batch.has_local_poses[b * 8 + f] = given && !(f >= 4 && poses[f].free) ? 1 : 0;
     batch.has_local_root_values[b * 8 + f] = (f === 3 || f === 4 + nT - 1) ? 0 : given;
   }
   for (let i = 0; i < 11; i++) batch.allowed_pred_num_tokens[b * 11 + i] = tokens.includes(6 + i) ? 1 : 0;

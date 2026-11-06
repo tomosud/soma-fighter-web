@@ -73,13 +73,16 @@ export class Stage {
     floor.rotation.x = -Math.PI / 2;
     floor.receiveShadow = true;
     this.scene.add(floor);
+    this.floor = floor;
     const ring = new THREE.Mesh(new THREE.RingGeometry(3.95, 4.05, 96), new THREE.MeshBasicMaterial({ color: 0xc8a24a }));
     ring.rotation.x = -Math.PI / 2;
     ring.position.y = 0.002;
     this.scene.add(ring);
+    this.ring = ring;
     const grid = new THREE.GridHelper(8, 16, 0x3b404d, 0x31353f);
     grid.position.y = 0.001;
     this.scene.add(grid);
+    this.grid = grid;
 
     this.side = 1;
     this.camPos = new THREE.Vector3(0, 1.6, 5);
@@ -112,6 +115,28 @@ export class Stage {
     this.sun.position.set(mid.x + 2, 7, mid.z + 3);
     this.sun.target.position.copy(mid);
     return { right: axis, toward: normal };
+  }
+
+  /** An endless floor: a large floor and a grid that move with `center`, the grid in whole cells so it looks fixed. */
+  makeEndless() {
+    this.scene.remove(this.floor, this.ring, this.grid);
+    this.floor = new THREE.Mesh(new THREE.PlaneGeometry(400, 400), new THREE.MeshStandardMaterial({ color: 0x2a2d36, roughness: 0.95 }));
+    this.floor.rotation.x = -Math.PI / 2;
+    this.floor.receiveShadow = true;
+    this.grid = new THREE.GridHelper(80, 80, 0x3b404d, 0x31353f);
+    this.grid.position.y = 0.001;
+    this.marks = new THREE.GridHelper(80, 8, 0x555b6b, 0x555b6b); // every 10 m, a little brighter
+    this.marks.position.y = 0.002;
+    this.scene.fog = new THREE.Fog(0x14161c, 14, 38);
+    this.scene.add(this.floor, this.grid, this.marks);
+  }
+
+  followFloor(center) {
+    this.floor.position.set(center.x, 0, center.z);
+    this.grid.position.set(Math.round(center.x), 0.001, Math.round(center.z));
+    this.marks.position.set(Math.round(center.x / 10) * 10, 0.002, Math.round(center.z / 10) * 10);
+    this.sun.position.set(center.x + 2, 7, center.z + 3);
+    this.sun.target.position.set(center.x, 0, center.z);
   }
 
   render() { this.renderer.render(this.scene, this.camera); }
