@@ -195,7 +195,7 @@ function lookup(speed, dir, phase) {
     if (b < 0 || b >= BINS.length) continue;
     for (const ph of [phase, 'D', phase === 'L' ? 'R' : 'L', 'F']) {
       const list = library.get(`${b}:${dir}:${ph}`);
-      if (list?.length) return list[Math.floor(Math.random() * list.length)];
+      if (list?.length) { const own = list.filter(e => !e.seed); return pick(own.length ? own : list); }
     }
   }
   return null;
@@ -559,6 +559,108 @@ function bookSeed(pose, key, w, grabbedArm = true) {
   return out;
 }
 
+// ---------------------------------------------------------------- Mixamo clips: variety for the targets
+
+// Mixamo animations retargeted to the SOMA rig (tools/mixamo_clips.mjs). They never play: frames of them are used
+// as targets (kicks, jumps, falls, getting up, gestures, idle stances, side and back steps), and SOMA makes the
+// motion. Loaded in the background; everything works without them.
+let mix = null;
+const pick = list => list[Math.floor(Math.random() * list.length)];
+function weighted(items, w) {
+  const ws = items.map(w), tot = ws.reduce((a, b) => a + b, 0);
+  let r = Math.random() * tot;
+  for (let i = 0; i < items.length; i++) { r -= ws[i]; if (r <= 0) return items[i]; }
+  return items.at(-1);
+}
+fetch(new URL('../assets/mixamo_clips.json', import.meta.url)).then(r => (r.ok ? r.json() : null)).then(j => { if (j) { mix = buildMix(j); seedGait(); } }).catch(() => {});
+function buildMix(j) {
+  const out = { clips: {} };
+  for (const [name, c] of Object.entries(j.clips)) {
+    const raw = c.frames.map(f => rig.fixRigid({ root: new Vector3(...f.root), rot: f.rot.map(q => new Quaternion(...q).normalize()) }));
+    // canonical: the clip's first frame faces +Z with its hips over the origin
+    const h = rig.heading(rig.positions(raw[0])), at = flat(raw[0].root);
+    out.clips[name] = { fps: c.fps, poses: raw.map(p => placePose(p, -h, at, at.clone().negate())) };
+  }
+  // kicks: which foot strikes, the frame where it is farthest out, and how high that is
+  out.kicks = [];
+  for (const name of ['kick_roundhouse', 'kick_side', 'kick_low', 'kick_medium', 'kick_side2', 'kick_snap', 'knee']) {
+    const c = out.clips[name];
+    if (!c) continue;
+    let best = null;
+    for (const side of ['Left', 'Right']) c.poses.forEach((pose, f) => {
+      if (f + 3 >= c.poses.length) return;
+      const P = rig.positions(pose);
+      const tip = name === 'knee' ? P[I[side + 'Shin']] : P[I[side + 'Foot']];
+      const score = flat(tip.clone().sub(P[0])).length() + 1.5 * tip.y;
+      if (!best || score > best.score) best = { score, apex: f, side, height: tip.y };
+    });
+    out.kicks.push({ name, ...best });
+  }
+  // the most expressive moment of a gesture: where the upper body is farthest from how the clip began
+  out.peak = name => {
+    const c = out.clips[name];
+    if (!c) return null;
+    const L0 = toLocal(c.poses[0]);
+    let bestF = 0, bd = -1;
+    c.poses.forEach((pose, f) => { const L = toLocal(pose); const d = [...TRUNK_UP, ...ARM_JOINTS('Left'), ...ARM_JOINTS('Right')].reduce((a, jj) => a + L[jj].angleTo(L0[jj]), 0); if (d > bd) { bd = d; bestF = f; } });
+    return c.poses[bestF];
+  };
+  return out;
+}
+/** A frame of a clip at a time (seconds, wrapped), canonical. */
+const clipAt = (name, t) => { const c = mix?.clips[name]; return c ? c.poses[Math.floor(t * c.fps) % c.poses.length] : null; };
+/** Upper body (trunk, head, arms) of `src` mixed into `pose` by w. */
+function upperFrom(pose, src, w, joints = [...TRUNK_UP, ...ARM_JOINTS('Left'), ...ARM_JOINTS('Right')]) {
+  if (!src || w <= 0) return pose;
+  const L = toLocal(pose), Ls = toLocal(src);
+  for (const j of joints) L[j].slerp(Ls[j], w);
+  const out = fromLocal(pose.root, L);
+  if (pose.contact) out.contact = pose.contact;
+  return out;
+}
+/**
+ * An in-place clip (the hips stay put while the feet step) given the travel it implies: the foot on the floor stays
+ * where it is, so the body moves by the opposite of that foot's slide.
+ */
+function withRootMotion(poses) {
+  if (Math.max(...poses.map(q => flat(q.root.clone().sub(poses[0].root)).length())) > 0.15) return poses;
+  const out = [clonePose(poses[0])];
+  const off = new Vector3();
+  for (let f = 1; f < poses.length; f++) {
+    const A = rig.positions(poses[f - 1]), B = rig.positions(poses[f]);
+    const foot = A[I.LeftFoot].y < A[I.RightFoot].y ? I.LeftFoot : I.RightFoot;
+    off.sub(flat(B[foot].clone().sub(A[foot])));
+    const q = clonePose(poses[f]);
+    q.root.add(off);
+    out.push(q);
+  }
+  return out;
+}
+/** Side steps, backing up and crouched walking from Mixamo seed the gait library (SOMA's own walking replaces them). */
+function seedGait() {
+  for (const [name, style] of [['strafe_left', ''], ['strafe_right', ''], ['walk_back', ''], ['crouch_walk', 'c'], ['crouch_fwd', 'c'], ['sneak', 'c']]) {
+    const c = mix.clips[name];
+    if (!c || c.fps !== 30) continue;
+    const ps = withRootMotion(c.poses);
+    for (let i = 2; i + 4 < ps.length - 2; i += 2) {
+      const w = ps.slice(i, i + 4);
+      const v = flat(w[2].root.clone().sub(w[1].root)).multiplyScalar(FPS);
+      const bin = binOf(v.length());
+      if (bin < 0) continue;
+      // which foot is on the floor: the lower one, if clearly lower
+      const P = rig.positions(w[0]);
+      const dy = P[I.LeftFoot].y - P[I.RightFoot].y;
+      const st = Math.abs(dy) < 0.02 ? 'D' : dy < 0 ? 'L' : 'R';
+      const dir = style + travelDir(v, facing(P));
+      const key = `${bin}:${dir}:${st}`;
+      const list = library.get(key) ?? [];
+      if (list.length < PER_KEY) list.push({ frames: canonicalize(w), speed: v.length(), seed: true });
+      library.set(key, list);
+    }
+  }
+  showLibrary();
+}
+
 // ---------------------------------------------------------------- kicks
 
 // Left-right mirror (swap Left*/Right* joints, reflect across the body's plane; the rest pose maps to itself), so the
@@ -666,14 +768,56 @@ function kickTarget(from, part, G) {
   return rig.fixRigid(t);
 }
 
+/**
+ * A kick chosen from the Mixamo kicks by how high the target is (some randomness, not the same one twice in a row):
+ * four frames from its top (so the target carries the kick's own swing), turned toward the target about the
+ * standing foot, the foot put on the target by IK. Without the clips: the mid / high key.
+ */
+let lastKick = null;
+function kickTargets(from, part, G) {
+  const list = mix?.kicks;
+  if (!list?.length) return { targets: [kickTarget(from, part, G)], end: null };
+  const k = weighted(list, e => Math.exp(-(((e.height - G.y) / 0.35) ** 2)) * (e.name === lastKick ? 0.2 : 1) + 0.03);
+  lastKick = k.name;
+  const c = mix.clips[k.name];
+  const at = flat(c.poses[k.apex].root);
+  let base = [0, 1, 2, 3].map(i => placePose(c.poses[k.apex + i], 0, ZERO, at.clone().negate()));
+  let end = placePose(c.poses.at(-1), 0, ZERO, at.clone().negate());
+  if (sideOf(part) !== k.side) { base = base.map(mirror); end = mirror(end); }
+  const hips = flat(from.root);
+  const tip = rig.positions(base[0])[I[part]];
+  const d = flat(G.clone().sub(hips));
+  const support = part === 'RightFoot' ? 'LeftFoot' : 'RightFoot';
+  const planted = flat(rig.positions(from)[I[support]]);
+  const yaw = Math.atan2(d.x, d.z) - Math.atan2(tip.x, tip.z);
+  let ts = base.map(p => placePose(p, yaw, ZERO, ZERO));
+  const shift = planted.sub(flat(rig.positions(ts[0])[I[support]]));
+  ts = ts.map(p => placePose(p, 0, ZERO, shift));
+  if (k.name !== 'knee') { // the foot onto the target; the frames after it keep the same change to the leg
+    const before = toLocal(ts[0]);
+    const r0 = reach(ts[0], part, G, true);
+    const after = toLocal(r0);
+    const leg = chain(sideOf(part), LEG);
+    ts = ts.map((p, i) => {
+      if (i === 0) return r0;
+      const L = toLocal(p);
+      for (const j of leg) L[j].multiply(before[j].clone().invert().multiply(after[j]));
+      return fromLocal(p.root, L);
+    });
+  }
+  ts = ts.map(p => { const q = clonePose(p); gaze(q, G); return rig.fixRigid(q); });
+  return { targets: ts, end, name: k.name };
+}
 function kickReq(part, G, standing, speed = 0) {
   return {
     kind: 'attack', mode: 'now', interrupt: true,
     build(tr, a, ctx) {
-      const t = kickTarget(ctx[3], part, G);
-      ghostPose = t;
-      const rate = clamp(1.2 + 0.4 * speed, 1.4, 2.6);
-      return { targets: [t], tokens: [6, 7], rate, tag: { kind: 'move' }, after: (tr2, a0, frames) => afterStrike(tr2, frames, rate, 0, standing) };
+      const { targets, end } = kickTargets(ctx[3], part, G);
+      ghostPose = targets[0];
+      const rate = clamp(1.2 + 0.4 * speed, 1.4, 2.6) * rand(0.85, 1.1);
+      // coming down: sometimes the stance it stood in, sometimes the stance the kick itself ends in
+      const legsFrom = end && Math.random() < 0.45 ? end : standing;
+      return { targets, tokens: [6, 7], rate, tag: { kind: 'move' }, after: (tr2, a0, frames) => afterStrike(tr2, frames, rate, 0, legsFrom) };
     },
   };
 }
@@ -700,7 +844,7 @@ function recoverReq(legsFrom) {
         const L = toLocal(from), Ls = toLocal(legsFrom);
         for (const j of LEG_JOINTS) L[j].copy(Ls[j]);
         // the pelvis too (a kick tilts and turns it), facing as the body faces now
-        const dy = rig.heading(P) - rig.heading(rig.positions(legsFrom));
+        const dy = rig.heading(P) - rig.heading(rig.positions(legsFrom)); // (works for a canonical clip frame too)
         L[0] = new Quaternion().setFromAxisAngle(UP, dy).multiply(legsFrom.rot[0]);
         let t = fromLocal(new Vector3(from.root.x, legsFrom.root.y, from.root.z), L);
         t = placePose(t, 0, ZERO, flat(P[foot]).sub(flat(rig.positions(t)[foot])));
@@ -727,14 +871,25 @@ function jumpReq(height, hor) {
       legsTo(apex, feet.map(f => f.clone().addScaledVector(hor, 0.45).setY(f.y + height + 0.1))); // knees tucked
       for (const [sd, sign] of [['Left', 1], ['Right', -1]]) rotateSubtree(rig, apex, I[sd + 'Arm'], new Quaternion().setFromAxisAngle(facing(rig.positions(apex)), sign * 0.35));
       const t0 = rig.fixRigid(apex);
+      // the body in the air from one of the Mixamo jumps (its own tuck and arms), round the top of its arc
+      const jumps = ['jump_idle', 'jump_up', 'jump_place', 'jump_joy'].filter(n => mix?.clips[n]);
+      let air = null;
+      if (jumps.length && Math.random() < 0.8) {
+        const c = mix.clips[pick(jumps)];
+        let top = 0;
+        c.poses.forEach((q, f) => { if (q.root.y > c.poses[top].root.y) top = f; });
+        top = clamp(top, 1, c.poses.length - 3);
+        const yaw = rig.heading(rig.positions(from));
+        air = [-1, 0, 1, 2].map(o => placePose(c.poses[top + o], yaw, ZERO, ZERO));
+      }
       // four frames round the top of the arc: still rising a little, then falling (gravity only)
       const vh = hor.clone().multiplyScalar(1 / 0.4);
       const targets = [0, 1, 2, 3].map(k => {
-        const t = clonePose(t0);
+        const t = air ? clonePose(air[k]) : clonePose(t0);
         const dt = (k - 1) / FPS;
-        t.root.addScaledVector(vh, dt);
+        t.root.copy(t0.root).addScaledVector(vh, dt);
         t.root.y -= 0.5 * 9.81 * dt * dt;
-        return t;
+        return rig.fixRigid(t);
       });
       ghostPose = targets[0];
       return { targets, tokens: [6], rate: 1.25, tag: { kind: 'move' }, after: (tr2) => tr2.request(landReq(hor, from)) };
@@ -773,8 +928,12 @@ function fallReq(dir) {
       const from = ctx[3];
       const P = rig.positions(from);
       const fwd = facing(P);
-      // lying on its back when pulled backwards, face down otherwise
-      const key = clonePose(book.keys[dir.dot(fwd) < -0.2 ? 'down_back' : 'down_ko'][0]);
+      // lying on its back when pulled backwards, face down otherwise (one of several ways of lying)
+      const back = dir.dot(fwd) < -0.2;
+      const clips = (back ? ['fall_back', 'stumble_back'] : ['fall_forward', 'trip']).filter(n => mix?.clips[n]);
+      const choice = clips.length && Math.random() < 0.75 ? mix.clips[pick(clips)].poses.at(-1) : book.keys[back ? 'down_back' : 'down_ko'][0];
+      fellOnBack = back;
+      const key = clonePose(choice);
       const Pk = rig.positions(key);
       const head = flat(Pk[I.Head].clone().sub(Pk[0]));
       const yaw = Math.atan2(dir.x, dir.z) - Math.atan2(head.x, head.z);
@@ -787,14 +946,33 @@ function fallReq(dir) {
           const end = tr2.frames[tr2.frames.length - 1];
           for (let k = 0; k < FPS; k++) tr2.frames.push({ pose: end.pose, rate: 1, tag: end.tag }); // a moment on the floor
           tr2.request(getUpReq());
-          mood.downUntil = clock + frames.length / FPS + 3.5;
+          mood.downUntil = clock + frames.length / FPS + 8; // until standing (set exactly when the stand-up is made)
           settleUntil = mood.downUntil;
         },
       };
     },
   };
 }
+let fellOnBack = false;
+/** Getting up: half way through a Mixamo get-up (on a knee, pushing up) first, then standing (SOMA's own way). */
 function getUpReq() {
+  const clip = mix?.clips[fellOnBack ? 'getting_up' : 'stand_up'];
+  if (!clip) return standUpReq();
+  return {
+    kind: 'down', mode: 'end',
+    build(tr, a, ctx) {
+      const from = ctx[3];
+      const c0 = clip.poses[0];
+      const mid = clip.poses[Math.floor(clip.poses.length * rand(0.5, 0.65))];
+      // the clip's lying start lined up with how the body lies now
+      const yaw = rig.heading(rig.positions(from)) - rig.heading(rig.positions(c0));
+      const t = placePose(mid, yaw, flat(c0.root), flat(from.root).sub(flat(c0.root)));
+      ghostPose = null;
+      return { targets: [t], tokens: [10, 11, 12], rate: 1, tag: { kind: 'hit' }, after: (tr2) => tr2.request(standUpReq()) };
+    },
+  };
+}
+function standUpReq() {
   return {
     kind: 'down', mode: 'end',
     build(tr, a, ctx) {
@@ -805,7 +983,10 @@ function getUpReq() {
       const head = flat(P[I.Head].clone().sub(P[0]));
       ghostPose = null;
       // stand up facing the way the head lay (a natural way to get up)
-      return { targets: [freeTarget(at, Math.atan2(head.x, head.z))], tokens: [14, 15, 16], rate: 1, fixEnd: false, tag: { kind: 'idle' }, after: () => { mood.annoy = 0.3; mood.stumbles = []; if (drag) drag.struck = false; } };
+      return { targets: [freeTarget(at, Math.atan2(head.x, head.z))], tokens: [10, 11, 12], rate: 1, fixEnd: false, tag: { kind: 'idle' }, after: (tr2) => {
+        mood.annoy = 0.3; mood.stumbles = []; if (drag) drag.struck = false;
+        mood.downUntil = clock + (tr2.frames.length - 1 - tr2.t) / FPS; settleUntil = mood.downUntil; // control comes back once it stands
+      } };
     },
   };
 }
@@ -833,6 +1014,9 @@ function confusedReq(side) {
       t = clonePose(t);
       rotateSubtree(rig, t, I.Head, new Quaternion().setFromAxisAngle(fwd, 0.18 * side)); // head tilted
       gaze(t, Pt[I.Head].clone().addScaledVector(fwd, 1).addScaledVector(left, 1.1 * side).add(new Vector3(0, -0.1, 0)));
+      // or one of the Mixamo gestures of not knowing (thinking, shaking the head, shrugging) on the upper body
+      const gestures = ['thinking', 'head_shake', 'shrug'].filter(n => mix?.clips[n]);
+      if (gestures.length && Math.random() < 0.6) t = upperFrom(clonePose(from), mix.peak(pick(gestures)), 0.85);
       ghostPose = null;
       return { targets: [rig.fixRigid(t)], tokens: [8, 9], rate: 1, tag: { kind: 'move' } };
     },
@@ -911,7 +1095,9 @@ function planTarget(pose, walking, key = null, from = null) {
   p = withDeviation(p, walking);
   if (drag?.part.endsWith('Hand') && drag.freeArm && !walking) p = holdFreeArm(p);
   if (drag && !(walking && drag.part.endsWith('Foot'))) p = reach(p, drag.part, leadPoint);
-  if (drag && mood.reluctant) { // dragging its feet: the trunk leans back from the pull
+  if (drag && mood.reluctant) { // dragging its feet: the trunk leans back from the pull, the head shakes no
+    const no = clipAt(mood.gesture ?? 'annoyed', clock);
+    if (no) p = upperFrom(p, no, 0.45, [...TRUNK_UP, ...ARM_JOINTS(drag.part === 'RightHand' ? 'Left' : 'Right')]);
     const P = rig.positions(p);
     const away = flat(P[0].clone().sub(drag.point));
     if (away.lengthSq() > 1e-6) { p = clonePose(p); rotateSubtree(rig, p, I.Spine1, new Quaternion().setFromAxisAngle(new Vector3().crossVectors(UP, away.normalize()), 0.2)); p = rig.fixRigid(p); }
@@ -922,8 +1108,9 @@ function planTarget(pose, walking, key = null, from = null) {
 }
 
 /** The walking style on a gait target: lower hips and bent knees (crouch), a bowed trunk (stoop), a lifted chest. */
+let styleScale = 1;
 function styleWalk(t) {
-  const { crouch, stoop, tall } = style;
+  const crouch = style.crouch * styleScale, stoop = style.stoop, tall = style.tall;
   if (crouch + stoop + tall < 0.02) return t;
   const feet = feetOf(t);
   const p = clonePose(t);
@@ -1016,9 +1203,18 @@ function locoReq(mode = 'now') {
         const fwd = new Vector3(Math.sin(end.yaw), 0, Math.cos(end.yaw));
         const dir = travelDir(end.vel, fwd);
         const phase = predictStance(tr, a, horizon, speed);
-        const entry = lookup(speed, dir, phase);
+        const crouchEntry = style.crouch > 0.45 && dir === 'f' ? lookup(speed, 'cf', phase) : null;
+        const entry = crouchEntry ?? lookup(speed, dir, phase);
+        styleScale = crouchEntry ? 0.4 : 1; // a crouched walk from the library is already low
         targets = entry ? entry.frames.map(f => placePose(f, end.yaw, ZERO, end.pos)) : path.map(p => placePose(STAND, p.yaw, ZERO, p.pos));
         targets = targets.map(t => planTarget(styleWalk(upright(t, speed)), true));
+        if (ctrl.stumble > 0 && mix) {
+          const push = ctrl.vel.clone().normalize(), f2 = new Vector3(Math.sin(end.yaw), 0, Math.cos(end.yaw));
+          const side = new Vector3().crossVectors(UP, f2).dot(push);
+          const name = push.dot(f2) < -0.4 ? 'stumble_back' : side > 0.4 ? 'react_right' : side < -0.4 ? 'react_left' : 'shoved';
+          const r = mix.clips[name] && mix.peak(name);
+          if (r) targets = targets.map(t => upperFrom(t, r, 0.4));
+        }
       } else if (drag || look.detached || deviation) {
         // standing: SOMA's own current pose, moved along the short path, shaped by the pull
         const h0 = rig.heading(rig.positions(from));
@@ -1062,6 +1258,15 @@ function idleReq(mode = 'end', fidget = false) {
       if (look.detached) {
         const t = planTarget(placePose(from, yaw - h, flat(from.root), A.clone().sub(flat(from.root))), false);
         return { targets: [t], tokens: [10, 11, 12, 13, 14], rate: 1, tag: { kind: 'idle' } };
+      }
+      if (fidget && mix && Math.random() < 0.5) {
+        const name = pick(['weight_shift', 'idle_breath'].filter(n => mix.clips[n]));
+        const c = name && mix.clips[name];
+        if (c) {
+          const q = c.poses[Math.floor(Math.random() * c.poses.length)];
+          const t = placePose(q, yaw, ZERO, A.clone().sub(flat(q.root)));
+          return { targets: [t], tokens: [12, 13, 14, 15], rate: 1, tag: { kind: 'idle' } };
+        }
       }
       return { targets: [freeTarget(A, yaw)], tokens: [10, 11, 12, 13, 14], rate: 1, fixEnd: false, tag: { kind: 'idle' } };
     },
@@ -1408,7 +1613,7 @@ function updateMood(dt) {
   if (over > 0) mood.annoy += dt * Math.min(0.6, 0.2 + 0.2 * over);
   else mood.annoy -= dt * (drag ? 0.05 : 0.2);
   mood.annoy = clamp(mood.annoy, 0, 2);
-  if (!mood.reluctant && mood.annoy > 1.2) { mood.reluctant = true; mood.reluctantSince = clock; }
+  if (!mood.reluctant && mood.annoy > 1.2) { mood.reluctant = true; mood.reluctantSince = clock; mood.gesture = pick(['annoyed', 'dismiss', 'head_shake']); }
   else if (mood.reluctant && mood.annoy < 0.5) mood.reluctant = false;
   // the pull turned round (to and fro): confusion when it happens again and again
   if (drag?.vf && drag.vf.length() > 0.7 && !drag.struck) {
@@ -1616,7 +1821,7 @@ if (params.has('debug')) {
     get shownP() { return shownP; }, get drag() { return drag; }, get bodyMotion() { return bodyMotion; },
     // a scripted pull: `point` is used as is (no screen ray)
     pull(part, point) { if (!part) releaseFoot(); drag = part ? { part, point, sent: null, scripted: true, freeArm: freeArmOf(part), start: clonePose(shown), seed: grabSeed() } : null; if (!part) planTimer = 0; },
-    poseBook, mood, style, book,
+    poseBook, mood, style, book, get mix() { return mix; }, get lastKick() { return lastKick; },
     draw: () => frame(performance.now()),
   };
 }

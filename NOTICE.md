@@ -13,6 +13,10 @@
 
 SOMA Fighter の `data/clips.npz` のうち、Mixamo（Adobe）のアニメーションを Motion Bricks Studio で SOMA 骨格に移したクリップ（`fbx-*`）から、ゲームが目標にする 16 個のキー × 4 フレームだけを取り出したもの（`tools/bake_keyposes.py`）。元のクリップとフレームは JSON の各キーに記録してある。公式 SOMA サンプル（BVH）由来のクリップと、画像から推定した静止ポーズは含めていない。
 
+## Mixamo のクリップ（`assets/mixamo_clips.json`）
+
+Mixamo（Adobe）のアニメーション 34 本（キック 7、ジャンプ 4、歩き 6、つまずき・転倒・起き上がり 6、身ぶり 5、押された反応 4、立ち姿 2）を X Bot で書き出し、`tools/mixamo_clips.mjs` で SOMA 骨格に移した姿勢データ。各関節の「T ポーズからの回転」を、骨の向きを合わせた SOMA の基本姿勢にかけ、腰の軌跡は腰の高さの比で縮めている。再生はせず、フレームを SOMA への目標に使う。元の FBX ファイルはリポジトリに含めない（`tools/mixamo_src/` は無視）。
+
 ## ライブラリ（CDN から読み込み）
 
 - [three.js](https://github.com/mrdoob/three.js) 0.186.1 — MIT
