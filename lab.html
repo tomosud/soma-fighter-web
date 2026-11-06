@@ -21,13 +21,13 @@
     <strong>SOMA Pull</strong>
     <label>最高速度 <input type="range" id="vmax" min="1" max="3" step="0.1" value="2.4"> <span id="vmax-v">2.4</span> m/s</label>
     <label>ひもの強さ <input type="range" id="stiff" min="1.5" max="4" step="0.1" value="2.6"> <span id="stiff-v">2.6</span></label>
-    <label class="toggle"><input type="checkbox" id="physics" checked> 重さ（物理）</label>
+    <label class="toggle"><input type="checkbox" id="physics" checked> 重さ（物理で反応を計画）</label>
     <button id="home" class="small">真ん中に戻す</button>
     <a href="./" class="small-link">格闘ゲームへ</a>
   </header>
 
   <aside class="gait">
-    <div class="stock-head">歩きのポーズ集（モデルの出力から育つ）</div>
+    <div class="stock-head">ポーズ集（SOMA の出力から育つ）</div>
     <div id="gait-bins"></div>
   </aside>
 
@@ -39,7 +39,7 @@
     </div>
     <dl class="guide-body">
       <dt><i class="dot pull"></i>黄色の球</dt>
-      <dd>手・腰・頭・足。ドラッグすると、ばねで引っ張る（体の重さでこらえ、たわむ）。強く引くとよろけて踏み出し、引き続けると歩き、走る</dd>
+      <dd>手・腰・頭・足。ドラッグで引っ張る。見えない物理が体の反応を計画し（薄い人形）、SOMA がそこへ動く。強く引くとよろけて踏み出し、引き続けると歩き、走る</dd>
       <dt><kbd>Shift</kbd> ＋ドラッグ</dt>
       <dd>床と平行に引く（奥・手前へ）</dd>
       <dt><i class="dot front"></i>水色の球</dt>

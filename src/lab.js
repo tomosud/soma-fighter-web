@@ -176,11 +176,14 @@ function lookup(speed, dir, phase) {
 function showLibrary() {
   const el = $('gait-bins');
   el.innerHTML = '';
+  let nr = 0;
+  if (typeof reactions !== 'undefined') for (const v of reactions.values()) nr += v.length;
   BINS.forEach((b, i) => {
     let n = 0;
     for (const [k, v] of library) if (k.startsWith(`${i}:`)) n += v.length;
     el.insertAdjacentHTML('beforeend', `<span>${b.name}</span><div class="bar"><div class="fill" style="width:${Math.min(100, (n / (PER_KEY * 8)) * 100)}%"></div></div><span class="n">${n}</span>`);
   });
+  el.insertAdjacentHTML('beforeend', `<span>引かれた反応</span><div class="bar"><div class="fill" style="width:${Math.min(100, (nr / 96) * 100)}%"></div></div><span class="n">${nr}</span>`);
 }
 
 // ---------------------------------------------------------------- the leash
@@ -319,10 +322,73 @@ function cascade(src, part, G, walking = false) {
   return rig.fixRigid(p);
 }
 
+// ---------------------------------------------------------------- reach (the grabbed limb only)
+
+/** Bend only the grabbed part toward G: a hand by collarbone and arm, a foot by the leg, the head by the neck. */
+function reach(src, part, G) {
+  const p = clonePose(src);
+  let P = rig.positions(p);
+  if (part.endsWith('Hand')) {
+    const side = sideOf(part), arm = chain(side, ARM), sh = I[side + 'Shoulder'];
+    const reachLen = reachOf(P, arm);
+    const ex = G.distanceTo(P[arm[0]]) - reachLen * 0.92;
+    const clav = clamp((ex + 0.15) / 0.35, 0, 1);
+    if (clav > 0) rotateSubtree(rig, p, sh, qpow(qcap(turn(P[arm[0]].clone().sub(P[sh]), G.clone().sub(P[sh])), 0.35), clav));
+    P = rig.positions(p);
+    const to = G.clone().sub(P[arm[0]]);
+    const tip = to.length() > reachLen * 0.995 ? P[arm[0]].clone().addScaledVector(to.normalize(), reachLen * 0.995) : G.clone();
+    const elbow = P[arm[1]].clone().sub(P[arm[0]].clone().lerp(P[arm[2]], 0.5));
+    twoBoneIK(rig, p, arm[0], arm[1], arm[2], tip, elbow.lengthSq() > 1e-6 ? elbow : new Vector3(0, -1, -0.3));
+  } else if (part.endsWith('Foot')) {
+    const leg = chain(sideOf(part), LEG);
+    const goal = G.clone();
+    goal.y = clamp(goal.y, ANKLE, P[leg[0]].y - 0.12);
+    const reachLen = reachOf(P, leg) * 0.98;
+    const to = goal.clone().sub(P[leg[0]]);
+    const tip = to.length() > reachLen ? P[leg[0]].clone().addScaledVector(to.normalize(), reachLen) : goal;
+    twoBoneIK(rig, p, leg[0], leg[1], leg[2], tip, facing(P).add(new Vector3(0, 0.6, 0)));
+  } else if (part === 'Head') {
+    const q = qcap(turn(P[I.Head].clone().sub(P[I.Neck1]), G.clone().sub(P[I.Neck1])), 0.5);
+    rotateSubtree(rig, p, I.Neck1, qpow(q, 0.5));
+    rotateSubtree(rig, p, I.Head, qpow(q, 0.5));
+  }
+  return rig.fixRigid(p);
+}
+
+// Reaction poses grown from SOMA's own output: while the body is being pulled, middle frames of what SOMA made are
+// kept by which part was pulled and in which direction (relative to the body). A later pull of the same kind starts
+// its target partly from one of them, so the vocabulary of leaning, reaching and bracing comes from the model.
+const reactions = new Map();
+const REACT_JOINTS = new Set(['Spine1', 'Spine2', 'Chest', 'Neck1', 'Neck2', 'Head', 'LeftShoulder', 'LeftArm', 'LeftForeArm', 'LeftHand',
+  'RightShoulder', 'RightArm', 'RightForeArm', 'RightHand'].map(n => I[n]));
+function reactionKey(part, P, G) {
+  const d = flat(G.clone().sub(P[I[ANCHOR[part]]]));
+  if (d.length() < 0.15) return null;
+  const rel = wrap(Math.atan2(d.x, d.z) - rig.heading(P));
+  return `${part}:${(Math.round(rel / (Math.PI / 4)) + 8) % 8}`;
+}
+function harvestReaction(frames, key) {
+  if (!key || frames.length < 12) return;
+  const mid = frames[Math.floor(frames.length * rand(0.45, 0.75))].pose;
+  const list = reactions.get(key) ?? [];
+  const entry = canonicalize([mid])[0];
+  if (list.length < 6) list.push(entry); else list[Math.floor(Math.random() * 6)] = entry;
+  reactions.set(key, list);
+  showLibrary();
+}
+/** Move the upper body part of the way toward a stored reaction of the same kind (legs and placement stay). */
+function blendReaction(pose, key, w = 0.35) {
+  const list = key && reactions.get(key);
+  if (!list?.length) return pose;
+  const L = toLocal(pose), Lr = toLocal(list[Math.floor(Math.random() * list.length)]);
+  for (const j of REACT_JOINTS) L[j].slerp(Lr[j], w);
+  const out = fromLocal(pose.root, L);
+  if (pose.contact) out.contact = pose.contact;
+  return out;
+}
+
 // ---------------------------------------------------------------- gaze
 
-// `detached`: the knob was moved and keeps its place relative to the body (left, height above the hips, ahead),
-// measured on a smoothed body facing so the gait's sway does not shake it
 const look = { detached: false, local: new Vector3(0, 0.6, 1.2), point: new Vector3(0, 1.6, 1.2), smooth: new Vector3(0, 1.6, 1.2), yaw: 0 };
 const bodyAxes = yaw => ({ fwd: new Vector3(Math.sin(yaw), 0, Math.cos(yaw)), left: new Vector3(Math.cos(yaw), 0, -Math.sin(yaw)) });
 function lookToLocal(pt, hips) {
@@ -372,15 +438,32 @@ function freeTarget(pos, yaw) {
   return t;
 }
 
+/**
+ * A target made from one of SOMA's own frames: a stored reaction mixed in, the body's response the (unseen)
+ * physics predicts, the grabbed limb reaching, and the gaze. SOMA makes every frame in between.
+ */
+function planTarget(pose, walking, key = null) {
+  let p = pose;
+  if (drag && !walking) p = blendReaction(p, key);
+  p = withDeviation(p);
+  if (drag) p = reach(p, drag.part, drag.point);
+  if (drag || look.detached) { p = clonePose(p); gaze(p, look.smooth); p = rig.fixRigid(p); }
+  if (pose.contact) p.contact = pose.contact;
+  return p;
+}
+
+let lastKey = null;
 function locoReq(mode = 'now') {
   return {
-    kind: 'move', mode, context: bodyContext,
+    kind: 'move', mode,
     build(tr, a, ctx) {
       const from = ctx[3];
       const horizon = horizonFor(ctrl.stretch, ctrl.vel.length() > 0.3);
       const path = predict(from, horizon);
       const end = path[0];
       const speed = end.vel.length();
+      const key = drag ? reactionKey(drag.part, rig.positions(from), drag.point) : null;
+      lastKey = key;
       let targets, free = false;
       if (speed >= 0.3) {
         const fwd = new Vector3(Math.sin(end.yaw), 0, Math.cos(end.yaw));
@@ -390,28 +473,29 @@ function locoReq(mode = 'now') {
         const phase = now === 'L' || now === 'R' ? (steps % 2 ? (now === 'L' ? 'R' : 'L') : now) : (Math.random() < 0.5 ? 'L' : 'R');
         const entry = lookup(speed, dir, phase);
         targets = entry ? entry.frames.map(f => placePose(f, end.yaw, ZERO, end.pos)) : path.map(p => placePose(STAND, p.yaw, ZERO, p.pos));
-        if (drag) targets = targets.map(t => cascade(t, drag.part, drag.point, true));
-      } else if (drag) {
-        // standing and being pulled: the body as it is now, moved along the (short) path, with the pull cascaded
+        targets = targets.map(t => planTarget(t, true));
+      } else if (drag || look.detached || deviation) {
+        // standing: SOMA's own current pose, moved along the short path, shaped by the pull
         const h0 = rig.heading(rig.positions(from));
-        targets = path.map(p => cascade(placePose(from, wrap(p.yaw - h0), flat(from.root), flat(p.pos).sub(flat(from.root))), drag.part, drag.point));
+        targets = path.map(p => planTarget(placePose(from, wrap(p.yaw - h0), flat(from.root), flat(p.pos).sub(flat(from.root))), false, key));
       } else {
         targets = [freeTarget(end.pos, end.yaw)];
         free = true;
       }
       ghostPose = free ? null : targets[0];
+      const standingPull = drag && speed < 0.3;
       return {
         targets, tokens: tokensFor(horizon), rate: 1, tag: { kind: free ? 'idle' : 'move' }, fixEnd: !free,
-        after: (_tr, _a, frames) => harvest(frames),
+        after: (_tr, _a, frames) => { harvest(frames); if (standingPull) harvestReaction(frames, key); },
       };
     },
   };
 }
 
-/** Standing: shift the weight a little now and then. */
+/** Standing: shift the weight a little now and then (looking where the gaze knob says, when it was moved). */
 function idleReq(mode = 'end', fidget = false) {
   return {
-    kind: 'idle', mode, context: bodyContext,
+    kind: 'idle', mode,
     build(tr, a, ctx) {
       const from = ctx[3];
       const h = rig.heading(rig.positions(from));
@@ -419,6 +503,10 @@ function idleReq(mode = 'end', fidget = false) {
       let yaw = h;
       if (fidget) { yaw += rand(-0.12, 0.12); const ang = rand(0, Math.PI * 2); A.add(new Vector3(Math.sin(ang), 0, Math.cos(ang)).multiplyScalar(rand(0.02, 0.06))); }
       ghostPose = null;
+      if (look.detached) {
+        const t = planTarget(placePose(from, yaw - h, flat(from.root), A.clone().sub(flat(from.root))), false);
+        return { targets: [t], tokens: [10, 11, 12, 13, 14], rate: 1, tag: { kind: 'idle' } };
+      }
       return { targets: [freeTarget(A, yaw)], tokens: [10, 11, 12, 13, 14], rate: 1, fixEnd: false, tag: { kind: 'idle' } };
     },
   };
@@ -543,32 +631,16 @@ controls.minDistance = 1.5;
 controls.maxDistance = 14;
 controls.update();
 
-// ---------------------------------------------------------------- the body: motion + physics
+// ---------------------------------------------------------------- the body: SOMA shown as is, physics plans unseen
 
+// The screen shows SOMA's output and nothing else. An unseen ragdoll follows that motion and takes the pull; how far
+// it is pushed (hips, trunk, legs) goes into the next target, so SOMA itself moves the body there.
 const ragdoll = new Ragdoll(rig);
 let clock = 0;
+let planned = clonePose(STAND); // the unseen physical body (shown faintly)
 
-/** What the muscles aim for: the generated motion with breathing and the gaze on it (and, without physics, the pull). */
-function aim(anim, dt) {
-  clock += dt;
-  let p = settings.physics || !drag ? clonePose(anim) : cascade(anim, drag.part, drag.point, ctrl.vel.length() > 0.3);
-  const P = rig.positions(p);
-  const breath = settings.breath ? Math.sin(clock * Math.PI * 2 / 4.2) : 0;
-  const left = new Vector3().crossVectors(UP, facing(P));
-  rotateSubtree(rig, p, I.Chest, new Quaternion().setFromAxisAngle(left, -0.018 * breath));
-  rotateSubtree(rig, p, I.LeftShoulder, new Quaternion().setFromAxisAngle(facing(P), 0.012 * breath));
-  rotateSubtree(rig, p, I.RightShoulder, new Quaternion().setFromAxisAngle(facing(P), -0.012 * breath));
-  const target = look.detached || !drag ? look.point : drag.point;
-  look.smooth.lerp(target, 1 - Math.exp(-dt * 6));
-  if (settings.gaze) gaze(p, look.smooth);
-  p = rig.fixRigid(p);
-  if (anim.contact) p.contact = anim.contact;
-  return p;
-}
-
-// How far physics has pushed the body away from the motion right now (hips offset and the trunk's turns). The next
-// generation starts from the recorded motion with this applied, so MotionBricks continues from where the body
-// really is: a pushed body recovers with its own steps.
+// How far the unseen physics has pushed the body away from SOMA's motion (hips offset and trunk/leg turns); the
+// next target carries it, so SOMA moves the body there and recovers with its own steps.
 // Only what an outside force did is fed back (while pulled, stumbling, or just released), with a dead zone and a
 // gain below one, so the loop cannot run away on its own.
 let deviation = null;
@@ -600,7 +672,6 @@ function withDeviation(pose) {
   if (pose.contact) out.contact = pose.contact;
   return out;
 }
-function bodyContext(tr, a) { return tr.context(a).map(withDeviation); }
 
 // balance: when the capture point (where the centre of mass is heading, x + v * sqrt(h / g)) leaves the feet,
 // step toward it
@@ -654,7 +725,11 @@ function balance(dt) {
 
 const STEP = 1 / 60;
 let acc = 0, last = performance.now(), fpsAcc = 0, fpsN = 0, fps = 0;
-let planTimer = 0, idleTimer = 3;
+let planTimer = 0, idleTimer = 3, lastPlannedDev = 0;
+function deviationSize() {
+  if (!deviation) return 0;
+  return deviation.root.length() + deviation.rot.reduce((a, q) => a + 2 * Math.acos(Math.min(1, Math.abs(q.w))), 0) * 0.25;
+}
 
 function simulate(dt) {
   if (drag && !drag.scripted) { const pt = pointOn(drag); if (pt) drag.point.copy(pt); }
@@ -670,9 +745,11 @@ function simulate(dt) {
   if (scheduler.ready && !track.busy) {
     const moving = ctrl.vel.length() > 0.05 || ctrl.want.length() > 0.05;
     const pointerMoved = drag && (!drag.sent || drag.sent.distanceTo(drag.point) > 0.04);
-    if ((moving || pointerMoved) && planTimer <= 0) {
+    const pushed = deviation && Math.abs(deviationSize() - lastPlannedDev) > 0.04; // the physics expects a new lean
+    if ((moving || pointerMoved || pushed || lookDrag) && planTimer <= 0) {
       if (drag) drag.sent = drag.point.clone();
-      track.request(locoReq('now'));
+      lastPlannedDev = deviationSize();
+      track.request(!moving && !drag && lookDrag ? idleReq('now') : locoReq('now'));
       planTimer = 0.18 + 0.12 * Math.min(1, ctrl.stretch);
     } else if (!moving && !drag) {
       if (track.remaining / FPS < scheduler.latency + 0.3) track.request(idleReq('end'));
@@ -682,19 +759,18 @@ function simulate(dt) {
   track.advance(dt);
   scheduler.tick([track]);
   const f = track.frames[Math.min(track.frames.length - 1, Math.floor(track.t))].pose;
-  const anim = clonePose(track.display);
-  anim.contact = f.contact;
-  const target = aim(anim, dt);
-  if (settings.physics) {
-    ragdoll.step(dt, target, f.contact, drag ? { name: drag.part, point: drag.point } : null);
-    shown = ragdoll.pose(target);
-    measureDeviation(anim, shown);
-    balance(dt);
-  } else {
-    shown = target;
-    deviation = null;
-  }
+  shown = clonePose(track.display); // SOMA's output, untouched
+  shown.contact = f.contact;
   shownP = rig.positions(shown);
+  clock += dt;
+  const lookAt = look.detached || !drag ? look.point : drag.point;
+  look.smooth.lerp(lookAt, 1 - Math.exp(-dt * 6));
+  if (settings.physics) {
+    ragdoll.step(dt, shown, f.contact, drag ? { name: drag.part, point: drag.point } : null);
+    planned = ragdoll.pose(shown);
+    measureDeviation(shown, planned);
+    balance(dt);
+  } else deviation = null;
 }
 
 function frame(now) {
@@ -703,11 +779,12 @@ function frame(now) {
   acc += dt;
   while (acc >= STEP) { simulate(STEP); acc -= STEP; }
   body.update(shownP, rig.extraPositions(shown, shownP), dt);
-  if (ghostPose) {
-    const P = rig.positions(ghostPose);
-    ghost.update(P, rig.extraPositions(ghostPose, P), dt);
+  const faint = drag && settings.physics ? planned : ghostPose;
+  if (faint) {
+    const P = rig.positions(faint);
+    ghost.update(P, rig.extraPositions(faint, P), dt);
   }
-  ghost.group.visible = !!ghostPose;
+  ghost.group.visible = !!faint;
   for (const h of handles) h.mesh.position.copy(shownP[I[h.part]]);
   lookKnob.position.copy(look.point);
   const lookColor = look.detached ? LOOK_FIXED : LOOK_FRONT;
@@ -818,7 +895,7 @@ $('physics').addEventListener('input', () => ragdoll.reset(shown));
 requestAnimationFrame(frame);
 if (params.has('debug')) {
   window.lab = {
-    track, scheduler, simulate, settings, ctrl, library, rig, stage, look, cascade, ragdoll, get deviation() { return deviation; }, get pushedUntil() { return pushedUntil; }, get clock() { return clock; },
+    track, scheduler, simulate, settings, ctrl, library, reactions, rig, stage, look, cascade, ragdoll, get planned() { return planned; }, get deviation() { return deviation; }, get pushedUntil() { return pushedUntil; }, get clock() { return clock; },
     get shownP() { return shownP; }, get drag() { return drag; },
     // a scripted pull: `point` is used as is (no screen ray)
     pull(part, point) { drag = part ? { part, point, sent: null, scripted: true } : null; if (!part) planTimer = 0; },
