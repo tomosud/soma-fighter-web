@@ -111,6 +111,23 @@ function makeStand() {
 const STAND = makeStand();
 const HIPS_Y = STAND.root.y;
 
+/** Forward lean of the trunk (hips to neck, from vertical, toward the facing), in radians. */
+function trunkLean(P) {
+  const v = P[I.Neck1].clone().sub(P[0]);
+  return Math.atan2(v.dot(facing(P)), v.y);
+}
+/** Stand the trunk up to a natural walking lean (about 3 degrees plus 2 per m/s), if it leans further forward. */
+function upright(pose, speed) {
+  const P = rig.positions(pose);
+  const extra = trunkLean(P) - (3 + 2 * speed) * Math.PI / 180;
+  if (extra <= 0) return pose;
+  const p = clonePose(pose);
+  rotateSubtree(rig, p, I.Spine1, new Quaternion().setFromAxisAngle(new Vector3().crossVectors(UP, facing(P)), -extra));
+  const out = rig.fixRigid(p);
+  if (pose.contact) out.contact = pose.contact;
+  return out;
+}
+
 function canonicalize(poses, ref = poses[0]) {
   const h = rig.heading(rig.positions(ref));
   const at = new Vector3(ref.root.x, 0, ref.root.z);
@@ -149,6 +166,7 @@ function harvest(frames) {
     const bin = binOf(mean);
     if (bin < 0) continue;
     if (w.some(p => p.root.y < HIPS_Y - 0.14 || p.root.y > HIPS_Y + 0.08)) continue;
+    if (w.some(p => trunkLean(rig.positions(p)) > 12 * Math.PI / 180)) continue; // no stooped walks in the library
     if (w.some(p => { const Q = rig.positions(p); return Math.min(Q[I.LeftFoot].y, Q[I.RightFoot].y) > 0.22; })) continue;
     const fwd = facing(rig.positions(w[0]));
     const dir = v[1].dot(fwd) / Math.max(1e-6, v[1].length()) < -0.3 ? 'b' : 'f';
@@ -195,7 +213,7 @@ const ANCHOR = { LeftHand: 'LeftArm', RightHand: 'RightArm', Hips: 'Hips', Head:
 
 function pullVelocity(P) {
   ctrl.stretch = 0;
-  if (!drag || isKick()) return new Vector3();
+  if (!drag || drag.struck || isKick() || (drag.part.endsWith('Hand') && (drag.age ?? 1) < 0.35)) return new Vector3();
   const d = flat(drag.point.clone().sub(P[I[ANCHOR[drag.part]]]));
   const stretch = d.length() - SLACK[drag.part];
   ctrl.stretch = Math.max(0, stretch);
@@ -436,7 +454,8 @@ function kickTarget(from, part, G) {
 // A hand flicked fast is a punch toward where it is heading: up = uppercut, across the body = hook, otherwise a jab
 // (left) or a cross (right). The keys are Mixamo-derived (jab and uppercut thrown with the left hand, cross and
 // hook with the right) and mirrored for the other hand. SOMA makes the wind-up and the strike.
-const PUNCH_SPEED = 1.8; // m/s of the pointer
+const PUNCH_SPEED = 1.3; // m/s of the pointer, within PUNCH_WINDOW s of grabbing the hand
+const PUNCH_WINDOW = 0.5;
 const PUNCH_KEYS = { jab: 'Left', cross: 'Right', hook: 'Right', uppercut: 'Left' };
 const kickRate = () => clamp(1.2 + 0.4 * (drag?.vel?.length() ?? 0), 1.4, 2.6);
 
@@ -449,7 +468,7 @@ function punchKind(part, vel, P) {
   return part === 'LeftHand' ? 'jab' : 'cross';
 }
 
-function punchReq(part, G, vel) {
+function punchReq(part, G, vel, start) {
   return {
     kind: 'attack', mode: 'now', interrupt: true,
     build(tr, a, ctx) {
@@ -466,17 +485,40 @@ function punchReq(part, G, vel) {
       const step = clamp(dist - Math.hypot(hand.x, hand.z), -0.15, 0.35);
       const at = dist > 1e-3 ? hips.clone().addScaledVector(d.clone().normalize(), step) : hips;
       let t = placePose(base, Math.atan2(d.x, d.z) - Math.atan2(hand.x, hand.z), ZERO, at);
-      t = reach(t, part, aimAt);
+      // a punch is thrown out: along the flick to nearly full reach, even if the pointer stopped close
+      const Pt = rig.positions(t), sh = Pt[I[sideOf(part) + 'Arm']];
+      const armLen = reachOf(Pt, chain(sideOf(part), ARM));
+      const toAim = aimAt.clone().sub(sh);
+      const fist = sh.clone().addScaledVector(toAim.normalize(), Math.max(aimAt.distanceTo(sh), armLen * 0.92));
+      t = reach(t, part, fist);
       t = clonePose(t);
-      gaze(t, aimAt);
+      gaze(t, fist);
       t = rig.fixRigid(t);
       ghostPose = t;
       lastPunch = kind;
-      return { targets: [t], tokens: [6], rate: clamp(1.4 + 0.35 * vel.length(), 1.6, 2.6), tag: { kind: 'move' } };
+      const rate = clamp(1.4 + 0.35 * vel.length(), 1.6, 2.6);
+      return { targets: [t], tokens: [6], rate, tag: { kind: 'move' }, after: (tr2, a0, frames) => afterStrike(tr2, frames, rate, start) };
     },
   };
 }
-let lastPunch = null, punchWait = 0;
+function kickReq(part, G, start) {
+  return {
+    kind: 'attack', mode: 'now', interrupt: true,
+    build(tr, a, ctx) {
+      const t = kickTarget(ctx[3], part, G);
+      ghostPose = t;
+      const rate = kickRate();
+      return { targets: [t], tokens: [6, 7], rate, tag: { kind: 'move' }, after: (tr2, a0, frames) => afterStrike(tr2, frames, rate, start) };
+    },
+  };
+}
+
+/** A strike is one shot: when it has landed, the limb comes back down to the pose before the grab. */
+function afterStrike(tr, frames, rate, start) {
+  if (start) tr.request(settleReq(start, 'end'));
+  settleUntil = clock + frames.length / FPS / rate + 1.0;
+}
+let lastPunch = null;
 
 // ---------------------------------------------------------------- gaze
 
@@ -597,16 +639,13 @@ function locoReq(mode = 'now') {
       const key = drag ? reactionKey(drag.part, rig.positions(from), drag.point) : null;
       lastKey = key;
       let targets, free = false;
-      const kicking = isKick();
-      if (kicking) {
-        targets = [kickTarget(from, drag.part, leadPoint)];
-      } else if (speed >= 0.3) {
+      if (speed >= 0.3) {
         const fwd = new Vector3(Math.sin(end.yaw), 0, Math.cos(end.yaw));
         const dir = end.vel.dot(fwd) / speed < -0.3 ? 'b' : 'f';
         const phase = predictStance(tr, a, horizon, speed);
         const entry = lookup(speed, dir, phase);
         targets = entry ? entry.frames.map(f => placePose(f, end.yaw, ZERO, end.pos)) : path.map(p => placePose(STAND, p.yaw, ZERO, p.pos));
-        targets = targets.map(t => planTarget(t, true));
+        targets = targets.map(t => planTarget(upright(t, speed), true));
       } else if (drag || look.detached || deviation) {
         // standing: SOMA's own current pose, moved along the short path, shaped by the pull
         const h0 = rig.heading(rig.positions(from));
@@ -616,12 +655,12 @@ function locoReq(mode = 'now') {
         free = true;
       }
       ghostPose = free ? null : targets[0];
-      const standingPull = drag && speed < 0.3 && !kicking;
-      // an arm reaching in place moves faster than a walking body, and a kick faster still
+      const standingPull = drag && speed < 0.3;
+      // an arm reaching in place moves faster than a walking body
       return {
-        targets, tokens: kicking ? [6, 7] : tokensFor(horizon), rate: kicking ? kickRate() : standingPull ? 1.3 : 1,
+        targets, tokens: tokensFor(horizon), rate: standingPull ? 1.3 : 1,
         tag: { kind: free ? 'idle' : 'move' }, fixEnd: !free,
-        after: (_tr, _a, frames) => { if (!kicking) harvest(frames); if (standingPull) harvestReaction(frames, key); },
+        after: (_tr, _a, frames) => { harvest(frames); if (standingPull) harvestReaction(frames, key); },
       };
     },
   };
@@ -753,11 +792,11 @@ function freeArmOf(part) {
   return { joints, local: joints.map(j => L[j].clone()) };
 }
 let settleTo = null, settleUntil = 0;
-function releaseFoot() { if (drag?.part.endsWith('Foot') && drag.start) settleTo = drag.start; }
+function releaseFoot() { if (drag?.part.endsWith('Foot') && drag.start && !drag.struck) settleTo = drag.start; }
 /** Back to the pose SOMA had before the foot was pulled, where the body is now and facing as it does now. */
-function settleReq(start) {
+function settleReq(start, mode = 'now') {
   return {
-    kind: 'hit', mode: 'now', interrupt: true,
+    kind: mode === 'now' ? 'hit' : 'idle', mode, interrupt: mode === 'now',
     build(tr, a, ctx) {
       const from = ctx[3];
       const dy = rig.heading(rig.positions(from)) - rig.heading(rig.positions(start));
@@ -893,6 +932,7 @@ function deviationSize() {
 function simulate(dt) {
   if (drag && !drag.scripted) { const pt = pointOn(drag); if (pt) drag.point.copy(pt); }
   if (drag) { // how fast the pointer moves (smoothed): targets aim where it will be when SOMA gets there
+    drag.age = (drag.age ?? 0) + dt;
     drag.vel ??= new Vector3();
     if (drag.prev) drag.vel.lerp(drag.point.clone().sub(drag.prev).divideScalar(dt), 1 - Math.exp(-dt * 8));
     drag.prev = drag.point.clone();
@@ -906,15 +946,23 @@ function simulate(dt) {
   ctrl.want.copy(pullVelocity(shownP));
   approach(ctrl.vel, ctrl.want, dt);
   planTimer -= dt; idleTimer -= dt;
-  punchWait -= dt;
-  if (scheduler.ready && drag?.part.endsWith('Hand') && drag.vel && drag.vel.length() > PUNCH_SPEED && punchWait <= 0) {
-    track.request(punchReq(drag.part, drag.point.clone(), drag.vel.clone()));
-    punchWait = 0.45;
-    planTimer = 0.35; // let the punch land before reaching again
+  // strikes: a hand flicked right after it is grabbed punches; a foot pulled above the knee kicks. One shot each.
+  if (scheduler.ready && drag && !drag.struck) {
+    const flick = drag.part.endsWith('Hand') && drag.age < PUNCH_WINDOW && drag.vel?.length() > PUNCH_SPEED;
+    // a kick is aimed once the foot's pull has (nearly) arrived: when the pointer stops, or a quarter second after
+    // it passed the knee
+    if (isKick()) drag.kickArmed ??= clock; else drag.kickArmed = null;
+    const kickNow = drag.kickArmed != null && (drag.vel.length() < 0.6 || clock - drag.kickArmed > 0.25);
+    if (flick || kickNow) {
+      track.request(flick ? punchReq(drag.part, drag.point.clone(), drag.vel.clone(), drag.start)
+        : kickReq(drag.part, drag.point.clone().add(drag.vel.clone().multiplyScalar(0.15).clampLength(0, 0.3)), drag.start));
+      drag.struck = true;
+      ctrl.vel.set(0, 0, 0);
+    }
   }
   if (scheduler.ready && settleTo && !drag) { track.request(settleReq(settleTo)); settleTo = null; idleTimer = 2.5; settleUntil = clock + 1.2; }
   // while the foot comes down after a kick, nothing re-plans from the raised leg
-  if (scheduler.ready && !track.busy && (drag || clock >= settleUntil)) {
+  if (scheduler.ready && !track.busy && !drag?.struck && (drag || clock >= settleUntil)) {
     const moving = ctrl.vel.length() > 0.05 || ctrl.want.length() > 0.05;
     // re-plan when where the target would aim has moved (the pointer, or its lead as a flick slows down and stops)
     const aimNow = drag ? drag.point.clone().add((drag.vel ?? new Vector3()).clone().multiplyScalar(scheduler.latency + 0.5).clampLength(0, 0.45)) : null;
