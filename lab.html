@@ -31,12 +31,29 @@
     <div id="gait-bins"></div>
   </aside>
 
-  <footer class="help">
-    <span>黄色の球（手・腰・頭・足）をドラッグ：引っ張る（遠くへ引くと歩き、走る。Shift で奥・手前へ）</span>
-    <span>水色の球：見る方向（ダブルクリックで正面に戻す）</span>
-    <span>空いた所をドラッグ：視点</span>
-    <span id="stats"></span>
-  </footer>
+  <aside class="guide" id="guide">
+    <div class="guide-head">
+      <span>操作</span>
+      <span class="look-state">視線：<b id="look-mode" class="front">正面（体についてくる）</b></span>
+      <button id="guide-toggle" class="icon" aria-label="操作説明を閉じる" title="操作説明を開く・閉じる">?</button>
+    </div>
+    <dl class="guide-body">
+      <dt><i class="dot pull"></i>黄色の球</dt>
+      <dd>手・腰・頭・足。ドラッグで引っ張る。少しなら体がたわんで手が届き、遠くへ引くと歩き、もっと引くと走る</dd>
+      <dt><kbd>Shift</kbd> ＋ドラッグ</dt>
+      <dd>床と平行に引く（奥・手前へ）</dd>
+      <dt><i class="dot front"></i>水色の球</dt>
+      <dd>見る方向・正面（体についてくる）。ドラッグすると空間に固定される</dd>
+      <dt><i class="dot fixed"></i>ピンクの球</dt>
+      <dd>見る方向・空間に固定。後ろに置くと体ごと振り向く。<b>ダブルクリックで正面に戻す</b></dd>
+      <dt>空いた所をドラッグ</dt>
+      <dd>視点を回す（ホイールで寄る・離れる）。カメラは体についてくる</dd>
+      <dt>画面の端で止める</dt>
+      <dd>引っ張ったままマウスを端に置くと、どこまでも歩き続ける</dd>
+    </dl>
+  </aside>
+
+  <footer class="help"><span id="stats"></span></footer>
 
   <section id="overlay">
     <div class="card">

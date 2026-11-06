@@ -20,3 +20,28 @@ button.small { width: auto; margin: 0; padding: 5px 10px; font-size: 13px; }
   .gait { top: auto; bottom: 44px; left: 16px; right: 16px; width: auto; }
   .lab-bar input[type=range] { width: 80px; }
 }
+
+.guide { position: fixed; left: 16px; bottom: 40px; width: min(380px, calc(100% - 32px)); background: var(--panel);
+  border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 8px; font-size: 13px; line-height: 1.5; }
+.guide-head { display: flex; align-items: center; gap: 10px; padding: 7px 10px; border-bottom: 1px solid rgba(255, 255, 255, 0.08); }
+.guide-head > span:first-child { font-weight: 700; }
+.look-state { color: var(--muted); margin-left: auto; }
+.look-state b { font-weight: 600; }
+.look-state b.front { color: #7fe3ff; }
+.look-state b.fixed { color: #ff7ad9; }
+button.icon { width: 24px; height: 24px; margin: 0; padding: 0; border-radius: 50%; font-size: 13px; line-height: 24px; }
+.guide-body { display: grid; grid-template-columns: max-content 1fr; gap: 6px 10px; margin: 0; padding: 8px 10px 10px; }
+.guide-body dt { color: var(--text); white-space: nowrap; display: flex; align-items: center; gap: 6px; }
+.guide-body dd { margin: 0; color: var(--muted); }
+.guide.closed .guide-body { display: none; }
+.guide.closed .guide-head { border-bottom: 0; }
+.dot { display: inline-block; width: 11px; height: 11px; border-radius: 50%; }
+.dot.pull { background: #ffe08a; }
+.dot.front { background: #7fe3ff; }
+.dot.fixed { background: #ff7ad9; }
+.help { left: auto; right: 16px; justify-content: flex-end; }
+@media (max-width: 760px) {
+  .guide { bottom: auto; top: 120px; }
+  .guide-body { grid-template-columns: 1fr; }
+  .guide-body dd { margin-bottom: 4px; }
+}

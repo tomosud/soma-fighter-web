@@ -436,10 +436,12 @@ const handles = HANDLE_PARTS.map(part => {
   scene.add(mesh);
   return { part, mesh };
 });
-const lookKnob = new THREE.Mesh(new THREE.SphereGeometry(0.07, 16, 12), new THREE.MeshBasicMaterial({ color: 0x7fe3ff, depthTest: false, transparent: true, opacity: 0.85 }));
+// gaze knob colours: cyan = in front of the face (follows the body), pink = fixed in space
+const LOOK_FRONT = 0x7fe3ff, LOOK_FIXED = 0xff7ad9;
+const lookKnob = new THREE.Mesh(new THREE.SphereGeometry(0.07, 16, 12), new THREE.MeshBasicMaterial({ color: LOOK_FRONT, depthTest: false, transparent: true, opacity: 0.85 }));
 lookKnob.renderOrder = 10;
 const lookLine = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new Vector3(), new Vector3()]),
-  new THREE.LineDashedMaterial({ color: 0x7fe3ff, dashSize: 0.06, gapSize: 0.05, depthTest: false, transparent: true, opacity: 0.6 }));
+  new THREE.LineDashedMaterial({ color: LOOK_FRONT, dashSize: 0.06, gapSize: 0.05, depthTest: false, transparent: true, opacity: 0.6 }));
 lookLine.renderOrder = 9;
 scene.add(lookKnob, lookLine);
 const band = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new Vector3(), new Vector3()]),
@@ -649,6 +651,14 @@ function frame(now) {
   ghost.group.visible = !!ghostPose;
   for (const h of handles) h.mesh.position.copy(shownP[I[h.part]]);
   lookKnob.position.copy(look.point);
+  const lookColor = look.detached ? LOOK_FIXED : LOOK_FRONT;
+  if (lookKnob.material.color.getHex() !== lookColor) {
+    lookKnob.material.color.setHex(lookColor);
+    lookLine.material.color.setHex(lookColor);
+    const el = $('look-mode');
+    el.textContent = look.detached ? '空間に固定' : '正面（体についてくる）';
+    el.className = look.detached ? 'fixed' : 'front';
+  }
   lookLine.geometry.setFromPoints([shownP[I.Head], look.point]);
   lookLine.computeLineDistances();
   band.visible = grip.visible = !!drag;
@@ -730,6 +740,15 @@ $('home').addEventListener('click', () => {
   look.detached = false;
   locks.Left = locks.Right = null;
   for (const v of [...springS, ...springV, rootS, rootV]) v.set(0, 0, 0);
+});
+// the guide can be folded away; the choice is remembered on this browser
+let guidePref = null;
+try { guidePref = localStorage.getItem('soma-pull-guide'); } catch { /* no storage */ }
+if (guidePref === 'closed' || (guidePref === null && innerWidth < 760)) $('guide').classList.add('closed'); // narrow screens start folded
+$('guide-toggle').addEventListener('click', () => {
+  const closed = $('guide').classList.toggle('closed');
+  $('guide-toggle').setAttribute('aria-label', closed ? '操作説明を開く' : '操作説明を閉じる');
+  try { localStorage.setItem('soma-pull-guide', closed ? 'closed' : 'open'); } catch { /* no storage */ }
 });
 if (!navigator.gpu) $('gpu-note').textContent = 'このブラウザでは WebGPU が使えません。WASM（CPU）で動きますが、かなり遅くなります。';
 
