@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SOMA Pose Lab</title>
+  <meta name="description" content="MotionBricks（SOMA）で生成した動きの途中のポーズを変異させてストックし、だんだん展開していくラボ。手足を引っ張るとついてくる">
+  <link rel="stylesheet" href="src/style.css">
+  <link rel="stylesheet" href="src/lab.css">
+  <script type="importmap">
+    { "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.186.1/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.186.1/examples/jsm/"
+    } }
+  </script>
+</head>
+<body class="lab">
+  <canvas id="view"></canvas>
+
+  <header class="lab-bar">
+    <strong>SOMA Pose Lab</strong>
+    <label class="toggle"><input type="checkbox" id="auto" checked> 自動展開</label>
+    <label>変異 <input type="range" id="strength" min="0" max="1" step="0.05" value="0.45"> <span id="strength-v">0.45</span></label>
+    <label>速さ <input type="range" id="rate" min="0.6" max="2.4" step="0.1" value="1.2"> <span id="rate-v">1.2</span></label>
+    <button id="reset" class="small">ストックを戻す</button>
+    <a href="./" class="small-link">格闘ゲームへ</a>
+  </header>
+
+  <aside class="stock">
+    <div class="stock-head">ストック <span id="stock-n">0</span> · 世代 <span id="gen">0</span></div>
+    <div id="stock-grid"></div>
+  </aside>
+
+  <footer class="help">
+    <span>手・足・頭・腰の球をドラッグ：引っ張る</span>
+    <span>空いた所をドラッグ：視点</span>
+    <span>ストックをクリック：次にその姿勢へ</span>
+    <span id="stats"></span>
+  </footer>
+
+  <section id="overlay">
+    <div class="card">
+      <h1>SOMA Pose Lab</h1>
+      <p>MotionBricks（SOMA）が、ストックから選んで変異させた姿勢へ向かう動きを次々に生成します。生成された動きの途中の姿勢を取り出し、さらに変異させてストックに加えるので、姿勢はだんだん人間離れしていきます。手足を引っ張ると、引っ張られた人のように体がついてきます。</p>
+      <fieldset>
+        <legend>モデル</legend>
+        <label><input type="radio" name="model" value="fp16" checked> Mixed FP16（380 MB、おすすめ）</label>
+        <label><input type="radio" name="model" value="fp32"> FP32（758 MB）</label>
+      </fieldset>
+      <p class="note">初回は NVIDIA の GitHub からモデルをダウンロードしてブラウザに保存します（格闘ゲームと共通）。利用条件は <a href="https://github.com/NVlabs/motionbricks/blob/54fc563aeaaf819a753d72cc9fdc6713989cdd43/motionbricks/assets/onnx/LICENSE.md" target="_blank" rel="noopener">NVIDIA Open Model Agreement</a>。</p>
+      <p class="note" id="gpu-note">WebGPU に対応したデスクトップの Chrome / Edge が必要です。</p>
+      <button id="start">モデルを読み込んで始める</button>
+      <div id="progress"><div class="track"><div id="progress-bar"></div></div><div id="progress-label"></div></div>
+    </div>
+  </section>
+
+  <script type="module" src="src/lab.js"></script>
+</body>
+</html>

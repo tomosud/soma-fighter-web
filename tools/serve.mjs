@@ -20,4 +20,7 @@ createServer((req, res) => {
   try { st = statSync(target); } catch { res.writeHead(404).end('not found'); return; }
   res.writeHead(200, { 'content-type': TYPES[extname(target)] ?? 'application/octet-stream', 'content-length': st.size, 'cache-control': 'no-cache' });
   createReadStream(target).pipe(res);
+}).on('error', e => {
+  if (e.code !== 'EADDRINUSE') throw e;
+  console.log(`already running: http://127.0.0.1:${port}/ (not starting a second server)`);
 }).listen(port, '127.0.0.1', () => console.log(`http://127.0.0.1:${port}/`));
