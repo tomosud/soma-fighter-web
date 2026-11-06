@@ -447,10 +447,11 @@ function kickTarget(from, part, G) {
   const foot = rig.positions(base)[I[part]];
   const phi = Math.atan2(foot.x, foot.z); // where the key's kick points, relative to its facing
   const d = flat(G.clone().sub(hips));
-  const dist = d.length();
-  const step = clamp(dist - Math.hypot(foot.x, foot.z), -0.2, 0.4);
-  const at = dist > 1e-3 ? hips.clone().addScaledVector(d.clone().normalize(), step) : hips;
-  let t = placePose(base, Math.atan2(d.x, d.z) - phi, ZERO, at);
+  // turn the key toward the target, then put its standing foot exactly on the standing foot now (it must not slide)
+  const support = part === 'RightFoot' ? 'LeftFoot' : 'RightFoot';
+  const planted = flat(rig.positions(from)[I[support]]);
+  let t = placePose(base, Math.atan2(d.x, d.z) - phi, ZERO, ZERO);
+  t = placePose(t, 0, ZERO, planted.sub(flat(rig.positions(t)[I[support]])));
   t = reach(t, part, G, true);
   t = clonePose(t);
   gaze(t, G);
@@ -464,8 +465,8 @@ function kickTarget(from, part, G) {
 // hook with the right) and mirrored for the other hand. SOMA makes the wind-up and the strike.
 const PUNCH_SPEED = 1.3; // m/s of the pointer, within PUNCH_WINDOW s of grabbing the hand
 const PUNCH_WINDOW = 0.5;
-const PUNCH_KEYS = { jab: 'Left', cross: 'Right', hook: 'Right', uppercut: 'Left' };
-const kickRate = () => clamp(1.2 + 0.4 * (drag?.vel?.length() ?? 0), 1.4, 2.6);
+// key pose and the hand it is thrown with (the other hand mirrors it)
+const PUNCH_KEYS = { jab: ['punch_straight', 'Right'], cross: ['punch_straight', 'Right'], hook: ['punch_hook', 'Right'], uppercut: ['punch_uppercut', 'Left'] };
 
 function punchKind(part, vel, P) {
   const s = vel.length();
@@ -483,51 +484,85 @@ function punchReq(part, G, vel, start) {
       const from = ctx[3];
       const P = rig.positions(from);
       const kind = punchKind(part, vel, P);
-      let base = clonePose(book.keys[kind][0]); // facing +Z, hips over the origin
-      if (PUNCH_KEYS[kind] !== sideOf(part)) base = mirror(base);
-      const hand = rig.positions(base)[I[part]];
+      const [keyName, keySide] = PUNCH_KEYS[kind];
+      let base = clonePose(book.keys[keyName][0]); // facing +Z, hips over the origin, at the moment it lands
+      if (keySide !== sideOf(part)) base = mirror(base);
       const hips = flat(from.root);
-      const aimAt = G.clone().addScaledVector(vel, 0.12); // where the flick is heading
-      const d = flat(aimAt.clone().sub(hips));
-      const dist = d.length();
-      const step = clamp(dist - Math.hypot(hand.x, hand.z), -0.15, 0.35);
-      const at = dist > 1e-3 ? hips.clone().addScaledVector(d.clone().normalize(), step) : hips;
-      let t = placePose(base, Math.atan2(d.x, d.z) - Math.atan2(hand.x, hand.z), ZERO, at);
-      // a punch is thrown out: along the flick to nearly full reach, even if the pointer stopped close
-      const Pt = rig.positions(t), sh = Pt[I[sideOf(part) + 'Arm']];
-      const armLen = reachOf(Pt, chain(sideOf(part), ARM));
-      const toAim = aimAt.clone().sub(sh);
-      const fist = sh.clone().addScaledVector(toAim.normalize(), Math.max(aimAt.distanceTo(sh), armLen * 0.92));
-      t = reach(t, part, fist);
+      const fwd = facing(P);
+      let ahead = flat(G.clone().sub(hips));
+      if (ahead.lengthSq() < 1e-4 || ahead.clone().normalize().dot(fwd) < 0.3) ahead = fwd.clone(); else ahead.normalize();
+      const aimAt = hips.clone().addScaledVector(ahead, 0.75).setY(kind === 'uppercut' ? 1.55 : 1.45);
+      // the body stays SOMA's: turn it toward the target, then give it the key's punching arm (and half its trunk)
+      const side = sideOf(part);
+      let t = placePose(from, wrap(Math.atan2(ahead.x, ahead.z) - Math.atan2(fwd.x, fwd.z)) * 0.7, hips, ZERO);
+      const L = toLocal(t), Lk = toLocal(base);
+      for (const j of ARM_JOINTS(side)) L[j].copy(Lk[j]);
+      for (const j of ['Spine1', 'Spine2', 'Chest'].map(n => I[n])) L[j].slerp(Lk[j], 0.5);
+      t = fromLocal(t.root, L);
+      // straights are pointed at the target at the arm's own reach; hooks and uppercuts keep the key's bent arm
+      const Pt = rig.positions(t), sh = Pt[I[side + 'Arm']];
+      const fist = sh.clone().addScaledVector(aimAt.clone().sub(sh).normalize(), Pt[I[part]].distanceTo(sh));
+      if (kind === 'jab' || kind === 'cross') t = reach(t, part, fist);
       t = clonePose(t);
       gaze(t, fist);
       t = rig.fixRigid(t);
       ghostPose = t;
       lastPunch = kind;
-      const rate = clamp(1.2 + 0.1 * vel.length(), 1.3, 1.8);
-      return { targets: [t], tokens: [6], rate, tag: { kind: 'move' }, after: (tr2, a0, frames) => afterStrike(tr2, frames, rate, start, 0.2) };
+      return { targets: [t], tokens: [6], rate: 1, tag: { kind: 'move' }, after: (tr2, a0, frames) => afterStrike(tr2, frames, null, start && { start, side }) };
     },
   };
 }
-function kickReq(part, G, start) {
+function kickReq(part, G, standing) {
   return {
     kind: 'attack', mode: 'now', interrupt: true,
     build(tr, a, ctx) {
-      const t = kickTarget(ctx[3], part, G);
+      let t = kickTarget(ctx[3], part, G);
+      // arms halfway back to what SOMA's body was doing (the key's arms would make it a replayed clip)
+      const L = toLocal(t), Lf = toLocal(placePose(ctx[3], 0, ZERO, ZERO));
+      for (const sd of ['Left', 'Right']) for (const j of ARM_JOINTS(sd)) L[j].slerp(Lf[j], 0.5);
+      t = rig.fixRigid(fromLocal(t.root, L));
       ghostPose = t;
-      const rate = kickRate();
-      return { targets: [t], tokens: [6, 7], rate, tag: { kind: 'move' }, after: (tr2, a0, frames) => afterStrike(tr2, frames, rate, start) };
+      return { targets: [t], tokens: [6], rate: 1, tag: { kind: 'move' }, after: (tr2, a0, frames) => afterStrike(tr2, frames, standing) };
     },
   };
 }
 
-/** A strike is one shot: when it has landed, the limb comes back down to the pose before the grab. */
-function afterStrike(tr, frames, rate, start, hold = 0) {
-  // hold the strike's end (full extension) for a moment, so it reads as a punch before the limb comes back
-  const end = tr.frames[tr.frames.length - 1];
-  for (let k = 0; k < Math.round(hold * FPS); k++) tr.frames.push({ pose: end.pose, rate: 1, tag: end.tag });
-  if (start) tr.request(settleReq(start, 'end'));
-  settleUntil = clock + frames.length / FPS / rate + hold + 1.0;
+/** A strike is one shot: once it has landed SOMA recovers on its own (only the hips' place and facing are given). */
+function afterStrike(tr, frames, legsFrom = null, arm = null) {
+  tr.request(recoverReq(legsFrom, arm));
+  settleUntil = clock + frames.length / FPS + 1.2;
+}
+const LEG_JOINTS = ['Leg', 'Shin', 'Foot', 'ToeBase'].flatMap(n => [I['Left' + n], I['Right' + n]]);
+function recoverReq(legsFrom, arm) {
+  return {
+    kind: 'idle', mode: 'end',
+    build(tr, a, ctx) {
+      const from = ctx[3];
+      const P = rig.positions(from);
+      const foot = P[I.LeftFoot].y <= P[I.RightFoot].y ? I.LeftFoot : I.RightFoot;
+      ghostPose = null;
+      if (legsFrom) {
+        // after a kick: the upper body as SOMA left it, the legs (and hips height) as they stood before the kick,
+        // placed about the standing foot so it does not slide
+        const L = toLocal(from), Ls = toLocal(legsFrom);
+        for (const j of LEG_JOINTS) L[j].copy(Ls[j]);
+        // the pelvis too (a kick tilts and turns it), facing as the body faces now
+        const dy = rig.heading(P) - rig.heading(rig.positions(legsFrom));
+        L[0] = new Quaternion().setFromAxisAngle(UP, dy).multiply(legsFrom.rot[0]);
+        let t = fromLocal(new Vector3(from.root.x, legsFrom.root.y, from.root.z), L);
+        t = placePose(t, 0, ZERO, flat(P[foot]).sub(flat(rig.positions(t)[foot])));
+        return { targets: [t], tokens: [8, 9, 10], rate: 1, tag: { kind: 'idle' } };
+      }
+      if (arm) {
+        // after a punch: everything as SOMA left it, only the punching arm back to how it hung before
+        const L = toLocal(from), Ls = toLocal(arm.start);
+        for (const j of ARM_JOINTS(arm.side)) L[j].copy(Ls[j]);
+        return { targets: [fromLocal(from.root, L)], tokens: [8, 9, 10], rate: 1, tag: { kind: 'idle' } };
+      }
+      const at = flat(from.root).lerp(flat(P[foot]), 0.5);
+      return { targets: [freeTarget(at, rig.heading(P))], tokens: [8, 9, 10], rate: 1, fixEnd: false, tag: { kind: 'idle' } };
+    },
+  };
 }
 let lastPunch = null;
 
@@ -606,7 +641,7 @@ function planTarget(pose, walking, key = null) {
 /** The arm that is not being pulled goes back to how it was when the pull began (SOMA tends to bring both). */
 function holdFreeArm(pose) {
   const L = toLocal(pose);
-  drag.freeArm.joints.forEach((j, k) => L[j].slerp(drag.freeArm.local[k], 0.8));
+  drag.freeArm.joints.forEach((j, k) => L[j].slerp(drag.freeArm.local[k], 0.5));
   const out = fromLocal(pose.root, L);
   if (pose.contact) out.contact = pose.contact;
   return out;
@@ -675,7 +710,7 @@ function locoReq(mode = 'now') {
       const standingPull = drag && speed < 0.3;
       // an arm reaching in place moves faster than a walking body
       return {
-        targets, tokens: tokensFor(horizon), rate: standingPull ? 1.3 : 1,
+        targets, tokens: tokensFor(horizon), rate: 1,
         tag: { kind: free ? 'idle' : 'move' }, fixEnd: !free,
         after: (_tr, _a, frames) => { harvest(frames); if (standingPull) harvestReaction(frames, key); },
       };
@@ -816,10 +851,14 @@ function settleReq(start, mode = 'now') {
     kind: mode === 'now' ? 'hit' : 'idle', mode, interrupt: mode === 'now',
     build(tr, a, ctx) {
       const from = ctx[3];
-      const dy = rig.heading(rig.positions(from)) - rig.heading(rig.positions(start));
-      const t = placePose(start, dy, flat(start.root), flat(from.root).sub(flat(start.root)));
+      const Pf = rig.positions(from), Ps = rig.positions(start);
+      const dy = rig.heading(Pf) - rig.heading(Ps);
+      // turn and place the old pose about the foot that is on the floor now, so that foot does not slide back
+      const foot = Pf[I.LeftFoot].y <= Pf[I.RightFoot].y ? I.LeftFoot : I.RightFoot;
+      const pivot = flat(Ps[foot]);
+      const t = placePose(start, dy, pivot, flat(Pf[foot]).sub(pivot));
       ghostPose = null;
-      return { targets: [t], tokens: [8, 9, 10], rate: 1.2, tag: { kind: 'idle' } };
+      return { targets: [t], tokens: [8, 9, 10], rate: 1, tag: { kind: 'idle' } };
     },
   };
 }

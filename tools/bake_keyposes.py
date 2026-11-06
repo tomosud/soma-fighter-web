@@ -46,6 +46,10 @@ KEYS = {
     "taunt_b": ("taunt", 38),
     "block_high": ("block_high", 14),
     "block_mid": ("block_mid", 16),
+    # punches for SOMA Pull, at the frames where they land (scanned for extension, height and guard)
+    "punch_straight": ("cross", 33),   # right straight: arm fully out at head height, left hand guarding
+    "punch_hook": ("hook", 39),        # right hook: elbow a little bent, swung across at face height
+    "punch_uppercut": ("uppercut", 15),  # left uppercut: fist driven up in front of the chin
 }
 
 # runtime (Z up, facing +X) -> model (Y up): undo MotionBricks' MUJOCO conversion (+90 deg about X),
