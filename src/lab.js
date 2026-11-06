@@ -145,13 +145,23 @@ const BINS = [
   { name: '早歩き', lo: 1.6, hi: 2.3 }, { name: '走り', lo: 2.3, hi: 3.3 },
 ];
 const PER_KEY = 8;
-const library = new Map();
+const library = new Map(); // `${bin}:${dir}:${stance foot}` -> [{ frames, speed }]
 const binOf = s => BINS.findIndex(b => s >= b.lo && s < b.hi);
 
 function stanceFoot(contact) {
   if (!contact) return 'D';
   const l = Math.max(contact[0], contact[1]) > 0.5, r = Math.max(contact[2], contact[3]) > 0.5;
   return l && r ? 'D' : l ? 'L' : r ? 'R' : 'F';
+}
+
+/** Which way a velocity goes relative to the facing: forward, back, or a side step to the left / right. */
+function travelDir(v, fwd) {
+  const s = v.length();
+  if (s < 1e-6) return 'f';
+  const along = v.dot(fwd) / s;
+  if (along <= -0.5) return 'b';
+  if (Math.abs(along) < 0.5) return new Vector3().crossVectors(UP, fwd).dot(v) > 0 ? 'l' : 'r';
+  return 'f';
 }
 
 function harvest(frames) {
@@ -168,8 +178,7 @@ function harvest(frames) {
     if (w.some(p => p.root.y < HIPS_Y - 0.14 || p.root.y > HIPS_Y + 0.08)) continue;
     if (w.some(p => trunkLean(rig.positions(p)) > 12 * Math.PI / 180)) continue; // no stooped walks in the library
     if (w.some(p => { const Q = rig.positions(p); return Math.min(Q[I.LeftFoot].y, Q[I.RightFoot].y) > 0.22; })) continue;
-    const fwd = facing(rig.positions(w[0]));
-    const dir = v[1].dot(fwd) / Math.max(1e-6, v[1].length()) < -0.3 ? 'b' : 'f';
+    const dir = travelDir(v[1], facing(rig.positions(w[0])));
     const key = `${bin}:${dir}:${stanceFoot(w[0].contact)}`;
     const list = library.get(key) ?? [];
     const entry = { frames: canonicalize(w), speed: mean };
@@ -216,15 +225,48 @@ const ANCHOR = { LeftHand: 'LeftArm', RightHand: 'RightArm', Hips: 'Hips', Head:
 // a little past the slack the body first steps toward the pull (a lunge), and only further away it walks
 const STEP_BAND = 0.15;
 
+// How the body is disposed: reluctant after being over-pulled, confused when pulled this way and that, on the
+// floor after a fall. Built from what the pull already does (no extra controls).
+const mood = { annoy: 0, reluctant: false, confusedUntil: 0, reversals: [], lastRelease: -9, downUntil: 0, stumbles: [] };
+const confused = () => clock < mood.confusedUntil;
+// Walking style read continuously from the same pull: how low (crouch), how stooped, how tall.
+const style = { crouch: 0, stoop: 0, tall: 0 };
+function styleWant() {
+  const w = { crouch: 0, stoop: 0, tall: 0 };
+  if (!drag || drag.struck) return w;
+  const y = drag.point.y;
+  if (drag.part === 'Hips') {
+    const base = drag.start.root.y;
+    w.crouch = clamp((base - y - 0.05) / 0.3, 0, 1);
+    w.tall = clamp((y - base - 0.05) / 0.15, 0, 1) * 0.6;
+  } else if (drag.part === 'Head') {
+    const base = rig.positions(drag.start)[I.Head].y;
+    const down = clamp((base - y - 0.05) / 0.35, 0, 1);
+    w.stoop = down; w.crouch = 0.5 * down;
+    w.tall = clamp((y - base - 0.03) / 0.12, 0, 1);
+  } else if (drag.part.endsWith('Hand')) {
+    w.crouch = clamp((0.85 - y) / 0.45, 0, 1) * 0.8;
+    w.stoop = 0.3 * w.crouch;
+    w.tall = clamp((y - 1.75) / 0.3, 0, 1);
+  }
+  return w;
+}
+
 function pullVelocity(P) {
   ctrl.stretch = 0;
-  if (!drag || drag.struck || isKick() || holding()) return new Vector3();
+  if (!drag || drag.struck || isKick() || holding() || confused() || clock < mood.downUntil) return new Vector3();
   const d = flat(drag.point.clone().sub(P[I[ANCHOR[drag.part]]]));
-  const stretch = d.length() - SLACK[drag.part];
+  const slack = SLACK[drag.part] + (mood.reluctant ? 0.2 : 0);
+  const stretch = d.length() - slack;
   ctrl.stretch = Math.max(0, stretch);
   const band = drag.part.endsWith('Foot') ? 0 : STEP_BAND;
   if (stretch <= band) return new Vector3();
-  return d.normalize().multiplyScalar(Math.min(settings.vmax, (stretch - band) * settings.stiff));
+  // analog: gentle for a small pull, saturating at the cap; slower backwards and sideways, crouched or reluctant
+  const along = d.clone().normalize().dot(facing(P));
+  const cap = settings.vmax * (along < -0.3 ? 0.55 : along < 0.5 ? 0.8 : 1) * (1 - 0.45 * style.crouch) * (mood.reluctant ? 0.6 : 1);
+  const k = settings.stiff * (mood.reluctant ? 0.55 : 1);
+  const speed = cap * (1 - Math.exp(-(stretch - band) * k / cap));
+  return d.normalize().multiplyScalar(speed);
 }
 
 function approach(v, want, dt) {
@@ -256,8 +298,10 @@ function predict(anchorPose, horizon) {
     const s = v.length();
     if (s > 0.3) {
       const travel = Math.atan2(v.x, v.z);
-      const back = Math.cos(travel - yaw) < -0.3 && s < 1.2;
-      yaw += clamp(wrap((back ? yaw : travel) - yaw), -4.5 / FPS, 4.5 / FPS);
+      const c = Math.cos(travel - yaw);
+      const back = c < -0.3 && s < 1.2;
+      const side = Math.abs(c) < 0.5 && s < 0.9; // a slow pull to the side: side steps
+      yaw += clamp(wrap((back || side ? yaw : travel) - yaw), -4.5 / FPS, 4.5 / FPS);
     }
     if (k > steps - 4) out.push({ pos: p.clone(), yaw, vel: v.clone() });
   }
@@ -668,6 +712,133 @@ function recoverReq(legsFrom) {
   };
 }
 
+// ---------------------------------------------------------------- jump, fall, confusion
+
+/** A small jump: the hips flicked up. SOMA makes the crouch and take-off into an apex, then the landing. */
+function jumpReq(height, hor) {
+  return {
+    kind: 'attack', mode: 'now', interrupt: true,
+    build(tr, a, ctx) {
+      const from = ctx[3];
+      const feet = feetOf(from);
+      const apex = clonePose(from);
+      apex.root.addScaledVector(hor, 0.5);
+      apex.root.y = HIPS_Y + height;
+      legsTo(apex, feet.map(f => f.clone().addScaledVector(hor, 0.45).setY(f.y + height + 0.1))); // knees tucked
+      for (const [sd, sign] of [['Left', 1], ['Right', -1]]) rotateSubtree(rig, apex, I[sd + 'Arm'], new Quaternion().setFromAxisAngle(facing(rig.positions(apex)), sign * 0.35));
+      const t0 = rig.fixRigid(apex);
+      // four frames round the top of the arc: still rising a little, then falling (gravity only)
+      const vh = hor.clone().multiplyScalar(1 / 0.4);
+      const targets = [0, 1, 2, 3].map(k => {
+        const t = clonePose(t0);
+        const dt = (k - 1) / FPS;
+        t.root.addScaledVector(vh, dt);
+        t.root.y -= 0.5 * 9.81 * dt * dt;
+        return t;
+      });
+      ghostPose = targets[0];
+      return { targets, tokens: [6], rate: 1.25, tag: { kind: 'move' }, after: (tr2) => tr2.request(landReq(hor, from)) };
+    },
+  };
+}
+function landReq(hor, before) {
+  return {
+    kind: 'attack', mode: 'end', interrupt: false,
+    build(tr, a, ctx) {
+      const from = ctx[3];
+      const P = rig.positions(from);
+      const land = clonePose(from);
+      const at = flat(from.root).addScaledVector(hor, 0.5);
+      land.root.set(at.x, HIPS_Y - 0.1, at.z); // knees take the landing
+      const feet = feetOf(before).map(f => f.clone().addScaledVector(hor, 1).setY(f.y));
+      legsTo(land, feet);
+      const L = toLocal(land), Lb = toLocal(before);
+      for (const j of [...TRUNK_UP, ...ARM_JOINTS('Left'), ...ARM_JOINTS('Right')]) L[j].slerp(Lb[j], 0.6);
+      L[I.Spine1].multiply(new Quaternion().setFromAxisAngle(new Vector3(1, 0, 0), 0.15));
+      const t = fromLocal(land.root, L);
+      ghostPose = null;
+      // nothing re-plans until the landing has played (a new plan would cut the jump off before it is seen)
+      return { targets: [t], tokens: [6], rate: 1.1, tag: { kind: 'idle' }, after: (tr2) => { jumpEnd = clock + (tr2.frames.length - 1 - tr2.t) / FPS / 1.1; settleUntil = jumpEnd + 0.2; } };
+    },
+  };
+}
+
+let jumpEnd = Infinity;
+
+/** Over the top: the body goes down in the direction it was pulled, lies a moment, and gets up by itself. */
+function fallReq(dir) {
+  return {
+    kind: 'down', mode: 'now', interrupt: true,
+    build(tr, a, ctx) {
+      const from = ctx[3];
+      const P = rig.positions(from);
+      const fwd = facing(P);
+      // lying on its back when pulled backwards, face down otherwise
+      const key = clonePose(book.keys[dir.dot(fwd) < -0.2 ? 'down_back' : 'down_ko'][0]);
+      const Pk = rig.positions(key);
+      const head = flat(Pk[I.Head].clone().sub(Pk[0]));
+      const yaw = Math.atan2(dir.x, dir.z) - Math.atan2(head.x, head.z);
+      const at = flat(from.root).addScaledVector(dir, 0.45);
+      let t = placePose(key, yaw, ZERO, at);
+      ghostPose = null;
+      return {
+        targets: [t], tokens: [8, 9], rate: 1, tag: { kind: 'hit' },
+        after: (tr2, a0, frames) => {
+          const end = tr2.frames[tr2.frames.length - 1];
+          for (let k = 0; k < FPS; k++) tr2.frames.push({ pose: end.pose, rate: 1, tag: end.tag }); // a moment on the floor
+          tr2.request(getUpReq());
+          mood.downUntil = clock + frames.length / FPS + 3.5;
+          settleUntil = mood.downUntil;
+        },
+      };
+    },
+  };
+}
+function getUpReq() {
+  return {
+    kind: 'down', mode: 'end',
+    build(tr, a, ctx) {
+      const from = ctx[3];
+      const P = rig.positions(from);
+      const feet = flat(P[I.LeftFoot]).lerp(flat(P[I.RightFoot]), 0.5);
+      const at = flat(from.root).lerp(feet, 0.5);
+      const head = flat(P[I.Head].clone().sub(P[0]));
+      ghostPose = null;
+      // stand up facing the way the head lay (a natural way to get up)
+      return { targets: [freeTarget(at, Math.atan2(head.x, head.z))], tokens: [14, 15, 16], rate: 1, fixEnd: false, tag: { kind: 'idle' }, after: () => { mood.annoy = 0.3; mood.stumbles = []; if (drag) drag.struck = false; } };
+    },
+  };
+}
+
+/** Pulled this way and that: it stops, looks from one side to the other, a hand goes up to the head. */
+function confusedReq(side) {
+  return {
+    kind: 'move', mode: 'now',
+    build(tr, a, ctx) {
+      const from = ctx[3];
+      const P = rig.positions(from);
+      const fwd = facing(P), left = new Vector3().crossVectors(UP, fwd);
+      let t = clonePose(from);
+      // weight a little onto one foot
+      const foot = side > 0 ? P[I.LeftFoot] : P[I.RightFoot];
+      const shift = flat(foot.clone().sub(from.root)).multiplyScalar(0.25);
+      t.root.add(shift);
+      t.root.y = Math.min(t.root.y, HIPS_Y);
+      legsTo(t, feetOf(from));
+      // the hand not being pulled scratches the head
+      const hand = drag?.part === 'RightHand' ? 'LeftHand' : 'RightHand';
+      const hs = hand === 'RightHand' ? -1 : 1;
+      const Pt = rig.positions(t);
+      t = reach(t, hand, Pt[I.Head].clone().addScaledVector(left, 0.11 * hs).add(new Vector3(0, 0.07, 0)).addScaledVector(fwd, 0.02));
+      t = clonePose(t);
+      rotateSubtree(rig, t, I.Head, new Quaternion().setFromAxisAngle(fwd, 0.18 * side)); // head tilted
+      gaze(t, Pt[I.Head].clone().addScaledVector(fwd, 1).addScaledVector(left, 1.1 * side).add(new Vector3(0, -0.1, 0)));
+      ghostPose = null;
+      return { targets: [rig.fixRigid(t)], tokens: [8, 9], rate: 1, tag: { kind: 'move' } };
+    },
+  };
+}
+
 // ---------------------------------------------------------------- gaze
 
 const look = { detached: false, local: new Vector3(0, 0.6, 1.2), point: new Vector3(0, 1.6, 1.2), smooth: new Vector3(0, 1.6, 1.2), yaw: 0 };
@@ -730,18 +901,44 @@ function freeTarget(pos, yaw) {
  * physics predicts, the grabbed limb reaching, and the gaze. SOMA makes every frame in between.
  */
 function planTarget(pose, walking, key = null, from = null) {
+  // (walking: the legs are the gait's; the physics may move the hips and trunk only)
   let p = pose;
   if (drag && !walking) p = blendReaction(p, key);
   if (drag && !walking && from) {
     p = bookSeed(p, bookKey(drag.part, rig.positions(from), drag.point), 0.3);
     if (!drag.part.endsWith('Foot')) p = cascadeMix(p, from, drag.part, leadPoint, clamp(0.5 * drag.seed.k, 0.3, 0.7));
   }
-  p = withDeviation(p);
+  p = withDeviation(p, walking);
   if (drag?.part.endsWith('Hand') && drag.freeArm && !walking) p = holdFreeArm(p);
-  if (drag) p = reach(p, drag.part, leadPoint);
-  if (drag || look.detached) { p = clonePose(p); gaze(p, look.smooth); p = rig.fixRigid(p); }
+  if (drag && !(walking && drag.part.endsWith('Foot'))) p = reach(p, drag.part, leadPoint);
+  if (drag && mood.reluctant) { // dragging its feet: the trunk leans back from the pull
+    const P = rig.positions(p);
+    const away = flat(P[0].clone().sub(drag.point));
+    if (away.lengthSq() > 1e-6) { p = clonePose(p); rotateSubtree(rig, p, I.Spine1, new Quaternion().setFromAxisAngle(new Vector3().crossVectors(UP, away.normalize()), 0.2)); p = rig.fixRigid(p); }
+  }
+  if (drag || look.detached || mood.reluctant) { p = clonePose(p); gaze(p, look.smooth); p = rig.fixRigid(p); }
   if (pose.contact) p.contact = pose.contact;
   return p;
+}
+
+/** The walking style on a gait target: lower hips and bent knees (crouch), a bowed trunk (stoop), a lifted chest. */
+function styleWalk(t) {
+  const { crouch, stoop, tall } = style;
+  if (crouch + stoop + tall < 0.02) return t;
+  const feet = feetOf(t);
+  const p = clonePose(t);
+  const fwd = facing(rig.positions(p));
+  p.root.y += -0.24 * crouch + 0.015 * tall;
+  const bow = 0.22 * crouch + 0.4 * stoop - 0.1 * tall;
+  if (Math.abs(bow) > 1e-3) {
+    const axis = new Vector3().crossVectors(UP, fwd);
+    rotateSubtree(rig, p, I.Spine1, new Quaternion().setFromAxisAngle(axis, bow * 0.6));
+    rotateSubtree(rig, p, I.Chest, new Quaternion().setFromAxisAngle(axis, bow * 0.4));
+  }
+  legsTo(p, feet);
+  const out = rig.fixRigid(p);
+  if (t.contact) out.contact = t.contact;
+  return out;
 }
 
 /** One step toward dir: the foot nearer the pull goes out (farther the harder the pull), the hips follow half way. */
@@ -817,11 +1014,11 @@ function locoReq(mode = 'now') {
       let targets, free = false;
       if (speed >= 0.3) {
         const fwd = new Vector3(Math.sin(end.yaw), 0, Math.cos(end.yaw));
-        const dir = end.vel.dot(fwd) / speed < -0.3 ? 'b' : 'f';
+        const dir = travelDir(end.vel, fwd);
         const phase = predictStance(tr, a, horizon, speed);
         const entry = lookup(speed, dir, phase);
         targets = entry ? entry.frames.map(f => placePose(f, end.yaw, ZERO, end.pos)) : path.map(p => placePose(STAND, p.yaw, ZERO, p.pos));
-        targets = targets.map(t => planTarget(upright(t, speed), true));
+        targets = targets.map(t => planTarget(styleWalk(upright(t, speed)), true));
       } else if (drag || look.detached || deviation) {
         // standing: SOMA's own current pose, moved along the short path, shaped by the pull
         const h0 = rig.heading(rig.positions(from));
@@ -843,7 +1040,9 @@ function locoReq(mode = 'now') {
       return {
         targets, tokens: tokensFor(horizon), rate: 1,
         tag: { kind: free ? 'idle' : 'move' }, fixEnd: !free,
-        after: (_tr, _a, frames) => { harvest(frames); if (standingPull) harvestReaction(frames, key); },
+        after: (_tr, _a, frames) => {
+          harvest(frames); if (standingPull) harvestReaction(frames, key);
+        },
       };
     },
   };
@@ -952,6 +1151,7 @@ canvas.addEventListener('pointerdown', e => {
     drag.freeArm = freeArmOf(h.part);
     drag.start = clonePose(shown);
     drag.seed = grabSeed();
+    if (clock - mood.lastRelease < 1.0) mood.annoy += 0.25; // grabbed again at once
     // keep the plane's offset from the hips along the camera's view so it starts through the grabbed part
     const view = camera.getWorldDirection(new Vector3()).setY(0).normalize();
     drag.offset = view.multiplyScalar(flat(pos.clone().sub(shownP[0])).dot(view));
@@ -1004,6 +1204,7 @@ function settleReq(start, mode = 'now') {
   };
 }
 const release = () => {
+  if (drag) mood.lastRelease = clock;
   releaseFoot();
   if (drag) planTimer = 0;
   drag = null;
@@ -1062,59 +1263,34 @@ function measureDeviation(anim, body) {
   });
   deviation = { root, rot };
 }
-function withDeviation(pose) {
+function withDeviation(pose, walking = false) {
   if (!deviation || !settings.physics) return pose;
-  const out = fromLocal(pose.root.clone().add(deviation.root), toLocal(pose).map((q, j) => q.multiply(deviation.rot[j])));
+  const out = fromLocal(pose.root.clone().add(deviation.root), toLocal(pose).map((q, j) => (walking && LEGS.has(j) ? q : q.multiply(deviation.rot[j]))));
   if (pose.contact) out.contact = pose.contact;
   return out;
 }
 
-// balance: when the capture point (where the centre of mass is heading, x + v * sqrt(h / g)) leaves the feet,
-// step toward it
-function hull(pts) {
-  const q = [...pts].sort((a, b) => a[0] - b[0] || a[1] - b[1]);
-  const cross = (o, a, b) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
-  const lo = [], hi = [];
-  for (const p of q) { while (lo.length >= 2 && cross(lo.at(-2), lo.at(-1), p) <= 0) lo.pop(); lo.push(p); }
-  for (const p of q.reverse()) { while (hi.length >= 2 && cross(hi.at(-2), hi.at(-1), p) <= 0) hi.pop(); hi.push(p); }
-  return lo.slice(0, -1).concat(hi.slice(0, -1));
-}
-function outside(p, pts) {
-  const H = hull(pts);
-  const segDist = (a, b) => {
-    const dx = b[0] - a[0], dz = b[1] - a[1], l = dx * dx + dz * dz;
-    const t = l ? clamp(((p[0] - a[0]) * dx + (p[1] - a[1]) * dz) / l, 0, 1) : 0;
-    return Math.hypot(p[0] - a[0] - dx * t, p[1] - a[1] - dz * t);
-  };
-  if (H.length >= 3) {
-    let inside = true;
-    for (let i = 0; i < H.length; i++) {
-      const a = H[i], b = H[(i + 1) % H.length];
-      if ((b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0]) < 0) { inside = false; break; }
-    }
-    if (inside) return 0;
-  }
-  let d = Infinity;
-  for (let i = 0; i < H.length; i++) d = Math.min(d, segDist(H[i], H[(i + 1) % H.length]));
-  return Math.max(0, d - 0.03);
-}
 let stumbleWait = 0, placedAt = -9;
+// A step is forced only by what pushed the body off SOMA's own motion: the unseen physical body's hips away from the
+// shown hips, plus where that gap is heading (a capture point of the difference). Walking itself never trips it.
+let prevOff = null;
+const offVel = new Vector3();
 function balance(dt) {
   stumbleWait -= dt;
   ctrl.stumble -= dt;
-  if (!settings.physics || !settings.balance || stumbleWait > 0 || isKick() || holding() || clock - placedAt < 0.8) return;
-  const pts = ragdoll.support();
-  if (!pts.length) return;
-  const { pos, vel } = ragdoll.com();
-  const cp = [pos.x + vel.x * 0.31, pos.z + vel.z * 0.31];
-  const d = outside(cp, pts);
-  if (d < 0.06) return;
-  const c = pts.reduce((m, q) => [m[0] + q[0] / pts.length, m[1] + q[1] / pts.length], [0, 0]);
-  const dir = new Vector3(cp[0] - c[0], 0, cp[1] - c[1]).normalize();
-  ctrl.vel.addScaledVector(dir, Math.min(1.4, 0.8 + 3 * d));
+  const off = flat(planned.root.clone().sub(shown.root));
+  if (prevOff) offVel.lerp(off.clone().sub(prevOff).divideScalar(dt), 1 - Math.exp(-dt * 10));
+  prevOff = off;
+  // walking already answers the pull with its own steps: a forced step is for a yank while standing or slow
+  if (!settings.physics || !settings.balance || stumbleWait > 0 || isKick() || holding() || clock - placedAt < 0.8 || ctrl.vel.length() > 0.45) return;
+  const cp = off.clone().addScaledVector(offVel, 0.31);
+  const d = cp.length() - 0.1;
+  if (d < 0) return;
+  ctrl.vel.addScaledVector(cp.normalize(), Math.min(1.4, 0.8 + 3 * d));
   ctrl.stumble = 0.6;
   stumbleWait = 0.5;
   planTimer = 0;
+  mood.stumbles.push(clock);
 }
 
 // ---------------------------------------------------------------- loop
@@ -1147,11 +1323,16 @@ function simulate(dt) {
     if (pt) { look.point.copy(pt); look.local.copy(lookToLocal(pt, shownP[0])); }
   } else if (look.detached) look.point.copy(lookFromLocal(look.local, shownP[0]));
   else look.point.copy(shownP[I.Head]).addScaledVector(bodyAxes(look.yaw).fwd, 1.2).setY(shownP[I.Head].y - 0.05);
+  // the walking style eases toward what the pull asks for (re-plan when it clearly changes)
+  const sw = styleWant();
+  for (const k of ['crouch', 'stoop', 'tall']) style[k] += (sw[k] - style[k]) * (1 - Math.exp(-dt * 4));
+  updateMood(dt);
   ctrl.want.copy(pullVelocity(shownP));
   approach(ctrl.vel, ctrl.want, dt);
   planTimer -= dt; idleTimer -= dt;
   footMode();
   keepWhenStill(dt);
+  if (scheduler.ready) reactions2(dt);
   // a foot lifted fast kicks once it is above the knee (one shot)
   if (scheduler.ready && drag && !drag.struck) {
     // a kick is aimed once the foot's pull has (nearly) arrived: when the pointer stops, or a quarter second after
@@ -1167,12 +1348,13 @@ function simulate(dt) {
   if (scheduler.ready && settleTo && !drag) { track.request(settleReq(settleTo)); settleTo = null; idleTimer = 2.5; settleUntil = clock + 1.2; }
   if (scheduler.ready && placeFoot && !drag) { track.request(placeFootReq(placeFoot.part, placeFoot.start)); placeFoot = null; idleTimer = 3; settleUntil = clock + 1.0; placedAt = clock; }
   // while the foot comes down after a kick, nothing re-plans from the raised leg
-  if (scheduler.ready && !track.busy && !drag?.struck && (drag || clock >= settleUntil)) {
+  if (scheduler.ready && !track.busy && !drag?.struck && !confused() && clock >= mood.downUntil && (drag || clock >= settleUntil)) {
     const moving = ctrl.vel.length() > 0.05 || ctrl.want.length() > 0.05;
     // re-plan when where the target would aim has moved (the pointer, or its lead as a flick slows down and stops)
     const hold = holding();
     const aimNow = drag ? (hold ? drag.point.clone() : drag.point.clone().add((drag.vel ?? new Vector3()).clone().multiplyScalar(scheduler.latency + 0.5).clampLength(0, 0.45))) : null;
-    const pointerMoved = drag && (!drag.sent || drag.sent.distanceTo(aimNow) > (hold ? 0.06 : 0.04));
+    const styleMoved = Math.abs(style.crouch - lastStyle.crouch) + Math.abs(style.stoop - lastStyle.stoop) + Math.abs(style.tall - lastStyle.tall) > 0.15;
+    const pointerMoved = drag && (!drag.sent || drag.sent.distanceTo(aimNow) > (hold ? 0.06 : 0.04) || styleMoved);
     const pushed = !isKick() && deviation && Math.abs(deviationSize() - lastPlannedDev) > 0.08; // the physics expects a clearly new lean
     // walking steadily, plans follow the steps: one at each foot strike (or at once when the heading turns), so the
     // footing is never swapped in the middle of a step
@@ -1182,6 +1364,7 @@ function simulate(dt) {
     if ((moving || pointerMoved || pushed || lookDrag) && due) {
       lastPlanDir = ctrl.want.lengthSq() > 1e-6 ? ctrl.want.clone().normalize() : null;
       if (drag) drag.sent = aimNow;
+      Object.assign(lastStyle, style);
       stepStrike = false;
       lastPlannedDev = deviationSize();
       track.request(hold ? holdReq('now') : !moving && !drag && lookDrag ? idleReq('now') : locoReq('now'));
@@ -1203,7 +1386,11 @@ function simulate(dt) {
   shown.contact = f.contact;
   shownP = rig.positions(shown);
   clock += dt;
-  const lookAt = look.detached || !drag || !(drag.part.endsWith('Hand') || drag.part === 'Head') ? look.point : drag.point;
+  let lookAt = look.detached || !drag || !(drag.part.endsWith('Hand') || drag.part === 'Head') ? look.point : drag.point;
+  if (drag && mood.reluctant && !look.detached) { // looks away from where it is being taken
+    const away = flat(shownP[0].clone().sub(drag.point)).normalize();
+    lookAt = shownP[I.Head].clone().addScaledVector(bodyAxes(look.yaw).fwd, 0.6).addScaledVector(away, 1.2).setY(shownP[I.Head].y - 0.1);
+  }
   look.smooth.lerp(lookAt, 1 - Math.exp(-dt * 6));
   if (settings.physics) {
     ragdoll.step(dt, shown, f.contact, drag ? { name: drag.part, point: drag.point } : null);
@@ -1211,6 +1398,77 @@ function simulate(dt) {
     measureDeviation(shown, planned);
     balance(dt);
   } else deviation = null;
+}
+
+const lastStyle = { crouch: 0, stoop: 0, tall: 0 };
+
+/** Reluctance builds while it is pulled harder than it can follow, or grabbed again and again; it fades at rest. */
+function updateMood(dt) {
+  const over = drag && !drag.struck && !holding() ? Math.max(0, ctrl.stretch * settings.stiff - settings.vmax * 1.1) : 0;
+  if (over > 0) mood.annoy += dt * Math.min(0.6, 0.2 + 0.2 * over);
+  else mood.annoy -= dt * (drag ? 0.05 : 0.2);
+  mood.annoy = clamp(mood.annoy, 0, 2);
+  if (!mood.reluctant && mood.annoy > 1.2) { mood.reluctant = true; mood.reluctantSince = clock; }
+  else if (mood.reluctant && mood.annoy < 0.5) mood.reluctant = false;
+  // the pull turned round (to and fro): confusion when it happens again and again
+  if (drag?.vf && drag.vf.length() > 0.7 && !drag.struck) {
+    const d = flat(drag.vf).normalize();
+    if (drag.lastDir && d.dot(drag.lastDir) < -0.5) { mood.reversals.push(clock); drag.lastDir = d; }
+    else if (!drag.lastDir || d.dot(drag.lastDir) > 0.6) drag.lastDir = d;
+  }
+  mood.reversals = mood.reversals.filter(t => clock - t < 2.2);
+}
+
+/** Jump, fall and confusion, read from the pull and the unseen physics. */
+let confusedStep = 0;
+function reactions2(dt) {
+  if (drag?.struck && drag.jumpedAt != null && clock > jumpEnd) { drag.struck = false; jumpEnd = Infinity; }
+  if (clock < mood.downUntil) return;
+  // confused: pulled to and fro four times within about two seconds
+  if (!confused() && drag && !drag.struck && mood.reversals.length >= 4 && !holding()) {
+    mood.confusedUntil = clock + 2.6; mood.reversals = []; confusedStep = 0;
+    ctrl.vel.set(0, 0, 0);
+    track.request(confusedReq(1));
+  }
+  if (confused()) {
+    if (confusedStep === 0 && mood.confusedUntil - clock < 1.4) { confusedStep = 1; track.request(confusedReq(-1)); }
+    return;
+  }
+  if (!drag || drag.struck) return;
+  // jump: the hips flicked upward
+  if (drag.part === 'Hips' && drag.vf && drag.vf.y > 1.2 && drag.point.y > drag.start.root.y + 0.03 && clock - (drag.jumpedAt ?? -9) > 1.2) {
+    const height = clamp(0.12 + 0.1 * (drag.vf.y - 1.2), 0.12, 0.3);
+    const hor = flat(drag.vf).multiplyScalar(0.3).clampLength(0, 0.45);
+    drag.jumpedAt = clock;
+    jumpEnd = Infinity;
+    if (!track.request(jumpReq(height, hor))) return;
+    drag.struck = true;
+    settleUntil = clock + 2; idleTimer = 3; // (also when the hips are let go mid-jump)
+    ctrl.vel.set(0, 0, 0);
+    return;
+  }
+  // fall: stumbled again and again while still being pulled, a held foot dragged far away, or the head pulled low
+  mood.stumbles = mood.stumbles.filter(t => clock - t < 1.8);
+  const P = shownP;
+  let fall = null;
+  // (stumbling is part of walking; only being dragged on harder than it can follow, again and again, brings it down)
+  const overPulled = ctrl.stretch * settings.stiff > settings.vmax * 1.3;
+  // first it gets reluctant; dragged on regardless, it goes down
+  const dragged = mood.reluctant && overPulled && clock - mood.reluctantSince > 4; // dragged along against its will for a while: it trips
+  if ((mood.stumbles.length >= 2 && overPulled && mood.reluctant && clock - mood.reluctantSince > 1.5) || mood.stumbles.length >= 5 || dragged) fall = flat(drag.point.clone().sub(P[0]));
+  if (holding()) {
+    const support = drag.part === 'RightFoot' ? I.LeftFoot : I.RightFoot;
+    const away = flat(drag.point.clone().sub(P[support]));
+    if (away.length() > 1.05) fall = away;
+  }
+  if (drag.part === 'Head' && drag.point.y < 0.75) fall = flat(drag.point.clone().sub(P[0]));
+  if (fall && fall.lengthSq() > 1e-4) {
+    if (!track.request(fallReq(fall.normalize()))) return;
+    drag.struck = true;
+    ctrl.vel.set(0, 0, 0);
+    mood.stumbles = [];
+    mood.downUntil = clock + 3; // until the fall itself sets the real time
+  }
 }
 
 /** The pointer held still and SOMA's body settled: keep that frame in the pose book (once per stop). */
@@ -1276,7 +1534,8 @@ function frame(now) {
 
 function hud() {
   if (!scheduler.ready) return;
-  $('stats').textContent = `${scheduler.backend} · 生成 ${scheduler.lastMs.toFixed(0)} ms · 速さ ${ctrl.vel.length().toFixed(1)} m/s · 描画 ${fps.toFixed(0)} fps`;
+  const state = clock < mood.downUntil ? '転んだ' : confused() ? '困っている' : mood.reluctant ? '嫌がっている' : style.crouch > 0.4 ? 'かがんでいる' : '';
+  $('stats').textContent = `${scheduler.backend} · 生成 ${scheduler.lastMs.toFixed(0)} ms · 速さ ${ctrl.vel.length().toFixed(1)} m/s · 描画 ${fps.toFixed(0)} fps${state ? ` · ${state}` : ''}`;
 }
 
 // ---------------------------------------------------------------- model loading
@@ -1357,7 +1616,7 @@ if (params.has('debug')) {
     get shownP() { return shownP; }, get drag() { return drag; }, get bodyMotion() { return bodyMotion; },
     // a scripted pull: `point` is used as is (no screen ray)
     pull(part, point) { if (!part) releaseFoot(); drag = part ? { part, point, sent: null, scripted: true, freeArm: freeArmOf(part), start: clonePose(shown), seed: grabSeed() } : null; if (!part) planTimer = 0; },
-    poseBook,
+    poseBook, mood, style, book,
     draw: () => frame(performance.now()),
   };
 }
