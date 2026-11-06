@@ -431,6 +431,53 @@ function kickTarget(from, part, G) {
   return rig.fixRigid(t);
 }
 
+// ---------------------------------------------------------------- punches
+
+// A hand flicked fast is a punch toward where it is heading: up = uppercut, across the body = hook, otherwise a jab
+// (left) or a cross (right). The keys are Mixamo-derived (jab and uppercut thrown with the left hand, cross and
+// hook with the right) and mirrored for the other hand. SOMA makes the wind-up and the strike.
+const PUNCH_SPEED = 1.8; // m/s of the pointer
+const PUNCH_KEYS = { jab: 'Left', cross: 'Right', hook: 'Right', uppercut: 'Left' };
+const kickRate = () => clamp(1.2 + 0.4 * (drag?.vel?.length() ?? 0), 1.4, 2.6);
+
+function punchKind(part, vel, P) {
+  const s = vel.length();
+  if (vel.y > 0.6 * s) return 'uppercut';
+  const side = P[I.LeftArm].clone().sub(P[I.RightArm]).setY(0).normalize(); // toward the body's left
+  const across = vel.clone().setY(0).dot(side) / Math.max(1e-6, s);
+  if ((part === 'RightHand' && across > 0.6) || (part === 'LeftHand' && across < -0.6)) return 'hook';
+  return part === 'LeftHand' ? 'jab' : 'cross';
+}
+
+function punchReq(part, G, vel) {
+  return {
+    kind: 'attack', mode: 'now', interrupt: true,
+    build(tr, a, ctx) {
+      const from = ctx[3];
+      const P = rig.positions(from);
+      const kind = punchKind(part, vel, P);
+      let base = clonePose(book.keys[kind][0]); // facing +Z, hips over the origin
+      if (PUNCH_KEYS[kind] !== sideOf(part)) base = mirror(base);
+      const hand = rig.positions(base)[I[part]];
+      const hips = flat(from.root);
+      const aimAt = G.clone().addScaledVector(vel, 0.12); // where the flick is heading
+      const d = flat(aimAt.clone().sub(hips));
+      const dist = d.length();
+      const step = clamp(dist - Math.hypot(hand.x, hand.z), -0.15, 0.35);
+      const at = dist > 1e-3 ? hips.clone().addScaledVector(d.clone().normalize(), step) : hips;
+      let t = placePose(base, Math.atan2(d.x, d.z) - Math.atan2(hand.x, hand.z), ZERO, at);
+      t = reach(t, part, aimAt);
+      t = clonePose(t);
+      gaze(t, aimAt);
+      t = rig.fixRigid(t);
+      ghostPose = t;
+      lastPunch = kind;
+      return { targets: [t], tokens: [6], rate: clamp(1.4 + 0.35 * vel.length(), 1.6, 2.6), tag: { kind: 'move' } };
+    },
+  };
+}
+let lastPunch = null, punchWait = 0;
+
 // ---------------------------------------------------------------- gaze
 
 const look = { detached: false, local: new Vector3(0, 0.6, 1.2), point: new Vector3(0, 1.6, 1.2), smooth: new Vector3(0, 1.6, 1.2), yaw: 0 };
@@ -514,6 +561,28 @@ function lead(horizon) {
   leadPoint.y = Math.max(0.02, leadPoint.y);
 }
 
+// Which foot is on the ground when the target is reached, from the steps SOMA actually took just before the anchor
+// (when its single-support phases started and how far apart); a fixed cadence only when there is no history yet.
+function formulaStance(from, horizon, speed) {
+  const steps = Math.round(horizon * (1.6 + 0.45 * speed));
+  const now = stanceFoot(from.contact);
+  return now === 'L' || now === 'R' ? (steps % 2 ? (now === 'L' ? 'R' : 'L') : now) : (Math.random() < 0.5 ? 'L' : 'R');
+}
+function predictStance(tr, a, horizon, speed) {
+  const onsets = [];
+  let last = null;
+  for (let i = Math.max(tr.base, a - 75); i <= a; i++) {
+    const st = stanceFoot(tr.frame(i).pose.contact);
+    if ((st === 'L' || st === 'R') && st !== last) { onsets.push({ st, i }); last = st; }
+  }
+  if (onsets.length < 3) return formulaStance(tr.frame(a).pose, horizon, speed);
+  const gaps = onsets.slice(1).map((o, k) => o.i - onsets[k].i);
+  const period = gaps.slice(-3).reduce((x, y) => x + y, 0) / Math.min(3, gaps.length); // frames per step
+  const lastOn = onsets.at(-1);
+  const steps = Math.floor((a - lastOn.i + horizon * FPS) / Math.max(6, period));
+  return steps % 2 ? (lastOn.st === 'L' ? 'R' : 'L') : lastOn.st;
+}
+
 let lastKey = null;
 function locoReq(mode = 'now') {
   return {
@@ -534,9 +603,7 @@ function locoReq(mode = 'now') {
       } else if (speed >= 0.3) {
         const fwd = new Vector3(Math.sin(end.yaw), 0, Math.cos(end.yaw));
         const dir = end.vel.dot(fwd) / speed < -0.3 ? 'b' : 'f';
-        const steps = Math.round(horizon * (1.6 + 0.45 * speed));
-        const now = stanceFoot(from.contact);
-        const phase = now === 'L' || now === 'R' ? (steps % 2 ? (now === 'L' ? 'R' : 'L') : now) : (Math.random() < 0.5 ? 'L' : 'R');
+        const phase = predictStance(tr, a, horizon, speed);
         const entry = lookup(speed, dir, phase);
         targets = entry ? entry.frames.map(f => placePose(f, end.yaw, ZERO, end.pos)) : path.map(p => placePose(STAND, p.yaw, ZERO, p.pos));
         targets = targets.map(t => planTarget(t, true));
@@ -552,7 +619,7 @@ function locoReq(mode = 'now') {
       const standingPull = drag && speed < 0.3 && !kicking;
       // an arm reaching in place moves faster than a walking body, and a kick faster still
       return {
-        targets, tokens: kicking ? [6, 7] : tokensFor(horizon), rate: kicking ? 1.4 : standingPull ? 1.3 : 1,
+        targets, tokens: kicking ? [6, 7] : tokensFor(horizon), rate: kicking ? kickRate() : standingPull ? 1.3 : 1,
         tag: { kind: free ? 'idle' : 'move' }, fixEnd: !free,
         after: (_tr, _a, frames) => { if (!kicking) harvest(frames); if (standingPull) harvestReaction(frames, key); },
       };
@@ -817,7 +884,7 @@ function balance(dt) {
 
 const STEP = 1 / 60;
 let acc = 0, last = performance.now(), fpsAcc = 0, fpsN = 0, fps = 0;
-let planTimer = 0, idleTimer = 3, lastPlannedDev = 0;
+let planTimer = 0, idleTimer = 3, lastPlannedDev = 0, lastPlanDir = null, stepStrike = false, lastStance = 'D';
 function deviationSize() {
   if (!deviation) return 0;
   return deviation.root.length() + deviation.rot.reduce((a, q) => a + 2 * Math.acos(Math.min(1, Math.abs(q.w))), 0) * 0.25;
@@ -839,14 +906,29 @@ function simulate(dt) {
   ctrl.want.copy(pullVelocity(shownP));
   approach(ctrl.vel, ctrl.want, dt);
   planTimer -= dt; idleTimer -= dt;
+  punchWait -= dt;
+  if (scheduler.ready && drag?.part.endsWith('Hand') && drag.vel && drag.vel.length() > PUNCH_SPEED && punchWait <= 0) {
+    track.request(punchReq(drag.part, drag.point.clone(), drag.vel.clone()));
+    punchWait = 0.45;
+    planTimer = 0.35; // let the punch land before reaching again
+  }
   if (scheduler.ready && settleTo && !drag) { track.request(settleReq(settleTo)); settleTo = null; idleTimer = 2.5; settleUntil = clock + 1.2; }
   // while the foot comes down after a kick, nothing re-plans from the raised leg
   if (scheduler.ready && !track.busy && (drag || clock >= settleUntil)) {
     const moving = ctrl.vel.length() > 0.05 || ctrl.want.length() > 0.05;
-    const pointerMoved = drag && (!drag.sent || drag.sent.distanceTo(drag.point) > 0.04);
+    // re-plan when where the target would aim has moved (the pointer, or its lead as a flick slows down and stops)
+    const aimNow = drag ? drag.point.clone().add((drag.vel ?? new Vector3()).clone().multiplyScalar(scheduler.latency + 0.5).clampLength(0, 0.45)) : null;
+    const pointerMoved = drag && (!drag.sent || drag.sent.distanceTo(aimNow) > 0.04);
     const pushed = !isKick() && deviation && Math.abs(deviationSize() - lastPlannedDev) > 0.08; // the physics expects a clearly new lean
-    if ((moving || pointerMoved || pushed || lookDrag) && planTimer <= 0) {
-      if (drag) drag.sent = drag.point.clone();
+    // walking steadily, plans follow the steps: one at each foot strike (or at once when the heading turns), so the
+    // footing is never swapped in the middle of a step
+    const steady = ctrl.vel.length() > 0.5 && ctrl.want.length() > 0.5;
+    const turned = steady && lastPlanDir && ctrl.want.clone().normalize().dot(lastPlanDir) < Math.cos(0.45);
+    const due = steady ? (stepStrike || turned || planTimer < -0.7) : planTimer <= 0;
+    if ((moving || pointerMoved || pushed || lookDrag) && due) {
+      lastPlanDir = ctrl.want.lengthSq() > 1e-6 ? ctrl.want.clone().normalize() : null;
+      if (drag) drag.sent = aimNow;
+      stepStrike = false;
       lastPlannedDev = deviationSize();
       track.request(!moving && !drag && lookDrag ? idleReq('now') : locoReq('now'));
       planTimer = 0.18 + 0.12 * Math.min(1, ctrl.stretch);
@@ -858,6 +940,8 @@ function simulate(dt) {
   track.advance(dt);
   scheduler.tick([track]);
   const f = track.frames[Math.min(track.frames.length - 1, Math.floor(track.t))].pose;
+  const st = stanceFoot(f.contact);
+  if ((st === 'L' || st === 'R') && st !== lastStance) { stepStrike = true; lastStance = st; }
   shown = clonePose(track.display); // SOMA's output, untouched
   shown.contact = f.contact;
   shownP = rig.positions(shown);
@@ -994,7 +1078,7 @@ $('physics').addEventListener('input', () => ragdoll.reset(shown));
 requestAnimationFrame(frame);
 if (params.has('debug')) {
   window.lab = {
-    track, scheduler, simulate, settings, ctrl, library, reactions, rig, mirror, kickTarget, stage, look, cascade, ragdoll, get planned() { return planned; }, get deviation() { return deviation; }, get pushedUntil() { return pushedUntil; }, get clock() { return clock; },
+    track, scheduler, simulate, settings, ctrl, library, reactions, rig, mirror, kickTarget, get lastPunch() { return lastPunch; }, stage, look, cascade, ragdoll, get planned() { return planned; }, get deviation() { return deviation; }, get pushedUntil() { return pushedUntil; }, get clock() { return clock; },
     get shownP() { return shownP; }, get drag() { return drag; },
     // a scripted pull: `point` is used as is (no screen ray)
     pull(part, point) { if (!part) releaseFoot(); drag = part ? { part, point, sent: null, scripted: true, freeArm: freeArmOf(part), start: clonePose(shown) } : null; if (!part) planTimer = 0; },

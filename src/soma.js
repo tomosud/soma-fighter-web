@@ -201,9 +201,11 @@ export function correctEndpoints(rig, frames, lastContext, firstTarget, fixEnd =
   const rEnd = firstTarget.root.clone().sub(frames[n - 1].root);
   const id = new Quaternion();
   return frames.map((fr, i) => {
-    const w = i / (n - 1), ws = 1 - w, we = fixEnd ? w : 0;
+    // fixEnd: true = the whole pose ends on the target, 'root' = only the hips' ground position does, false = nothing
+    const w = i / (n - 1), ws = 1 - w, we = fixEnd === true ? w : 0, wr = fixEnd ? w : 0;
     const L = toLocal(fr);
-    const out = { root: fr.root.clone().addScaledVector(rStart, ws).addScaledVector(rEnd, we), rot: [] };
+    const rootEnd = fixEnd === 'root' ? rEnd.clone().setY(0) : rEnd;
+    const out = { root: fr.root.clone().addScaledVector(rStart, ws).addScaledVector(rootEnd, wr), rot: [] };
     for (let j = 0; j < NJ; j++) {
       const ds = id.clone().slerp(dStart[j], ws), de = id.clone().slerp(dEnd[j], we);
       const local = de.multiply(ds).multiply(L[j]);

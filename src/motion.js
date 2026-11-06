@@ -157,7 +157,7 @@ export class Scheduler {
       if (m.track.serial !== m.serial) return; // superseded (hit, reset)
       const dec = decodeRequest(this.rig, motions, tokens, b, m.align);
       if (!dec.frames.length || !dec.frames.every(f => Number.isFinite(f.root.x) && f.rot.every(q => Number.isFinite(q.w)))) return; // degenerate output
-      const fixed = correctEndpoints(this.rig, dec.frames, m.ctx[3], m.spec.targets[0], m.spec.fixEnd !== false);
+      const fixed = correctEndpoints(this.rig, dec.frames, m.ctx[3], m.spec.targets[0], m.spec.fixEnd ?? true);
       const frames = fixed.map(pose => ({ pose, rate: m.spec.rate, tag: m.spec.tag }));
       if (m.track.splice(m.a, frames)) m.spec.after?.(m.track, m.a, frames);
     });
