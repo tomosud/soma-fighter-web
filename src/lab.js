@@ -21,6 +21,7 @@ import { Rig, placePose, clonePose, emptyBatch, encodeRequest, FPS } from './som
 import { rotateSubtree, twoBoneIK } from './poses.js';
 import { Track, Scheduler, BATCH } from './motion.js';
 import { Stage, Mannequin } from './render.js';
+import { Ragdoll } from './ragdoll.js';
 
 const MB_REV = '54fc563aeaaf819a753d72cc9fdc6713989cdd43';
 const MODELS = {
@@ -42,8 +43,8 @@ const camera = stage.camera;
 const worker = new Worker(new URL('./infer.worker.js', import.meta.url), { type: 'module' });
 const scheduler = new Scheduler(rig, worker);
 
-const settings = { vmax: 2.4, stiff: 2.6, footlock: true };
-for (const [id, key, fmt] of [['vmax', 'vmax', v => v.toFixed(1)], ['stiff', 'stiff', v => v.toFixed(1)], ['footlock', 'footlock']]) {
+const settings = { vmax: 2.4, stiff: 2.6, physics: true, feedback: true, balance: true, gaze: true, breath: true };
+for (const [id, key, fmt] of [['vmax', 'vmax', v => v.toFixed(1)], ['stiff', 'stiff', v => v.toFixed(1)], ['physics', 'physics']]) {
   const el = $(id);
   const read = () => { settings[key] = el.type === 'checkbox' ? el.checked : Number(el.value); if ($(`${id}-v`)) $(`${id}-v`).textContent = fmt(settings[key]); };
   el.addEventListener('input', read);
@@ -184,7 +185,7 @@ function showLibrary() {
 
 // ---------------------------------------------------------------- the leash
 
-const ctrl = { vel: new Vector3(), want: new Vector3(), stretch: 0 };
+const ctrl = { vel: new Vector3(), want: new Vector3(), stretch: 0, stumble: 0 };
 const SLACK = { LeftHand: 0.5, RightHand: 0.5, Hips: 0.12, Head: 0.3, LeftFoot: 0.9, RightFoot: 0.9 };
 const ANCHOR = { LeftHand: 'LeftArm', RightHand: 'RightArm', Hips: 'Hips', Head: 'Head', LeftFoot: 'LeftLeg', RightFoot: 'RightLeg' };
 
@@ -355,6 +356,7 @@ function gaze(p, L, weight = 1) {
 // ---------------------------------------------------------------- requests
 
 function horizonFor(stretch, moving) {
+  if (ctrl.stumble > 0) return 0.55;
   if (!drag) return moving ? 0.9 : 1.2;
   return clamp(0.5 + 0.45 * stretch, 0.5, 1.4);
 }
@@ -372,9 +374,9 @@ function freeTarget(pos, yaw) {
 
 function locoReq(mode = 'now') {
   return {
-    kind: 'move', mode,
-    build(tr, a) {
-      const from = tr.frame(a).pose;
+    kind: 'move', mode, context: bodyContext,
+    build(tr, a, ctx) {
+      const from = ctx[3];
       const horizon = horizonFor(ctrl.stretch, ctrl.vel.length() > 0.3);
       const path = predict(from, horizon);
       const end = path[0];
@@ -409,9 +411,9 @@ function locoReq(mode = 'now') {
 /** Standing: shift the weight a little now and then. */
 function idleReq(mode = 'end', fidget = false) {
   return {
-    kind: 'idle', mode,
-    build(tr, a) {
-      const from = tr.frame(a).pose;
+    kind: 'idle', mode, context: bodyContext,
+    build(tr, a, ctx) {
+      const from = ctx[3];
       const h = rig.heading(rig.positions(from));
       const A = flat(from.root);
       let yaw = h;
@@ -541,74 +543,111 @@ controls.minDistance = 1.5;
 controls.maxDistance = 14;
 controls.update();
 
-// ---------------------------------------------------------------- on-screen layer
+// ---------------------------------------------------------------- the body: motion + physics
 
-// per-joint springs between the generated motion and the cascaded pose: the body lags, overshoots a little, settles
-const springS = rig.names.map(() => new Vector3()), springV = rig.names.map(() => new Vector3());
-const rootS = new Vector3(), rootV = new Vector3();
-const STIFF = rig.names.map(n => (/Hips/.test(n) ? 90 : /Spine|Chest/.test(n) ? 120 : /Neck|Head|Jaw|Eye/.test(n) ? 150 : /Leg|Shin|Foot|Toe/.test(n) ? 320 : 240));
-
-function springLayer(base, goal, dt) {
-  const Lb = toLocal(base), Lg = toLocal(goal);
-  const L = Lb.map((q, j) => {
-    const t = logq(q.clone().invert().multiply(Lg[j]));
-    const k = STIFF[j], c = 2 * Math.sqrt(k) * 0.55;
-    springV[j].addScaledVector(t.sub(springS[j]).multiplyScalar(k).sub(springV[j].clone().multiplyScalar(c)), dt);
-    springS[j].addScaledVector(springV[j], dt);
-    if (springS[j].length() > 1.6) springS[j].setLength(1.6);
-    return q.clone().multiply(expq(springS[j]));
-  });
-  const tr = goal.root.clone().sub(base.root);
-  rootV.addScaledVector(tr.sub(rootS).multiplyScalar(90).sub(rootV.clone().multiplyScalar(2 * Math.sqrt(90) * 0.55)), dt);
-  rootS.addScaledVector(rootV, dt);
-  return fromLocal(base.root.clone().add(rootS), L);
-}
-
-const locks = { Left: null, Right: null };
+const ragdoll = new Ragdoll(rig);
 let clock = 0;
 
-function overlay(base, contact, dt) {
+/** What the muscles aim for: the generated motion with breathing and the gaze on it (and, without physics, the pull). */
+function aim(anim, dt) {
   clock += dt;
-  const walking = ctrl.vel.length() > 0.3;
-  const goal = drag ? cascade(base, drag.part, drag.point, walking) : base;
-  let p = springLayer(base, goal, dt);
-  let P = rig.positions(p);
-  // planted feet stay where they landed
-  for (const side of ['Left', 'Right']) {
-    const c = contact ? Math.max(...(side === 'Left' ? contact.slice(0, 2) : contact.slice(2, 4))) : 1;
-    const foot = I[side + 'Foot'];
-    if (!settings.footlock || c < 0.5 || drag?.part === side + 'Foot' || P[foot].y > ANKLE + 0.06) { locks[side] = null; continue; }
-    if (!locks[side] || Math.hypot(locks[side].x - P[foot].x, locks[side].z - P[foot].z) > 0.2) { locks[side] = flat(P[foot]); continue; }
-    const c3 = chain(side, LEG);
-    const keep = p.rot[foot].clone();
-    const knee = P[c3[1]].clone().sub(P[c3[0]].clone().lerp(P[c3[2]], 0.5));
-    twoBoneIK(rig, p, c3[0], c3[1], c3[2], new Vector3(locks[side].x, P[foot].y, locks[side].z), knee.lengthSq() > 1e-6 ? knee : facing(P));
-    rotateSubtree(rig, p, foot, keep.multiply(p.rot[foot].clone().invert()));
-    P = rig.positions(p);
-  }
-  // the grabbed hand or foot is exactly on the pointer (as far as it reaches)
-  if (drag && (drag.part.endsWith('Hand') || drag.part.endsWith('Foot'))) {
-    const isHand = drag.part.endsWith('Hand');
-    const c3 = chain(sideOf(drag.part), isHand ? ARM : LEG);
-    const reach = reachOf(P, c3) * 0.995;
-    const tip = drag.point.clone();
-    if (!isHand) tip.y = clamp(tip.y, ANKLE, P[c3[0]].y - 0.12);
-    const to = tip.clone().sub(P[c3[0]]);
-    if (to.length() > reach) tip.copy(P[c3[0]]).addScaledVector(to.normalize(), reach);
-    const mid = P[c3[1]].clone().sub(P[c3[0]].clone().lerp(P[c3[2]], 0.5));
-    twoBoneIK(rig, p, c3[0], c3[1], c3[2], tip, mid.lengthSq() > 1e-6 ? mid : new Vector3(0, -1, 0));
-  }
-  // breathing
-  const breath = Math.sin(clock * Math.PI * 2 / 4.2);
+  let p = settings.physics || !drag ? clonePose(anim) : cascade(anim, drag.part, drag.point, ctrl.vel.length() > 0.3);
+  const P = rig.positions(p);
+  const breath = settings.breath ? Math.sin(clock * Math.PI * 2 / 4.2) : 0;
   const left = new Vector3().crossVectors(UP, facing(P));
   rotateSubtree(rig, p, I.Chest, new Quaternion().setFromAxisAngle(left, -0.018 * breath));
   rotateSubtree(rig, p, I.LeftShoulder, new Quaternion().setFromAxisAngle(facing(P), 0.012 * breath));
   rotateSubtree(rig, p, I.RightShoulder, new Quaternion().setFromAxisAngle(facing(P), -0.012 * breath));
-  // gaze: the knob, or the point being pulled
   const target = look.detached || !drag ? look.point : drag.point;
   look.smooth.lerp(target, 1 - Math.exp(-dt * 6));
-  gaze(p, look.smooth);
-  return rig.fixRigid(p);
+  if (settings.gaze) gaze(p, look.smooth);
+  p = rig.fixRigid(p);
+  if (anim.contact) p.contact = anim.contact;
+  return p;
+}
+
+// How far physics has pushed the body away from the motion right now (hips offset and the trunk's turns). The next
+// generation starts from the recorded motion with this applied, so MotionBricks continues from where the body
+// really is: a pushed body recovers with its own steps.
+// Only what an outside force did is fed back (while pulled, stumbling, or just released), with a dead zone and a
+// gain below one, so the loop cannot run away on its own.
+let deviation = null;
+let pushedUntil = 0;
+// fed back: the trunk (balance) and the legs (so planted feet stay where they are when the hips move); not the arms
+const TRUNK = new Set(['Hips', 'Spine1', 'Spine2', 'Chest', 'LeftLeg', 'LeftShin', 'LeftFoot', 'LeftToeBase', 'RightLeg', 'RightShin', 'RightFoot', 'RightToeBase'].map(n => I[n]));
+const LEGS = new Set(['LeftLeg', 'LeftShin', 'LeftFoot', 'LeftToeBase', 'RightLeg', 'RightShin', 'RightFoot', 'RightToeBase'].map(n => I[n]));
+function measureDeviation(anim, body) {
+  if (drag || ctrl.stumble > 0) pushedUntil = clock + 1.0;
+  if (!settings.feedback || clock > pushedUntil) { deviation = null; return; }
+  const La = toLocal(anim), Lb = toLocal(body);
+  // while walking the gait already carries the body; feed back less the faster it goes
+  const gain = 0.8 * (1 - Math.min(1, ctrl.vel.length() / 0.8));
+  if (gain <= 0.01) { deviation = null; return; }
+  const root = body.root.clone().sub(anim.root);
+  const r = root.length();
+  root.multiplyScalar(r < 0.025 ? 0 : (Math.min(r, 0.5) - 0.025) / r * gain);
+  const rot = La.map((q, j) => {
+    if (!TRUNK.has(j)) return new Quaternion(); // the arms only lag behind fast motion; balance is trunk and legs
+    const v = logq(q.clone().invert().multiply(Lb[j]));
+    const a = v.length(), dead = LEGS.has(j) ? 0.015 : 0.05;
+    return a < dead ? new Quaternion() : expq(v.setLength((Math.min(a, 0.8) - dead) * gain));
+  });
+  deviation = { root, rot };
+}
+function withDeviation(pose) {
+  if (!deviation || !settings.physics) return pose;
+  const out = fromLocal(pose.root.clone().add(deviation.root), toLocal(pose).map((q, j) => q.multiply(deviation.rot[j])));
+  if (pose.contact) out.contact = pose.contact;
+  return out;
+}
+function bodyContext(tr, a) { return tr.context(a).map(withDeviation); }
+
+// balance: when the capture point (where the centre of mass is heading, x + v * sqrt(h / g)) leaves the feet,
+// step toward it
+function hull(pts) {
+  const q = [...pts].sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  const cross = (o, a, b) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+  const lo = [], hi = [];
+  for (const p of q) { while (lo.length >= 2 && cross(lo.at(-2), lo.at(-1), p) <= 0) lo.pop(); lo.push(p); }
+  for (const p of q.reverse()) { while (hi.length >= 2 && cross(hi.at(-2), hi.at(-1), p) <= 0) hi.pop(); hi.push(p); }
+  return lo.slice(0, -1).concat(hi.slice(0, -1));
+}
+function outside(p, pts) {
+  const H = hull(pts);
+  const segDist = (a, b) => {
+    const dx = b[0] - a[0], dz = b[1] - a[1], l = dx * dx + dz * dz;
+    const t = l ? clamp(((p[0] - a[0]) * dx + (p[1] - a[1]) * dz) / l, 0, 1) : 0;
+    return Math.hypot(p[0] - a[0] - dx * t, p[1] - a[1] - dz * t);
+  };
+  if (H.length >= 3) {
+    let inside = true;
+    for (let i = 0; i < H.length; i++) {
+      const a = H[i], b = H[(i + 1) % H.length];
+      if ((b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0]) < 0) { inside = false; break; }
+    }
+    if (inside) return 0;
+  }
+  let d = Infinity;
+  for (let i = 0; i < H.length; i++) d = Math.min(d, segDist(H[i], H[(i + 1) % H.length]));
+  return Math.max(0, d - 0.03);
+}
+let stumbleWait = 0;
+function balance(dt) {
+  stumbleWait -= dt;
+  ctrl.stumble -= dt;
+  if (!settings.physics || !settings.balance || stumbleWait > 0) return;
+  const pts = ragdoll.support();
+  if (!pts.length) return;
+  const { pos, vel } = ragdoll.com();
+  const cp = [pos.x + vel.x * 0.31, pos.z + vel.z * 0.31];
+  const d = outside(cp, pts);
+  if (d < 0.06) return;
+  const c = pts.reduce((m, q) => [m[0] + q[0] / pts.length, m[1] + q[1] / pts.length], [0, 0]);
+  const dir = new Vector3(cp[0] - c[0], 0, cp[1] - c[1]).normalize();
+  ctrl.vel.addScaledVector(dir, Math.min(1.4, 0.8 + 3 * d));
+  ctrl.stumble = 0.6;
+  stumbleWait = 0.5;
+  planTimer = 0;
 }
 
 // ---------------------------------------------------------------- loop
@@ -643,7 +682,18 @@ function simulate(dt) {
   track.advance(dt);
   scheduler.tick([track]);
   const f = track.frames[Math.min(track.frames.length - 1, Math.floor(track.t))].pose;
-  shown = overlay(track.display, f.contact, dt);
+  const anim = clonePose(track.display);
+  anim.contact = f.contact;
+  const target = aim(anim, dt);
+  if (settings.physics) {
+    ragdoll.step(dt, target, f.contact, drag ? { name: drag.part, point: drag.point } : null);
+    shown = ragdoll.pose(target);
+    measureDeviation(anim, shown);
+    balance(dt);
+  } else {
+    shown = target;
+    deviation = null;
+  }
   shownP = rig.positions(shown);
 }
 
@@ -746,9 +796,9 @@ $('home').addEventListener('click', () => {
   drag = null;
   ctrl.vel.set(0, 0, 0);
   track.reset(new Vector3(0, 0, 0), 0);
+  ragdoll.reset(track.display);
   look.detached = false;
-  locks.Left = locks.Right = null;
-  for (const v of [...springS, ...springV, rootS, rootV]) v.set(0, 0, 0);
+  deviation = null;
 });
 // the guide can be folded away; the choice is remembered on this browser
 let guidePref = null;
@@ -763,10 +813,12 @@ if (!navigator.gpu) $('gpu-note').textContent = 'このブラウザでは WebGPU
 
 showLibrary();
 track.reset(new Vector3(0, 0, 0), 0);
+ragdoll.reset(track.display);
+$('physics').addEventListener('input', () => ragdoll.reset(shown));
 requestAnimationFrame(frame);
 if (params.has('debug')) {
   window.lab = {
-    track, scheduler, simulate, settings, ctrl, library, rig, stage, look, cascade,
+    track, scheduler, simulate, settings, ctrl, library, rig, stage, look, cascade, ragdoll, get deviation() { return deviation; }, get pushedUntil() { return pushedUntil; }, get clock() { return clock; },
     get shownP() { return shownP; }, get drag() { return drag; },
     // a scripted pull: `point` is used as is (no screen ray)
     pull(part, point) { drag = part ? { part, point, sent: null, scripted: true } : null; if (!part) planTimer = 0; },

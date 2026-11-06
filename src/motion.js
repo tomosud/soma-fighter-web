@@ -129,8 +129,9 @@ export class Scheduler {
       track.pending = null;
       track.inflight = req;
       const a = track.anchor(req, lat);
-      const ctx = track.context(a);
-      const spec = req.build(track, a);
+      // a request may start from something other than the recorded motion (e.g. the pose physics pushed it into)
+      const ctx = req.context ? req.context(track, a) : track.context(a);
+      const spec = req.build(track, a, ctx);
       const align = encodeRequest(this.rig, batch, b, ctx, spec.targets, spec.tokens);
       return { track, req, serial: track.serial, a, ctx, spec, align };
     });
