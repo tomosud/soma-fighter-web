@@ -8,7 +8,7 @@ NVIDIA [MotionBricks](https://github.com/NVlabs/motionbricks)（SOMA モデル�
 
 ## 遊ぶ
 
-GitHub Pages の URL を開き、「モデルを読み込んで始める」を押す。初回は NVIDIA の GitHub からモデル（Mixed FP16 で 380 MB）をダウンロードしてブラウザに保存する（2 回目からは保存したものを使う）。
+GitHub Pages の URL を開き、「モデルを読み込んで始める」を押す。初回は NVIDIA の GitHub からモデル（Mixed FP16 で 380 MB）をダウンロードしてブラウザ（IndexedDB）に保存する（2 回目からは保存したものを使う）。
 
 | 操作 | キー |
 |---|---|
@@ -29,10 +29,10 @@ GitHub Pages の URL を開き、「モデルを読み込んで始める」を�
 
 | 環境 | 1 回の生成（2 人分） |
 |---|---|
-| WebGPU、NVIDIA Turing（Claude デスクトップの Chromium 152） | 約 190〜270 ms |
+| WebGPU、NVIDIA Turing（Claude デスクトップの Chromium 152） | 約 120〜170 ms |
 | Node の onnxruntime（CPU） | 約 80 ms |
 
-生成にかかる時間のぶん先の姿勢から生成を始め、届いたら続きとしてつなぐ（`src/motion.js`）。間に合わなければ 0.18 秒で混ぜてつなぐ。
+バッチの大きさを 2 に固定して ONNX Runtime に形の計算を畳ませると、可変のときより約 3 割速い（WebGPU で約 180〜230 ms → 120〜170 ms）。生成にかかる時間のぶん先の姿勢から生成を始め、届いたら続きとしてつなぐ（`src/motion.js`）。間に合わなければ 0.18 秒で混ぜてつなぐ。
 
 ## 仕組み
 
@@ -41,7 +41,7 @@ src/
   soma.js          骨格（30 関節）、順運動学、MotionBricks の入力エンコード・出力デコード・端点補正
   poses.js         キーポーズ：回転と 2 関節 IK で作る構え・打撃・のけぞり・ダウン
   motion.js        Track（再生中の動きと、生成した動きのつなぎ方）と Scheduler（2 人分を 1 回にまとめる）
-  infer.worker.js  ONNX Runtime Web（WebGPU、だめなら WASM）、モデルのダウンロードと Cache Storage への保存
+  infer.worker.js  ONNX Runtime Web（WebGPU、だめなら WASM）、モデルのダウンロードと IndexedDB への保存（Blob 1 つ）
   render.js        three.js：カプセルの人形、床、2 人を横から映すカメラ
   main.js          試合：入力、CPU、当たり判定、ラウンド
 assets/soma_rig.json   公式の骨格 USD から取り出したレスト姿勢

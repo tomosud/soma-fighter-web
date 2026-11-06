@@ -5,6 +5,7 @@ import { FPS, clonePose, lerpPose, placePose, emptyBatch, encodeRequest, decodeR
 const LOCK = new Set(['attack', 'hit', 'down']);
 const PRIORITY = { idle: 0, move: 1, attack: 2, hit: 3, down: 4 };
 const ZERO = new Vector3();
+export const BATCH = 2; // the model session is built for this fixed batch size
 
 export class Track {
   constructor(rig, book) {
@@ -122,8 +123,8 @@ export class Scheduler {
     const ready = tracks.filter(t => t.pending);
     if (!ready.length) return;
     const lat = this.latency * 1.15 + 0.02;
-    const batch = emptyBatch(ready.length);
-    const metas = ready.map((track, b) => {
+    const batch = emptyBatch(BATCH);
+    const metas = ready.slice(0, BATCH).map((track, b) => {
       const req = track.pending;
       track.pending = null;
       track.inflight = req;
@@ -133,6 +134,7 @@ export class Scheduler {
       const align = encodeRequest(this.rig, batch, b, ctx, spec.targets, spec.tokens);
       return { track, req, serial: track.serial, a, ctx, spec, align };
     });
+    for (let b = metas.length; b < BATCH; b++) encodeRequest(this.rig, batch, b, metas[0].ctx, metas[0].spec.targets, metas[0].spec.tokens); // padding
     const id = this.nextId++;
     this.jobs.set(id, { metas, t0: performance.now() });
     this.busy = true;

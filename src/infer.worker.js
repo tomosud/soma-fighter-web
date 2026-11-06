@@ -4,20 +4,56 @@ import * as ort from 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.30.0/dist/o
 ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.30.0/dist/';
 ort.env.wasm.numThreads = self.crossOriginIsolated ? Math.min(4, navigator.hardwareConcurrency || 1) : 1;
 
-const CACHE = 'motionbricks-model-v1';
 let session = null;
 let backend = '';
 
 const post = (type, data = {}) => self.postMessage({ type, ...data });
 
+// The downloaded model is kept in IndexedDB as one Blob (Cache Storage fails on entries of a few hundred MB,
+// and IndexedDB refuses ArrayBuffers over ~127 MB, but Blobs of this size are fine).
+const DB = 'motionbricks-models';
+const STORE = 'onnx';
+
+function openDb() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB, 1);
+    req.onupgradeneeded = () => req.result.createObjectStore(STORE);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+function idb(db, mode, fn) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE, mode);
+    const req = fn(tx.objectStore(STORE));
+    tx.oncomplete = () => resolve(req?.result);
+    tx.onerror = tx.onabort = () => reject(tx.error);
+  });
+}
+
+async function readCached(db, url) {
+  const blob = await idb(db, 'readonly', s => s.get(url));
+  return blob ? new Uint8Array(await blob.arrayBuffer()) : null;
+}
+
+async function writeCached(db, url, bytes) {
+  try {
+    await idb(db, 'readwrite', s => s.put(new Blob([bytes]), url));
+  } catch (e) {
+    console.warn('could not keep the model in IndexedDB:', e);
+  }
+}
+
 async function fetchModel(url) {
-  let cache = null;
-  try { cache = await caches.open(CACHE); } catch { /* no Cache Storage (private mode etc.) */ }
-  if (cache) {
-    const hit = await cache.match(url);
+  let db = null;
+  try { db = await openDb(); } catch { /* no IndexedDB (private mode etc.) */ }
+  for (const old of ['motionbricks-model-v1', 'motionbricks-model-v2']) self.caches?.delete(old)?.catch(() => {}); // earlier versions
+  if (db) {
+    const hit = await readCached(db, url).catch(() => null);
     if (hit) {
       post('progress', { phase: 'cache', loaded: 1, total: 1 });
-      return new Uint8Array(await hit.arrayBuffer());
+      return hit;
     }
   }
   const res = await fetch(url);
@@ -43,9 +79,7 @@ async function fetchModel(url) {
     for (const p of parts) { bytes.set(p, o); o += p.length; }
   }
   post('progress', { phase: 'download', loaded, total: loaded });
-  if (cache) {
-    try { await cache.put(url, new Response(bytes, { headers: { 'content-type': 'application/octet-stream' } })); } catch { /* quota */ }
-  }
+  if (db) await writeCached(db, url, bytes);
   return bytes;
 }
 
@@ -65,7 +99,7 @@ async function webgpuDevice() {
   return { device, name: [info.vendor, info.architecture, info.description].filter(Boolean).join(' ') };
 }
 
-async function load({ url, ep }) {
+async function load({ url, ep, batch }) {
   const bytes = await fetchModel(url);
   post('progress', { phase: 'session' });
   const errors = [];
@@ -74,7 +108,8 @@ async function load({ url, ep }) {
       const gpu = await webgpuDevice();
       if (!gpu) throw new Error('WebGPU is not available');
       ort.env.webgpu.device = gpu.device;
-      session = await ort.InferenceSession.create(bytes, { executionProviders: ['webgpu'], graphOptimizationLevel: 'all' });
+      // A fixed batch size lets ORT fold the shape computations, which otherwise run on the CPU between GPU kernels.
+      session = await ort.InferenceSession.create(bytes, { executionProviders: ['webgpu'], graphOptimizationLevel: 'all', freeDimensionOverrides: { batch_size: batch } });
       backend = `WebGPU${gpu.name ? ` (${gpu.name})` : ''}`;
     } catch (e) {
       errors.push(`WebGPU: ${e.message ?? e}`);
@@ -82,7 +117,7 @@ async function load({ url, ep }) {
     }
   }
   if (!session) {
-    session = await ort.InferenceSession.create(bytes, { executionProviders: ['wasm'], graphOptimizationLevel: 'all' });
+    session = await ort.InferenceSession.create(bytes, { executionProviders: ['wasm'], graphOptimizationLevel: 'all', freeDimensionOverrides: { batch_size: batch } });
     backend = 'WASM (CPU)';
   }
   post('ready', { backend, warnings: errors });

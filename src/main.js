@@ -3,7 +3,7 @@
 import { Quaternion, Vector3 } from 'three';
 import { Rig, placePose, emptyBatch, encodeRequest } from './soma.js';
 import { PoseBook } from './poses.js';
-import { Track, Scheduler } from './motion.js';
+import { Track, Scheduler, BATCH } from './motion.js';
 import { Stage, Mannequin } from './render.js';
 
 const MB_REV = '54fc563aeaaf819a753d72cc9fdc6713989cdd43';
@@ -406,7 +406,7 @@ worker.onmessage = ({ data }) => {
  * speed. Both are real requests (both fighters stepping), batched like the game.
  */
 function warmup(id = -1) {
-  const batch = emptyBatch(2);
+  const batch = emptyBatch(BATCH);
   fighters.forEach((f, b) => {
     const ctx = f.track.context(f.track.end);
     const A = ground(ctx[3].root);
@@ -421,7 +421,7 @@ $('start').addEventListener('click', () => {
   const url = new URL(params.get('model') ?? MODELS[choice].url, location.href).href;
   $('start').disabled = true;
   $('progress').classList.add('show');
-  worker.postMessage({ type: 'load', url, ep: params.get('ep') ?? 'webgpu' });
+  worker.postMessage({ type: 'load', url, ep: params.get('ep') ?? 'webgpu', batch: BATCH });
 });
 
 if (!navigator.gpu) $('gpu-note').textContent = 'このブラウザでは WebGPU が使えません。WASM（CPU）で動きますが、かなり遅くなります。Chrome / Edge の最新版をおすすめします。';
