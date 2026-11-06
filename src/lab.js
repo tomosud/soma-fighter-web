@@ -6,7 +6,7 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { Quaternion, Vector3 } from 'three';
 import { Rig, placePose, clonePose, emptyBatch, encodeRequest } from './soma.js';
-import { KeyBook, rotateSubtree, twoBoneIK } from './poses.js';
+import { KeyBook, rotateSubtree, twoBoneIK, setWorldRot } from './poses.js';
 import { Track, Scheduler, BATCH } from './motion.js';
 import { Stage, Mannequin } from './render.js';
 
@@ -42,16 +42,20 @@ ghost.bones.forEach(b => { b.mesh.castShadow = false; });
 ghost.head.castShadow = false;
 let ghostPose = null;
 
-const settings = { auto: true, strength: 0.45, rate: 1.2 };
+const settings = { mode: 'dance', auto: true, strength: 0.45, rate: 1.2, bpm: 110, sound: true };
 const bind = (id, key, fmt = v => v) => {
   const el = $(id);
-  const read = () => { settings[key] = el.type === 'checkbox' ? el.checked : Number(el.value); if ($(`${id}-v`)) $(`${id}-v`).textContent = fmt(settings[key]); };
+  const read = () => { settings[key] = el.type === 'checkbox' ? el.checked : el.tagName === 'SELECT' ? el.value : Number(el.value); if ($(`${id}-v`)) $(`${id}-v`).textContent = fmt(settings[key]); };
   el.addEventListener('input', read);
   read();
 };
 bind('auto', 'auto');
 bind('strength', 'strength', v => v.toFixed(2));
 bind('rate', 'rate', v => v.toFixed(1));
+bind('mode', 'mode');
+bind('bpm', 'bpm', v => v.toFixed(0));
+bind('sound', 'sound');
+$('mode').addEventListener('input', () => { dance.queue.length = 0; });
 
 // ---------------------------------------------------------------- pose helpers
 
@@ -170,8 +174,8 @@ function mutate(src, strength) {
 const stock = [];
 let nextId = 1, maxGen = 0, playing = null, queued = null;
 
-function addStock(pose, gen, seed = false) {
-  const entry = { id: nextId++, pose, gen, seed, el: null, energy: energy(pose) };
+function addStock(pose, gen, seed = false, name = null) {
+  const entry = { id: nextId++, pose, gen, seed, name, el: null, energy: energy(pose) };
   // novelty: how far it is from the closest of (a sample of) the poses already kept
   const sample = stock.length > 24 ? Array.from({ length: 24 }, () => stock[Math.floor(Math.random() * stock.length)]) : stock;
   entry.novelty = sample.length ? Math.min(...sample.map(e => distance(e.pose, pose))) : 1;
@@ -199,7 +203,7 @@ function resetStock() {
   for (const e of stock) e.el.remove();
   stock.length = 0;
   maxGen = 0;
-  for (const name of Object.keys(book.keys)) addStock(ground(canonical(book.keys[name][0])), 0, true);
+  for (const name of Object.keys(book.keys)) addStock(ground(canonical(book.keys[name][0])), 0, true, name);
 }
 
 /** Pick by score, newer poses a little more often, so the stock keeps moving on and does not settle. */
@@ -230,6 +234,7 @@ function harvest(frames, parent) {
   const carry = 1 + settings.strength * 2;
   const L = Lm.map((q, j) => q.clone().multiply(qpow(Lp[j].clone().invert().multiply(q), carry, Math.PI * 0.4)));
   let child = canonical(fromLocal(mid.root, L));
+  if (settings.mode === 'dance') { addStock(dancify(child, settings.strength * 0.4), (parent?.gen ?? 0) + 1); return; }
   child = mutate(child, settings.strength * 0.5);
   const want = Math.min(1.3, Math.max(0.3, (parent?.energy ?? 0.3) * 1.05));
   for (let k = 0; k < 3; k++) {
@@ -276,6 +281,7 @@ function thumb(entry) {
   el.appendChild(label);
   el.addEventListener('click', () => {
     queued = entry;
+    if (settings.mode === 'dance') { dance.queue.unshift({ pose: dancify(entry.pose, 0.1), beats: 2, entry }); return; }
     if (!drag && scheduler.ready) track.request(evolveReq(entry, 'now', true));
   });
   return el;
@@ -355,6 +361,259 @@ function dragReq() {
       };
     },
   };
+}
+
+// ---------------------------------------------------------------- dance mode
+// The same stock, made danceable: the legs come from a small set of footings with the feet on the floor, the
+// joints stay within human-ish limits, the centre of mass stays over the feet and the strength stays in a band.
+// Poses are strung into 8-count phrases on the beat (A, A mirrored, B, A varied), travelling around the floor,
+// with a walk between phrases now and then.
+
+const UPPER = ['Spine1', 'Spine2', 'Chest', 'Neck1', 'Neck2', 'Head', 'LeftShoulder', 'LeftArm', 'LeftForeArm', 'LeftHand',
+  'RightShoulder', 'RightArm', 'RightForeArm', 'RightHand'];
+const UPPER_J = UPPER.map(n => I[n]);
+// how far each joint may turn away from the stance, in radians
+const LIMIT = { Spine1: 0.45, Spine2: 0.4, Chest: 0.4, Neck1: 0.5, Neck2: 0.4, Head: 0.6, LeftShoulder: 0.5, RightShoulder: 0.5,
+  LeftArm: 2.6, RightArm: 2.6, LeftForeArm: 2.4, RightForeArm: 2.4, LeftHand: 1.0, RightHand: 1.0 };
+// footings in the key frame (facing +Z, left = +X): ankle x, z (and lift), hips x, y, z
+const FEET = [
+  { name: 'stand', w: 3, l: [0.11, 0.03], r: [-0.11, -0.03], hips: [0, 0.96, 0] },
+  { name: 'wide', w: 2, l: [0.27, 0], r: [-0.27, 0], hips: [0, 0.86, 0] },
+  { name: 'left', w: 3, l: [0.09, 0.05], r: [-0.24, -0.12], hips: [0.06, 0.94, 0] },
+  { name: 'right', w: 3, l: [0.24, -0.12], r: [-0.09, 0.05], hips: [-0.06, 0.94, 0] },
+  { name: 'step', w: 2, l: [0.1, 0.3], r: [-0.12, -0.18], hips: [0, 0.9, 0.06] },
+  { name: 'lunge', w: 1, l: [0.17, 0.45], r: [-0.17, -0.35], hips: [0, 0.8, 0.05] },
+  { name: 'squat', w: 1, l: [0.25, 0.05], r: [-0.25, 0.05], hips: [0, 0.68, -0.06] },
+  { name: 'point', w: 1, l: [0.12, 0.42, 0.05], r: [-0.1, -0.03], hips: [-0.04, 0.94, -0.02] },
+];
+const FEET_W = FEET.reduce((a, f) => a + f.w, 0);
+const MASS = { Hips: 14, Spine1: 8, Spine2: 8, Chest: 10, Neck1: 2, Head: 6, LeftArm: 2.5, RightArm: 2.5, LeftForeArm: 1.5,
+  RightForeArm: 1.5, LeftHand: 0.6, RightHand: 0.6, LeftLeg: 9, RightLeg: 9, LeftShin: 4, RightShin: 4, LeftFoot: 1.2, RightFoot: 1.2 };
+const ANKLE = rig.restPos[I.LeftFoot].y;
+const LEG_REACH = (rig.restPos[I.LeftLeg].distanceTo(rig.restPos[I.LeftShin]) + rig.restPos[I.LeftShin].distanceTo(rig.restPos[I.LeftFoot])) * 0.995;
+const stanceHips = canonical(book.stance).rot[0].clone();
+
+function clampJoints(pose) {
+  const L = toLocal(pose);
+  for (const [name, lim] of Object.entries(LIMIT)) {
+    const j = I[name];
+    const d = stanceLocal[j].clone().invert().multiply(L[j]);
+    const a = angleOf(d);
+    if (a > lim) L[j] = stanceLocal[j].clone().multiply(qpow(d, lim / a));
+  }
+  return fromLocal(pose.root, L);
+}
+
+function upperEnergy(pose) {
+  const L = toLocal(pose);
+  return UPPER_J.reduce((sum, j) => sum + angleOf(stanceLocal[j].clone().invert().multiply(L[j])), 0) / UPPER_J.length;
+}
+
+function scaleUpper(pose, factor) {
+  const L = toLocal(pose);
+  for (const j of UPPER_J) L[j] = stanceLocal[j].clone().multiply(qpow(stanceLocal[j].clone().invert().multiply(L[j]), factor));
+  return fromLocal(pose.root, L);
+}
+
+// left-right mirror: swap Left*/Right* joints and reflect across the body's YZ plane, rest pose onto rest pose
+const MIRROR = rig.names.map(n => I[n.startsWith('Left') ? `Right${n.slice(4)}` : n.startsWith('Right') ? `Left${n.slice(5)}` : n]);
+const reflect = q => new Quaternion(q.x, -q.y, -q.z, q.w);
+function mirror(pose) {
+  const rot = pose.rot.map((_, j) => {
+    const m = MIRROR[j];
+    return reflect(pose.rot[m].clone().multiply(rig.restRot[m].clone().invert())).multiply(rig.restRot[j]);
+  });
+  return rig.fixRigid({ root: new Vector3(-pose.root.x, pose.root.y, pose.root.z), rot });
+}
+
+function footing(name = null) {
+  if (name) return FEET.find(f => f.name === name);
+  let r = Math.random() * FEET_W;
+  for (const f of FEET) { r -= f.w; if (r <= 0) return f; }
+  return FEET[0];
+}
+
+function plantFeet(p, ft, lt, rt) {
+  for (let k = 0; k < 4; k++) { // lower the hips until both legs reach their feet
+    const P = rig.positions(p);
+    const need = Math.max(P[I.LeftLeg].distanceTo(lt), P[I.RightLeg].distanceTo(rt)) - LEG_REACH;
+    if (need <= 0) break;
+    p.root.y -= need + 0.004;
+  }
+  twoBoneIK(rig, p, I.LeftLeg, I.LeftShin, I.LeftFoot, lt, new Vector3(0.35, 0, 1));
+  twoBoneIK(rig, p, I.RightLeg, I.RightShin, I.RightFoot, rt, new Vector3(-0.35, 0, 1));
+  setWorldRot(rig, p, I.LeftFoot, new Quaternion().setFromAxisAngle(UP, 0.25).multiply(rig.restRot[I.LeftFoot]));
+  setWorldRot(rig, p, I.RightFoot, new Quaternion().setFromAxisAngle(UP, -0.25).multiply(rig.restRot[I.RightFoot]));
+}
+
+/** Make a pose danceable (and, with strength > 0, vary its upper body first). The result faces +Z, hips over its feet. */
+function dancify(src, strength, feetName = null) {
+  let p = clonePose(canonical(src));
+  if (strength > 0) {
+    const ops = 1 + Math.floor(Math.random() * (1 + strength * 2));
+    for (let o = 0; o < ops; o++) {
+      const r = Math.random();
+      if (r < 0.38) {
+        const j = UPPER_J[Math.floor(Math.random() * UPPER_J.length)];
+        rotateSubtree(rig, p, j, new Quaternion().setFromAxisAngle(randUnit(), rand(-1, 1) * strength * 0.9));
+      } else if (r < 0.75) { // reach a hand out, up or to the side (not down through the floor, not far behind)
+        const chain = (Math.random() < 0.5 ? LIMBS.LeftHand : LIMBS.RightHand).map(n => I[n]);
+        const P = rig.positions(p);
+        const reach = P[chain[1]].distanceTo(P[chain[0]]) + P[chain[2]].distanceTo(P[chain[1]]);
+        let dir;
+        do { dir = randUnit(); } while (dir.y < -0.5 || dir.z < -0.4);
+        twoBoneIK(rig, p, chain[0], chain[1], chain[2], P[chain[0]].clone().addScaledVector(dir, reach * rand(0.55, 0.98)), new Vector3(rand(-1, 1), -1, rand(-1, 0.3)));
+      } else if (r < 0.9 && stock.length > 1) {
+        const L = toLocal(p), Lo = toLocal(canonical(stock[Math.floor(Math.random() * stock.length)].pose));
+        const part = ['LeftArm', 'RightArm', 'Neck1', 'Spine2'][Math.floor(Math.random() * 4)];
+        const w = rand(0.5, 1);
+        for (const k of rig.subtree(I[part])) L[k].slerp(Lo[k], w);
+        p = fromLocal(p.root, L);
+      } else {
+        p = mirror(p);
+      }
+    }
+  }
+  // stand the hips up (a little lean and turn are kept)
+  const d = stanceHips.clone().invert().multiply(p.rot[0]);
+  const a = angleOf(d);
+  if (a > 0.3) setWorldRot(rig, p, 0, stanceHips.clone().multiply(qpow(d, 0.3 / a)));
+  p = clampJoints(p);
+  // strength band: not so weak that it fades, not so strong that it falls apart
+  const lo = 0.22 + 0.12 * strength, hi = 0.42 + 0.4 * strength;
+  let e = upperEnergy(p);
+  if (e > 1e-3 && (e < lo || e > hi)) p = clampJoints(scaleUpper(p, (e < lo ? lo : hi) / e));
+  for (let k = 0; k < 3 && strength > 0 && (e = upperEnergy(p)) < lo * 0.8; k++) { // too plain: lift an arm somewhere
+    const chain = (Math.random() < 0.5 ? LIMBS.LeftHand : LIMBS.RightHand).map(n => I[n]);
+    const P = rig.positions(p);
+    const reach = P[chain[1]].distanceTo(P[chain[0]]) + P[chain[2]].distanceTo(P[chain[1]]);
+    const dir = new Vector3(rand(-1, 1), rand(0, 1), rand(0, 1)).normalize();
+    twoBoneIK(rig, p, chain[0], chain[1], chain[2], P[chain[0]].clone().addScaledVector(dir, reach * 0.9), new Vector3(0, -1, -0.3));
+    p = clampJoints(p);
+  }
+  // legs from a footing, feet on the floor
+  const ft = footing(feetName);
+  const jitter = () => rand(-0.03, 0.03);
+  const lt = new Vector3(ft.l[0] + jitter(), ANKLE + (ft.l[2] ?? 0), ft.l[1] + jitter());
+  const rt = new Vector3(ft.r[0] + jitter(), ANKLE + (ft.r[2] ?? 0), ft.r[1] + jitter());
+  p.root.set(ft.hips[0], ft.hips[1] + rand(-0.03, 0.02), ft.hips[2]);
+  plantFeet(p, ft, lt, rt);
+  // centre of mass over the feet: move the hips toward the line between the ankles
+  for (let k = 0; k < 3; k++) {
+    const P = rig.positions(p);
+    let m = 0, cx = 0, cz = 0;
+    for (const [n, w] of Object.entries(MASS)) { m += w; cx += P[I[n]].x * w; cz += P[I[n]].z * w; }
+    cx /= m; cz /= m;
+    const ax = lt.x, az = lt.z, bx = rt.x, bz = rt.z;
+    const t = Math.max(0, Math.min(1, ((cx - ax) * (bx - ax) + (cz - az) * (bz - az)) / ((bx - ax) ** 2 + (bz - az) ** 2 || 1)));
+    const qx = ax + (bx - ax) * t - cx, qz = az + (bz - az) * t - cz, dist = Math.hypot(qx, qz);
+    if (dist <= 0.07) break;
+    p.root.x += (qx * (dist - 0.05)) / dist;
+    p.root.z += (qz * (dist - 0.05)) / dist;
+    plantFeet(p, ft, lt, rt);
+  }
+  // hands stay above the floor
+  for (const part of ['LeftHand', 'RightHand']) {
+    const chain = LIMBS[part].map(n => I[n]);
+    const P = rig.positions(p);
+    if (P[chain[2]].y < 0.12) twoBoneIK(rig, p, chain[0], chain[1], chain[2], P[chain[2]].clone().setY(0.14), new Vector3(0, -1, 0));
+  }
+  return rig.fixRigid(p);
+}
+
+const dance = { queue: [], phrase: 0, theta: 0, dir: 1, marks: [], count: 0, prevNow: 0 };
+const neutral = () => dancify(book.stance, 0, 'stand');
+
+function danceable() {
+  for (let k = 0; k < 8; k++) {
+    const e = pick();
+    if (!e.name?.startsWith('down')) return e;
+  }
+  return stock[0];
+}
+
+function planPhrase() {
+  const s = settings.strength;
+  const A = [0, 1, 2, 3].map(() => dancify(danceable().pose, s));
+  const B = [0, 1, 2, 3].map(() => dancify(danceable().pose, s));
+  const items = [...A, ...A.map(mirror), ...B, ...A.map(pose => dancify(pose, s * 0.25))].map(pose => ({ pose, beats: 2 }));
+  if (dance.phrase % 2 === 1) items.unshift({ walk: true, beats: 4 });
+  if (Math.random() < 0.4) dance.dir = -dance.dir;
+  dance.queue.push(...items);
+  dance.phrase++;
+}
+
+function danceReq(item) {
+  return {
+    kind: 'idle', mode: 'end',
+    build(tr, a) {
+      const from = tr.frame(a).pose;
+      dance.theta += dance.dir * (item.walk ? 1.5 : 0.25 + 0.2 * settings.strength);
+      const dest = new Vector3(Math.sin(dance.theta) * 1.3, 0, Math.cos(dance.theta) * 0.8);
+      let target;
+      if (item.walk) {
+        target = placePose(neutral(), Math.atan2(dest.x - from.root.x, dest.z - from.root.z), ZERO, dest);
+      } else {
+        const yaw = Math.atan2(camera.position.x - dest.x, camera.position.z - dest.z) + rand(-0.4, 0.4); // face the viewer
+        target = placePose(item.pose, yaw, ZERO, dest);
+      }
+      ghostPose = target;
+      if (item.entry && queued === item.entry) queued = null;
+      return {
+        targets: [target], tokens: item.walk ? [10, 11, 12, 13, 14] : [8, 9, 10, 11, 12], rate: 1, tag: { kind: 'dance' },
+        after(_tr, a0, frames) {
+          // fit the motion to its beats: the key pose lands on the next count
+          const rate = Math.max(0.5, Math.min(2.4, (frames.length - 1) / 30 / ((item.beats * 60) / settings.bpm)));
+          for (const f of frames) f.rate = rate;
+          dance.marks.push({ start: a0, len: frames.length - 1, beats: item.beats });
+          if (!item.walk && Math.random() < 0.5) harvest(frames, { gen: maxGen, energy: 0.4 });
+        },
+      };
+    },
+  };
+}
+
+// beat sound (kick on the counts, a hat between them); the counts come from the motion being played
+let audio = null;
+function sound(kind, accent = false) {
+  if (!settings.sound || !audio) return;
+  const t = audio.currentTime;
+  const g = audio.createGain();
+  g.connect(audio.destination);
+  if (kind === 'kick') {
+    const o = audio.createOscillator();
+    o.frequency.setValueAtTime(accent ? 150 : 120, t);
+    o.frequency.exponentialRampToValueAtTime(45, t + 0.12);
+    g.gain.setValueAtTime(accent ? 0.9 : 0.55, t);
+    g.gain.exponentialRampToValueAtTime(0.001, t + 0.2);
+    o.connect(g); o.start(t); o.stop(t + 0.22);
+  } else {
+    const len = Math.floor(audio.sampleRate * 0.04);
+    const buf = audio.createBuffer(1, len, audio.sampleRate);
+    const ch = buf.getChannelData(0);
+    for (let i = 0; i < len; i++) ch[i] = (Math.random() * 2 - 1) * (1 - i / len);
+    const src = audio.createBufferSource();
+    src.buffer = buf;
+    const hp = audio.createBiquadFilter();
+    hp.type = 'highpass'; hp.frequency.value = 7000;
+    g.gain.value = 0.18;
+    src.connect(hp); hp.connect(g); src.start(t);
+  }
+}
+
+function beats() {
+  const now = track.now, prev = dance.prevNow;
+  dance.prevNow = now;
+  if (now <= prev) return;
+  for (const m of dance.marks) {
+    for (let k = 0; k < m.beats * 2; k++) {
+      const at = m.start + (m.len * k) / (m.beats * 2);
+      if (at > prev && at <= now) {
+        if (k % 2 === 0) sound('kick', dance.count++ % 8 === 0); else sound('hat');
+      }
+    }
+  }
+  dance.marks = dance.marks.filter(m => m.start + m.len > now - 2);
 }
 
 // ---------------------------------------------------------------- dragging
@@ -448,10 +707,15 @@ function simulate(dt) {
         track.request(dragReq());
       }
     } else if (!track.busy && track.remaining / 30 < scheduler.latency + 0.25) {
-      track.request(settings.auto ? evolveReq(pick()) : evolveReq(stock[0], 'end', true));
+      if (!settings.auto) track.request(evolveReq(stock[0], 'end', true));
+      else if (settings.mode === 'dance') {
+        if (!dance.queue.length) planPhrase();
+        track.request(danceReq(dance.queue.shift()));
+      } else track.request(evolveReq(pick()));
     }
   }
   track.advance(dt);
+  if (settings.mode === 'dance') beats();
   scheduler.tick([track]);
   const tag = track.tag;
   if (tag.kind === 'evolve') playing = tag.entry;
@@ -541,6 +805,7 @@ $('start').addEventListener('click', () => {
   const url = new URL(params.get('model') ?? MODELS[choice], location.href).href;
   $('start').disabled = true;
   $('progress').classList.add('show');
+  try { audio = new AudioContext(); } catch { /* no audio */ }
   worker.postMessage({ type: 'load', url, ep: params.get('ep') ?? 'webgpu', batch: BATCH });
 });
 $('reset').addEventListener('click', resetStock);
@@ -549,4 +814,4 @@ if (!navigator.gpu) $('gpu-note').textContent = 'このブラウザでは WebGPU
 resetStock();
 track.reset(new Vector3(0, 0, 0), 0);
 requestAnimationFrame(frame);
-if (params.has('debug')) window.lab = { track, stock, scheduler, simulate, settings, get drag() { return drag; }, set drag(v) { drag = v; }, dragReq, pulled, mutate, stage, rig, draw: () => frame(performance.now()) };
+if (params.has('debug')) window.lab = { track, stock, scheduler, simulate, settings, get drag() { return drag; }, set drag(v) { drag = v; }, dragReq, pulled, mutate, stage, rig, draw: () => frame(performance.now()), dance, dancify, mirror, planPhrase, upperEnergy };

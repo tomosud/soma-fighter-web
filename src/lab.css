@@ -25,3 +25,5 @@ button.small { width: auto; margin: 0; padding: 5px 10px; font-size: 13px; }
   #stock-grid { grid-template-columns: repeat(6, 1fr); }
   .lab-bar input[type=range] { width: 80px; }
 }
+
+.lab-bar select { background: #22252e; color: var(--text); border: 1px solid #555b6b; border-radius: 4px; padding: 2px 4px; }

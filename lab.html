@@ -19,9 +19,12 @@
 
   <header class="lab-bar">
     <strong>SOMA Pose Lab</strong>
+    <label>モード <select id="mode"><option value="dance" selected>ダンス</option><option value="free">自由</option></select></label>
     <label class="toggle"><input type="checkbox" id="auto" checked> 自動展開</label>
+    <label>BPM <input type="range" id="bpm" min="80" max="140" step="1" value="110"> <span id="bpm-v">110</span></label>
+    <label class="toggle"><input type="checkbox" id="sound" checked> 音</label>
     <label>変異 <input type="range" id="strength" min="0" max="1" step="0.05" value="0.45"> <span id="strength-v">0.45</span></label>
-    <label>速さ <input type="range" id="rate" min="0.6" max="2.4" step="0.1" value="1.2"> <span id="rate-v">1.2</span></label>
+    <label>速さ（自由） <input type="range" id="rate" min="0.6" max="2.4" step="0.1" value="1.2"> <span id="rate-v">1.2</span></label>
     <button id="reset" class="small">ストックを戻す</button>
     <a href="./" class="small-link">格闘ゲームへ</a>
   </header>

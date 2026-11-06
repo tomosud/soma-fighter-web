@@ -41,6 +41,11 @@ KEYS = {
     "down_back": ("down_back", 57),
     "down_ko": ("down_ko", 100),
     "victory": ("victory", 60),
+    "victory_b": ("victory", 100),
+    "taunt": ("taunt", 20),
+    "taunt_b": ("taunt", 38),
+    "block_high": ("block_high", 14),
+    "block_mid": ("block_mid", 16),
 }
 
 # runtime (Z up, facing +X) -> model (Y up): undo MotionBricks' MUJOCO conversion (+90 deg about X),
