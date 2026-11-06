@@ -25,7 +25,7 @@ jobs:
       - name: Collect the static site
         run: |
           mkdir _site
-          cp -r index.html src assets NOTICE.md LICENSE _site/
+          cp -r *.html src assets NOTICE.md LICENSE _site/
           touch _site/.nojekyll
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
