@@ -2,7 +2,7 @@
 
 NVIDIA [MotionBricks](https://github.com/NVlabs/motionbricks)（SOMA モデル）を**ブラウザの WebGPU で動かし**、その場で生成した動きだけで戦う 1 対 1 の格闘ゲーム。サーバーは要らず、GitHub Pages の静的ファイルだけで動く。
 
-用意したアニメーションは再生しない。「構え」「ジャブ」「ストレート」「ミドルキック」「のけぞり」「ダウン」のキーポーズだけをコードで作り（`src/poses.js`）、相手の今の位置に合わせて置いて（打撃は IK で手足の先を相手の頭・胴へ届かせて）、そこまでの動きを MotionBricks が毎回生成する。2 人分の生成は 1 回の推論にまとめる。
+用意したアニメーションは再生しない。構え・打撃 6 種・のけぞり 5 種・ダウン 2 種・勝ちポーズの**キーポーズだけ**（Mixamo のモーションを SOMA に移したものから、当たる瞬間などの 4 フレームずつ。`assets/keyposes.json`）を相手の今の位置に合わせて置き（打撃は IK で手足の先を相手の頭・あご・胴へ届かせ）、そこまでの動きを MotionBricks が毎回生成する。2 人分の生成は 1 回の推論にまとめる。
 
 デスクトップ版 SOMA Fighter（TensorRT サーバー + ブラウザ描画）の考え方を参考にした、最小限のブラウザ版。
 
@@ -16,7 +16,10 @@ GitHub Pages の URL を開き、「モデルを読み込んで始める」を�
 | 横に動く（奥 / 手前） | W / S |
 | ジャブ | J（左クリック） |
 | ストレート | L（中クリック） |
+| フック | U |
+| アッパー | I |
 | ミドルキック | K（右クリック） |
+| ハイキック | O |
 
 2 本先取。届かない距離で打つと空振りになる。打たれると打撃は止まる。
 
@@ -39,14 +42,16 @@ GitHub Pages の URL を開き、「モデルを読み込んで始める」を�
 ```
 src/
   soma.js          骨格（30 関節）、順運動学、MotionBricks の入力エンコード・出力デコード・端点補正
-  poses.js         キーポーズ：回転と 2 関節 IK で作る構え・打撃・のけぞり・ダウン
+  poses.js         キーポーズ：keyposes.json の読み込み、打撃を点へ届かせる 2 関節 IK（KeyBook）。手で作る版（PoseBook）も残す
   motion.js        Track（再生中の動きと、生成した動きのつなぎ方）と Scheduler（2 人分を 1 回にまとめる）
   infer.worker.js  ONNX Runtime Web（WebGPU、だめなら WASM）、モデルのダウンロードと IndexedDB への保存（Blob 1 つ）
   render.js        three.js：カプセルの人形、床、2 人を横から映すカメラ
   main.js          試合：入力、CPU、当たり判定、ラウンド
 assets/soma_rig.json   公式の骨格 USD から取り出したレスト姿勢
+assets/keyposes.json   キーポーズ（SOMA Fighter の clips.npz のうち Mixamo 由来のクリップから）
 tools/
   extract_rig.py   USD → soma_rig.json（uv run --with usd-core python tools/extract_rig.py <usd>）
+  bake_keyposes.py clips.npz → keyposes.json（uv run --with numpy --with scipy python -I tools/bake_keyposes.py <clips.npz> <clips.json>）
   smoke.mjs        Node でモデルを動かす試験（エンコード → 推論 → デコードの誤差）
   serve.mjs        ローカル用の静的サーバー
 ```
@@ -72,4 +77,4 @@ npm run smoke -- models/mmm_v6_soma_fp16.onnx
 
 ## ライセンス
 
-コードは Apache-2.0。MotionBricks のコード（Apache-2.0）を移した部分、骨格データ（CC-BY-4.0）、モデルの重み（NVIDIA Open Model Agreement、このリポジトリには含めない）については [NOTICE.md](NOTICE.md)。
+コードは Apache-2.0。MotionBricks のコード（Apache-2.0）を移した部分、骨格データ（CC-BY-4.0）、キーポーズ（Mixamo 由来）、モデルの重み（NVIDIA Open Model Agreement、このリポジトリには含めない）については [NOTICE.md](NOTICE.md)。

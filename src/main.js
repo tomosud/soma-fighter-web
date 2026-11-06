@@ -1,8 +1,9 @@
 // SOMA Fighter Web: a one-on-one fighting game whose every frame of motion is generated in the browser by
-// NVIDIA MotionBricks (SOMA). Key poses are authored here; MotionBricks generates the motion toward them.
+// NVIDIA MotionBricks (SOMA). Only key poses are given (from Mixamo-derived SOMA clips, placed against the
+// opponent and bent by IK); MotionBricks generates the motion toward them.
 import { Quaternion, Vector3 } from 'three';
 import { Rig, placePose, emptyBatch, encodeRequest } from './soma.js';
-import { PoseBook } from './poses.js';
+import { KeyBook } from './poses.js';
 import { Track, Scheduler, BATCH } from './motion.js';
 import { Stage, Mannequin } from './render.js';
 
@@ -18,14 +19,30 @@ const RING = 3.7;
 const HP = 100;
 const $ = id => document.getElementById(id);
 
+// key: key pose, chain: IK chain to the striking end, tip: the tip is between the chain's end and this joint
+const ARM_L = ['LeftArm', 'LeftForeArm', 'LeftHand'], ARM_R = ['RightArm', 'RightForeArm', 'RightHand'];
+const LEG_R = ['RightLeg', 'RightShin', 'RightFoot'];
 const ATTACKS = {
-  jab: { name: 'ジャブ', kind: 'punch', lead: true, limb: 'LeftHand', tip: 'LeftHandMiddleEnd', aim: 'head', power: 7, rate: 2.1, tokens: [6], step: 0.35, reach: 0.62 },
-  cross: { name: 'ストレート', kind: 'punch', lead: false, limb: 'RightHand', tip: 'RightHandMiddleEnd', aim: 'head', power: 12, rate: 1.8, tokens: [6], step: 0.45, reach: 0.6 },
-  kick: { name: 'ミドルキック', kind: 'kick', lead: false, limb: 'RightFoot', tip: 'RightToeBase', aim: 'body', power: 15, rate: 1.6, tokens: [6, 7], step: 0.45, reach: 0.85 },
+  jab: { name: 'ジャブ', key: 'jab', kind: 'punch', chain: ARM_L, tip: 'LeftHandMiddleEnd', aim: 'head', power: 7, rate: 2.4, tokens: [6], step: 0.45 },
+  cross: { name: 'ストレート', key: 'cross', kind: 'punch', chain: ARM_R, tip: 'RightHandMiddleEnd', aim: 'head', power: 12, rate: 1.8, tokens: [6], step: 0.55 },
+  hook: { name: 'フック', key: 'hook', kind: 'punch', chain: ARM_R, tip: 'RightHandMiddleEnd', aim: 'head', power: 14, rate: 1.6, tokens: [6], step: 0.5 },
+  uppercut: { name: 'アッパー', key: 'uppercut', kind: 'punch', chain: ARM_L, tip: 'LeftHandMiddleEnd', aim: 'chin', power: 13, rate: 1.7, tokens: [6], step: 0.45 },
+  mid_kick: { name: 'ミドルキック', key: 'mid_kick', kind: 'kick', chain: LEG_R, tip: 'RightToeBase', aim: 'body', power: 15, rate: 1.7, tokens: [6], step: 0.5 },
+  high_kick: { name: 'ハイキック', key: 'high_kick', kind: 'kick', chain: LEG_R, tip: 'RightToeBase', aim: 'head', power: 20, rate: 1.6, tokens: [7], step: 0.6 },
+};
+// the defender's key pose by where and how hard it was hit; back = metres pushed away
+const REACTIONS = {
+  head_light: { key: 'hit_head_light', back: 0.15, tokens: [6], rate: 2.2 },
+  head: { key: 'hit_head', back: 0.25, tokens: [6], rate: 2.0 },
+  head_big: { key: 'hit_head_big', back: 0.35, tokens: [6, 7], rate: 1.8 },
+  body: { key: 'hit_body', back: 0.3, tokens: [6], rate: 2.0 },
+  stomach: { key: 'hit_stomach', back: 0.15, tokens: [6], rate: 2.0 },
+  down: { key: 'down_back', back: 0.4, tokens: [10], rate: 1.5, down: true },
+  down_ko: { key: 'down_ko', back: 0.3, tokens: [12, 13, 14], rate: 1.3, down: true },
 };
 
 const rig = new Rig(await (await fetch(new URL('../assets/soma_rig.json', import.meta.url))).json());
-const book = new PoseBook(rig);
+const book = new KeyBook(rig, await (await fetch(new URL('../assets/keyposes.json', import.meta.url))).json());
 const stage = new Stage($('view'));
 const worker = new Worker(new URL('./infer.worker.js', import.meta.url), { type: 'module' });
 const scheduler = new Scheduler(rig, worker);
@@ -67,7 +84,8 @@ function idleReq(f, mode = 'end') {
     kind: 'idle', mode,
     build(track, a) {
       const A = ground(track.frame(a).pose.root);
-      return { targets: [placePose(book.stance, yawTo(A, f.opp.root), ZERO, A)], tokens: [8, 9, 10, 11, 12], rate: 1, tag: { kind: 'idle' } };
+      const yaw = yawTo(A, f.opp.root);
+      return { targets: book.get(Math.random() < 0.5 ? 'stance' : 'stance_b').map(p => placePose(p, yaw, ZERO, A)), tokens: [8, 9, 10, 11, 12], rate: 1, tag: { kind: 'idle' } };
     },
   };
 }
@@ -78,7 +96,8 @@ function moveReq(f, dir, mode = 'now') {
     build(track, a) {
       const A = ground(track.frame(a).pose.root);
       const dest = clampRing(A.clone().addScaledVector(dir, 0.6));
-      return { targets: [placePose(book.stance, yawTo(dest, f.opp.root), ZERO, dest)], tokens: [6, 7, 8], rate: 1.25, tag: { kind: 'move', dir: dir.clone() } };
+      const yaw = yawTo(dest, f.opp.root);
+      return { targets: book.get('stance').map(p => placePose(p, yaw, ZERO, dest)), tokens: [6, 7, 8], rate: 1.25, tag: { kind: 'move', dir: dir.clone() } };
     },
   };
 }
@@ -86,26 +105,29 @@ function moveReq(f, dir, mode = 'now') {
 function aimPoint(f, aim) {
   const P = f.P;
   if (aim === 'head') return P[rig.index.Head].clone().lerp(f.track.extra[0], 0.45);
+  if (aim === 'chin') return P[rig.index.Jaw].clone().lerp(P[rig.index.Head], 0.3);
   return P[rig.index.Spine2].clone();
 }
 
-function attackReq(f, key) {
-  const atk = ATTACKS[key];
+function attackReq(f, name) {
+  const atk = ATTACKS[name];
+  const natural = book.tip(atk.key, atk.chain[2], atk.tip); // where the key pose's limb tip is
   return {
-    kind: 'attack', mode: 'now', key,
+    kind: 'attack', mode: 'now', key: name,
     build(track, a) {
       const A = ground(track.frame(a).pose.root);
       const yaw = yawTo(A, f.opp.root);
       const fwd = new Vector3(Math.sin(yaw), 0, Math.cos(yaw));
       const local = aimPoint(f.opp, atk.aim).sub(A).applyQuaternion(new Quaternion().setFromAxisAngle(UP, -yaw));
-      const step = Math.max(-0.15, Math.min(atk.step, local.z - atk.reach));
+      // step in (or back a little) so the key's own reach lands near the point, then bend the limb onto it
+      const step = Math.max(-0.15, Math.min(atk.step, local.z - natural.z));
       local.z -= step;
-      const from = atk.kind === 'kick' ? new Vector3(-0.1, 0.87, -0.1) : new Vector3(atk.lead ? 0.15 : -0.15, 1.44, 0.05);
-      local.add(local.clone().sub(from).normalize().multiplyScalar(0.1)); // swing through the point
-      const key = atk.kind === 'kick' ? book.kick(local) : book.punch(local, atk.lead);
-      const tag = { kind: 'attack', atk: { ...atk, done: false, start: 0, end: 0 } };
+      local.z += 0.08; // swing through the point
+      const poses = book.strike(atk.key, atk.chain, atk.tip, local);
+      const tag = { kind: 'attack', atk: { ...atk, limb: atk.chain[2], done: false, start: 0, end: 0 } };
+      const at = clampRing(A.clone().addScaledVector(fwd, step));
       return {
-        targets: [placePose(key, yaw, ZERO, clampRing(A.clone().addScaledVector(fwd, step)))],
+        targets: poses.map(p => placePose(p, yaw, ZERO, at)),
         tokens: atk.tokens, rate: atk.rate, tag,
         after(tr, a0, frames) {
           tag.atk.start = a0;
@@ -117,21 +139,32 @@ function attackReq(f, key) {
   };
 }
 
-function hitReq(f, from, down) {
+function hitReq(f, from, how) {
+  const r = REACTIONS[how];
   return {
-    kind: down ? 'down' : 'hit', mode: 'now', interrupt: true,
+    kind: r.down ? 'down' : 'hit', mode: 'now', interrupt: true,
     build(track, a) {
       const A = ground(track.frame(a).pose.root);
       const away = A.clone().sub(ground(from));
       if (away.lengthSq() < 1e-6) away.set(1, 0, 0);
       away.normalize();
-      const dest = clampRing(A.clone().addScaledVector(away, down ? 0.55 : 0.3));
-      const yaw = Math.atan2(-away.x, -away.z);
+      const dest = clampRing(A.clone().addScaledVector(away, r.back));
+      const yaw = Math.atan2(-away.x, -away.z); // keys face the attacker
       return {
-        targets: [placePose(down ? book.down : book.hit, yaw, ZERO, dest)],
-        tokens: down ? [9, 10, 11, 12] : [6, 7], rate: down ? 1 : 1.5, tag: { kind: down ? 'down' : 'hit' },
-        after: down ? null : tr => tr.request(idleReq(f, 'end')),
+        targets: book.get(r.key).map(p => placePose(p, yaw, ZERO, dest)),
+        tokens: r.tokens, rate: r.rate, tag: { kind: r.down ? 'down' : 'hit' },
+        after: r.down ? null : tr => tr.request(idleReq(f, 'end')),
       };
+    },
+  };
+}
+
+function victoryReq(f) {
+  return {
+    kind: 'down', mode: 'now', interrupt: true,
+    build(track, a) {
+      const A = ground(track.frame(a).pose.root);
+      return { targets: book.get('victory').map(p => placePose(p, yawTo(A, f.opp.root), ZERO, A)), tokens: [10, 11, 12], rate: 1, tag: { kind: 'down' } };
     },
   };
 }
@@ -140,7 +173,7 @@ function hitReq(f, from, down) {
 
 const keys = new Set();
 let buffered = null; // attack pressed while the player cannot act yet
-const ATTACK_KEYS = { KeyJ: 'jab', KeyL: 'cross', KeyK: 'kick' };
+const ATTACK_KEYS = { KeyJ: 'jab', KeyL: 'cross', KeyU: 'hook', KeyI: 'uppercut', KeyK: 'mid_kick', KeyO: 'high_kick' };
 addEventListener('keydown', e => {
   if (e.repeat) return;
   keys.add(e.code);
@@ -148,7 +181,7 @@ addEventListener('keydown', e => {
 });
 addEventListener('keyup', e => keys.delete(e.code));
 addEventListener('blur', () => keys.clear());
-$('view').addEventListener('mousedown', e => { buffered = { key: e.button === 2 ? 'kick' : e.button === 1 ? 'cross' : 'jab', time: performance.now() }; });
+$('view').addEventListener('mousedown', e => { buffered = { key: e.button === 2 ? 'mid_kick' : e.button === 1 ? 'cross' : 'jab', time: performance.now() }; });
 $('view').addEventListener('contextmenu', e => e.preventDefault());
 
 let cam = { right: new Vector3(1, 0, 0), toward: new Vector3(0, 0, 1) };
@@ -186,11 +219,12 @@ function cpuControl(f, dt) {
   if (f.opp.track.tag.kind === 'attack' && d < 1.3 && r < 0.3) return tr.request(moveReq(f, toOpp.clone().negate()));
   if (d > 1.4) return tr.request(moveReq(f, toOpp));
   if (d < 0.65) return tr.request(r < 0.5 ? moveReq(f, toOpp.clone().negate()) : attackReq(f, 'jab'));
-  if (r < 0.3) return tr.request(attackReq(f, 'jab'));
-  if (r < 0.45) return tr.request(attackReq(f, 'cross'));
-  if (r < 0.62) return tr.request(attackReq(f, 'kick'));
-  if (r < 0.72) return tr.request(moveReq(f, toOpp.clone().negate()));
-  if (r < 0.82) return tr.request(moveReq(f, side));
+  if (r < 0.62) {
+    const pick = ['jab', 'jab', 'cross', 'hook', 'uppercut', 'mid_kick', 'mid_kick', 'high_kick'];
+    return tr.request(attackReq(f, pick[Math.floor(Math.random() * pick.length)]));
+  }
+  if (r < 0.74) return tr.request(moveReq(f, toOpp.clone().negate()));
+  if (r < 0.86) return tr.request(moveReq(f, side));
 }
 
 // ---------------------------------------------------------------- hits
@@ -237,7 +271,10 @@ function checkHits(att, def, dt) {
   def.body.flash = 1;
   hitstop = 0.07;
   if (dk === 'attack') def.track.tag.atk.done = true; // a hit cancels the defender's own strike
-  def.track.request(hitReq(def, att.root, def.hp <= 0));
+  const how = def.hp <= 0 ? (atk.kind === 'kick' || dmg >= 18 ? 'down_ko' : 'down')
+    : onHead ? (dmg < 8 ? 'head_light' : dmg >= 18 ? 'head_big' : 'head')
+      : atk.kind === 'kick' ? 'body' : 'stomach';
+  def.track.request(hitReq(def, att.root, how));
   popText(`${atk.name} ${dmg}${onHead ? '（頭）' : ''}`, att === p1 ? 'p1' : 'p2');
   if (def.hp <= 0) knockout(att);
 }
@@ -278,6 +315,7 @@ function knockout(winner) {
   stateTime = 0;
   winner.wins++;
   banner('K.O.');
+  setTimeout(() => { if (state === 'ko') winner.track.request(victoryReq(winner)); }, 700);
 }
 
 function banner(text, ms = 1300) {

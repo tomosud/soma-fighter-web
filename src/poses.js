@@ -155,3 +155,52 @@ export class PoseBook {
 }
 
 export { NJ };
+
+// ---------------------------------------------------------------- key poses from motion capture
+
+/**
+ * Key poses converted from Mixamo-derived SOMA clips (assets/keyposes.json, see tools/bake_keyposes.py).
+ * Each key holds four consecutive poses (the key pose and the three after it) in the local frame: facing +Z,
+ * the first pose's hips over the origin.
+ */
+export class KeyBook {
+  constructor(rig, json) {
+    this.rig = rig;
+    this.I = rig.index;
+    this.keys = {};
+    for (const [name, key] of Object.entries(json.keys)) {
+      this.keys[name] = key.frames.map(f => rig.fixRigid({ root: new Vector3(...f.root), rot: f.rot.map(q => new Quaternion(...q).normalize()) }));
+    }
+    this.stance = this.keys.stance[0];
+  }
+
+  /** The four poses of a key (copies). */
+  get(name) { return this.keys[name].map(clonePose); }
+
+  /** Where the striking limb's tip is at the key pose (local frame). */
+  tip(name, limb, tipJoint) {
+    const P = this.rig.positions(this.keys[name][0]);
+    return P[this.I[limb]].clone().lerp(P[this.I[tipJoint]], 0.5);
+  }
+
+  /**
+   * A strike's four target poses with the limb bent so its tip passes through `point` (local frame, after the
+   * step-in has been taken off). Later poses carry the tip a little further along the swing.
+   */
+  strike(name, chain, tipJoint, point) {
+    const rig = this.rig, I = this.I;
+    const [a, b, c] = chain.map(n => I[n]);
+    const poses = this.get(name);
+    const P0 = rig.positions(poses[0]);
+    const swing = point.clone().sub(P0[a]).normalize();
+    poses.forEach((pose, i) => {
+      const P = rig.positions(pose);
+      const tipOffset = P[c].clone().lerp(P[I[tipJoint]], 0.5).sub(P[c]);
+      const want = point.clone().addScaledVector(swing, 0.03 * i).sub(tipOffset);
+      const bend = P[b].clone().sub(P[a].clone().lerp(P[c], 0.5)); // keep the key's elbow / knee direction
+      twoBoneIK(rig, pose, a, b, c, want, bend.lengthSq() > 1e-6 ? bend : new Vector3(0, -1, 0));
+      rig.fixRigid(pose);
+    });
+    return poses;
+  }
+}
