@@ -99,14 +99,17 @@ export function createPlayLog(ctx) {
       taken: taken.length, takenJ: Math.round(taken.reduce((a, e) => a + e.energy, 0)),
       enemyStrikes: E.filter(e => e.type === 'enemyStrike').length,
       enemyLanded: E.filter(e => e.type === 'enemyStrike').length ? +(taken.length / E.filter(e => e.type === 'enemyStrike').length).toFixed(2) : null,
-      enemyStunned: n ? +(F.filter(fr => fr.es >= 3).length / n).toFixed(2) : null,
+      enemyStunned: near ? +(F.filter(fr => fr.near && !fr.act).length / near).toFixed(2) : null, // (close in, and none near able to act)
       enemyAttackerNear: n ? +(F.filter(fr => fr.att && fr.near).length / Math.max(1, near)).toFixed(2) : null,
       // blows and falls
       reactDelay: med(reacts.map(e => e.react)), knockDelay: med(reacts.filter(e => ['heavy', 'down', 'fly'].includes(e.tier)).map(e => e.knock)),
       reactDisp: med(reacts.map(e => e.disp06)),
       reactSpread: reacts.length > 2 ? +Math.sqrt(mean(reacts.map(e => (e.disp06 ?? 0) ** 2)) - (mean(reacts.map(e => e.disp06 ?? 0)) ** 2)).toFixed(2) : null,
-      falls: fallsHere.length, fallKinds: new Set(fallsHere.map(e => e.fall.name)).size, kos: E.filter(e => e.type === 'ko').length, dodges: E.filter(e => e.type === 'dodge').length, dodged: E.filter(e => e.type === 'dodged').length, counters: given.filter(e => e.counter).length,
-      playerStill: n ? +(F.filter(fr => fr.ps >= 3 && fr.hv < 0.05).length / n).toFixed(2) : null,
+      falls: fallsHere.length, fallKinds: new Set(fallsHere.map(e => e.fall.name)).size, kos: E.filter(e => e.type === 'ko').length, dodges: E.filter(e => e.type === 'dodge').length,
+      hitsUnseen: taken.filter(e => !e.touch && e.tier !== 'ground').length ? +(taken.filter(e => !e.touch && e.tier !== 'ground' && (e.angle == null || (e.angle > 55 && !e.warned) || (e.wind ?? 0) < 0.3)).length / taken.filter(e => !e.touch && e.tier !== 'ground').length).toFixed(2) : null,
+      warnedBehind: taken.filter(e => !e.touch && e.tier !== 'ground' && e.angle > 55).length,
+      longestApart: (() => { let best = 0, run = 0; for (const fr of F) { if (fr.d > 3) run++; else { best = Math.max(best, run); run = 0; } } return +(Math.max(best, run) / FPS).toFixed(1); })(), dodged: E.filter(e => e.type === 'dodged').length, counters: given.filter(e => e.counter).length,
+      playerStill: n ? +(F.filter(fr => fr.ps >= 3 && (fr.pl ?? fr.hv) < 0.08).length / n).toFixed(2) : null, // (unable to act and the body not moving: limbs and head)
       downStill: downEnds.length ? +mean(downEnds.map(e => e.still)).toFixed(2) : null,
       downMotion: downEnds.length ? +mean(downEnds.map(e => e.motion)).toFixed(2) : null,
       meanDist: n ? +(F.reduce((a, fr) => a + fr.d, 0) / n).toFixed(2) : null,
@@ -121,6 +124,15 @@ export function createPlayLog(ctx) {
     for (const n of ['LeftHand', 'RightHand', 'LeftFoot', 'RightFoot', 'Head']) { const j = ctx.I[n]; s += F.P[j].distanceTo(F.prevP[j]) / dt; }
     return s / 5;
   };
+  // the player's facing (from its shoulder line) and the angle to a point, in degrees
+  const facingAngle = (P, pt) => {
+    const l = P.P[ctx.I.LeftArm], r = P.P[ctx.I.RightArm];
+    const fx = -(l.z - r.z), fz = l.x - r.x; // (cross of the shoulder line with up: forward)
+    const tx = pt.x - P.P[0].x, tz = pt.z - P.P[0].z;
+    const c = (fx * tx + fz * tz) / Math.max(1e-6, Math.hypot(fx, fz) * Math.hypot(tx, tz));
+    return Math.round(Math.acos(Math.max(-1, Math.min(1, c))) * 180 / Math.PI);
+  };
+  const lastWind = new Map();
   function stepLog(dt) {
     const P = ctx.player;
     if (!P) return;
@@ -137,7 +149,8 @@ export function createPlayLog(ctx) {
     const lh = ctx.lastHit;
     if (lh && lh !== lastHit) {
       lastHit = lh;
-      const e = ev(lh.by === 'あなた' ? 'hit' : 'taken', { energy: +lh.energy.toFixed(1), tier: lh.tier, counter: !!lh.counter, touch: !!lh.touch, slam: !!lh.slam, blocked: !!lh.blocked, head: !!lh.isHead, victim: lh.victim, pressId: lh.pressId || null });
+      const w0 = lh.by !== 'あなた' ? lastWind.get(lh.striker) : null;
+      const e = ev(lh.by === 'あなた' ? 'hit' : 'taken', { angle: w0?.angle ?? null, warned: !!w0?.warned, wind: w0 ? +(clock - w0.t).toFixed(2) : null, energy: +lh.energy.toFixed(1), tier: lh.tier, counter: !!lh.counter, touch: !!lh.touch, slam: !!lh.slam, blocked: !!lh.blocked, head: !!lh.isHead, victim: lh.victim, pressId: lh.pressId || null });
       const pr = lh.pressId && pressById.get(lh.pressId);
       if (pr && lh.by === 'あなた' && pr.tContact == null) { pr.tContact = +(clock - pr.t).toFixed(2); pr.energy = e.energy; pr.tier = lh.tier; }
       const V = ctx.fighters.find(f => f.id === lh.victim);
@@ -161,7 +174,7 @@ export function createPlayLog(ctx) {
     for (const F of ctx.fighters) {
       const was = prevState.get(F);
       if (was !== F.state) {
-        if (!F.isPlayer && F.state === 'attack') ev('enemyStrike', { d: +F.P[0].distanceTo(P.P[0]).toFixed(2), who: F.id });
+        if (!F.isPlayer && F.state === 'attack') { const e2 = ev('enemyStrike', { d: +F.P[0].distanceTo(P.P[0]).toFixed(2), who: F.id, angle: facingAngle(P, F.P[0]), warned: (F.warnUntil ?? -9) > clock - 0.6 }); lastWind.set(F.id, e2); }
         if (F.state === 'fall') ev('down', { who: F.isPlayer ? 'P' : F.id });
         if (F.state === 'out') ev('ko', { who: F.id });
         if (F.state === 'down') downs.set(F, { t0: clock, n: 0, sum: 0, still: 0 });
@@ -194,7 +207,8 @@ export function createPlayLog(ctx) {
       aim: P.aim ? PART[P.aim.part] : 0, x: +P.P[0].x.toFixed(2), z: +P.P[0].z.toFixed(2), vx: +vx.toFixed(2), vz: +vz.toFixed(2), hv: +Math.hypot(vx, vz).toFixed(2),
       d: +d.toFixed(2), near: nowNear ? 1 : 0, ps: STATE[P.state] ?? 0, es: near ? STATE[near.state] ?? 0 : 0,
       hp: Math.round(P.hp), ehp: near ? Math.round(near.hp) : 0, att: ctx.crew.attacker === near ? 1 : 0, eph: near ? PHASE[near.mode] ?? 0 : 0,
-      el: near ? +limbSpeed(near, dt).toFixed(2) : 0,
+      el: near ? +limbSpeed(near, dt).toFixed(2) : 0, pl: +limbSpeed(P, dt).toFixed(2),
+      act: es.filter(e => Math.hypot(e.P[0].x - P.P[0].x, e.P[0].z - P.P[0].z) < 3 && ['free', 'guard', 'attack'].includes(e.state)).length,
     });
     if (local && clock - lastSave > 20) { lastSave = clock; save(); }
   }
@@ -326,5 +340,5 @@ export function createPlayLog(ctx) {
     else p.later = outcome;
   }
   addEventListener('pagehide', () => { if (local) navigator.sendBeacon?.(`/save/play_${sid}_log.json`, json()); });
-  return { step: stepLog, press, pressResult, note, save, download, get sid() { return sid; }, get local() { return local; }, summary: () => summarize({ f0: 0, f1: frames.length, events }), segments, frames, events, presses };
+  return { summaryFrom: f0 => summarize({ f0, f1: frames.length, events: events.filter(e => e.f >= f0) }), get frameCount() { return frames.length; }, step: stepLog, press, pressResult, note, save, download, get sid() { return sid; }, get local() { return local; }, summary: () => summarize({ f0: 0, f1: frames.length, events }), segments, frames, events, presses };
 }
