@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>SOMA Brawl</title>
-  <meta name="description" content="腰を引いて動き、右クリックで打つ。Mixamo の参考ポーズからモーションマッチングで選んだ動きを MotionBricks（SOMA）がつなぐ、流れるような殴り合い">
+  <meta name="description" content="マウスで動き、左クリックでパンチ・右クリックでキック。Mixamo の参考ポーズからモーションマッチングで選んだ動きを MotionBricks（SOMA）がつなぐ、流れるような殴り合い">
   <link rel="stylesheet" href="src/style.css">
   <link rel="stylesheet" href="src/lab.css">
   <style>
@@ -33,8 +33,8 @@
   <div class="fight-info">倒した数 <b id="kos">0</b><span id="last-hit"></span></div>
 
   <div class="fight-guide">
-    <div><b>左ボタン</b>（どこでも）：押したまま動かすと、腰がばねで指へ引かれる。勢いがつき、切り返すと振り子のように強く戻る。いつも相手の方を向く</div>
-    <div><b>打つ</b>：右クリック（左を押したままでも）。その瞬間の構えと勢いに合う技が出る（踏み込みながら・回り込みながら・下がりながらで変わる）。打っている間に押すと次の技へつなぐ</div>
+    <div><b>動く</b>：マウスを動かすだけ（ボタンは要らない）。腰がばねでカーソルの下へ引かれ、勢いがつく。体はカーソルの方を向き、目から薄い線が出る。相手の上では打撃の間合いで止まり、素早く振り抜けば体当たり</div>
+    <div><b>打つ</b>：左クリックでパンチ、右クリックでキック。カーソルの指す所（頭・胴・脚）を狙う。その瞬間の構えと勢いに合う技が出る。打っている間に押すと次の技へつなぐ</div>
     <div>同時の相手：<a href="?enemies=1">1</a> · <a href="?enemies=2">2</a> · <a href="?enemies=3">3</a></div>
     <div id="db-info">参考ポーズを読み込み中…</div>
   </div>
@@ -44,7 +44,7 @@
   <section id="overlay">
     <div class="card">
       <h1>SOMA Brawl</h1>
-      <p>腰を引っ張って動き、右クリックで打ちます。相手は 3 人。交代で攻め役になり、残りは回り込んで隙をうかがいます。倒すと次が来ます。動きはすべて、Mixamo のアニメーションから作った参考ポーズの中からモーションマッチングで選び、そこまでを NVIDIA の MotionBricks（SOMA）がブラウザの中で生成します。当たりの強さは、当たった手足の速さから計算した運動エネルギーで決まります。</p>
+      <p>マウスで動き、左クリックでパンチ、右クリックでキックです。相手は 3 人。交代で攻め役になり、残りは回り込んで隙をうかがいます。倒すと次が来ます。動きはすべて、Mixamo のアニメーションから作った参考ポーズの中からモーションマッチングで選び、そこまでを NVIDIA の MotionBricks（SOMA）がブラウザの中で生成します。当たりの強さは、当たった手足の速さから計算した運動エネルギーで決まります。</p>
       <fieldset>
         <legend>モデル</legend>
         <label><input type="radio" name="model" value="fp16" checked> Mixed FP16（380 MB、おすすめ）</label>

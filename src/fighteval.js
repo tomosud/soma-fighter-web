@@ -23,14 +23,14 @@ export const SCENARIOS = [
       if (c < 0.9) S.pull(S.around(0, 0.85));
       else if (c < 1.8) S.pull(S.around(0, 2.4));
       else S.pull(null);
-      if (S.once(`p${Math.floor(t / 3)}`, c > 0.55)) S.press();
+      if (S.once(`p${Math.floor(t / 3)}`, c > 0.55)) S.press('punch', 'head');
     },
   },
   {
     name: 'circle_hook', label: '回り込んで打つ', sec: 9,
     step(S, t) {
       S.pull(S.around(0.9 + t * 1.6, 1.1));
-      if (S.once(`p${Math.floor(t / 1.5)}`, t % 1.5 > 0.7)) S.press();
+      if (S.once(`p${Math.floor(t / 1.5)}`, t % 1.5 > 0.7)) S.press(Math.floor(t / 1.5) % 2 ? 'kick' : 'punch');
     },
   },
   {
@@ -38,7 +38,7 @@ export const SCENARIOS = [
     step(S, t) {
       const c = t % 3;
       S.pull(c < 1.4 ? S.around(0, 0.95) : S.around(0, 2.3));
-      for (const k of [0.5, 0.68, 0.86]) if (S.once(`p${Math.floor(t / 3)}_${k}`, c > k)) S.press();
+      for (const [k, kind] of [[0.5, 'punch'], [0.68, 'punch'], [0.86, 'kick']]) if (S.once(`p${Math.floor(t / 3)}_${k}`, c > k)) S.press(kind);
     },
   },
   {
@@ -46,7 +46,7 @@ export const SCENARIOS = [
     step(S, t) {
       S.pull(S.around(0, 2.6));
       const d = S.dist();
-      if (d < 1.5 && S.once(`p${Math.floor(t / 1.2)}`, true)) S.press();
+      if (d < 1.5 && S.once(`p${Math.floor(t / 1.2)}`, true)) S.press('kick', 'body');
     },
   },
   {
@@ -71,7 +71,7 @@ export const SCENARIOS = [
       if (S.mem.dodgeAt != null) {
         const u = t - S.mem.dodgeAt;
         S.pull(S.around(0.9, 1.3));
-        if (u > 0.4 && S.once(`c${S.mem.dodgeAt.toFixed(2)}`, true)) S.press();
+        if (u > 0.4 && S.once(`c${S.mem.dodgeAt.toFixed(2)}`, true)) S.press('punch', 'head');
         if (u > 1.4) S.mem.dodgeAt = null;
       } else S.pull(S.around(0, 1.5));
     },
@@ -80,7 +80,7 @@ export const SCENARIOS = [
     name: 'trade', label: '立ち止まって打ち合う', sec: 8,
     step(S, t) {
       S.pull(null);
-      if (S.once(`p${Math.floor(t / 0.9)}`, true) && S.dist() < 1.7) S.press();
+      if (S.once(`p${Math.floor(t / 0.9)}`, true) && S.dist() < 1.7) S.press(Math.floor(t / 0.9) % 3 === 2 ? 'kick' : 'punch', Math.floor(t / 0.9) % 3 === 2 ? 'legs' : 'head');
     },
   },
 ];
@@ -106,7 +106,13 @@ async function runScenario(brawl, sc) {
   const S = {
     P, e, mem: {},
     pull(p) { pointer = p ? p.clone().setY(0.95) : null; brawl.pull(pointer); },
-    press() { P.strikeInput = brawl.clock; rec.presses.push({ t: brawl.clock - t0, f: rec.frames.length, motion: null, contact: null }); },
+    // (the cursor's aim follows the opponent while moving about: as a person's would)
+    press(kind = 'punch', part = kind === 'kick' ? 'body' : 'head') {
+      const joint = brawl.rig.index[part === 'head' ? 'Head' : part === 'body' ? 'Spine2' : 'LeftShin'];
+      brawl.aim({ enemy: e, part, joint, off: new Vector3() }); S.mem.aimSet = brawl.clock;
+      P.strikeInput = { t: brawl.clock, kind };
+      rec.presses.push({ t: brawl.clock - t0, f: rec.frames.length, motion: null, contact: null, kind });
+    },
     once(key, cond) { if (!cond || fired.has(key)) return false; fired.add(key); return true; },
     dist() { return flat(e.P[0].clone().sub(P.P[0])).length(); },
     around(angle, r) {
@@ -119,6 +125,8 @@ async function runScenario(brawl, sc) {
     brawl.onStep = dt => {
       const t = brawl.clock - t0;
       if (t > sc.sec) { brawl.onStep = null; resolve(); return; }
+      // the cursor stays on the opponent (its head), as a person's would; a press moves it to the part it strikes
+      if (!S.mem.aimSet || brawl.clock - S.mem.aimSet > 0.6) brawl.aim({ enemy: e, part: 'head', joint: brawl.rig.index.Head, off: new Vector3() });
       sc.step(S, t);
       // the press answered: the first frame of the strike's motion shown; its contact
       for (const pr of rec.presses) if (pr.motion == null && P.track.tag.kind === 'attack' && t > pr.t) pr.motion = t - pr.t;
@@ -157,14 +165,29 @@ async function runScenario(brawl, sc) {
     };
   });
   rec.jumps = brawl.jumps.length - rec.jumps0;
-  brawl.pull(null);
+  brawl.pull(null); brawl.aim(null);
   return rec;
 }
 
 const med = a => { const s = a.filter(x => x != null).sort((x, y) => x - y); return s.length ? s[s.length >> 1] : null; };
 const mean = a => (a.length ? a.reduce((x, y) => x + y, 0) / a.length : 0);
 
+/** The evaluator's summary over the frames where the player is free or striking (blows, falls, getting up are
+ * movements the everyday reference does not cover). */
+function maskedNat(rec, nat) {
+  const n = Math.min(nat.n, rec.frames.length), ok = [];
+  for (let t = 8; t < n - 8; t++) if (rec.frames[t].ps < 3) ok.push(t);
+  const body = nat.rows.filter(r => !r.whole && !r.minor);
+  const all = [];
+  for (const r of body) for (const t of ok) all.push(r.z[t]);
+  all.sort((a, b) => a - b);
+  const slide = [];
+  for (const nm of ['左足すべり', '右足すべり']) { const r = nat.rows.find(x => x.name === nm); for (const t of ok) if (r.raw[t] > 0) slide.push(r.raw[t]); }
+  slide.sort((a, b) => a - b);
+  return { meanZ: all.length ? all.reduce((a, b) => a + b, 0) / all.length : 0, p95Z: all[Math.floor(all.length * 0.95)] ?? 0, slide: slide[slide.length >> 1] ?? 0, frames: ok.length };
+}
 function metrics(rec, nat) {
+  const nm = maskedNat(rec, nat);
   const F = rec.frames, mine = rec.hits.filter(h => h.by === 'P' && !h.blocked), theirs = rec.hits.filter(h => h.by === 'E');
   return {
     presses: rec.presses.length,
@@ -180,7 +203,7 @@ function metrics(rec, nat) {
     lag: mean(F.filter(f => f.lag > 0).map(f => f.lag)),
     sits: F.reduce((a, f, i) => a + (f.sit && !(F[i - 1]?.sit) ? 1 : 0), 0),
     jumps: rec.jumps,
-    meanZ: nat.summary.meanZ, p95Z: nat.summary.p95Z, slide: nat.summary.slideCmPerS,
+    meanZ: nm.meanZ, p95Z: nm.p95Z, slide: nm.slide,
   };
 }
 
@@ -274,5 +297,6 @@ export async function runAll(brawl, tag = 'run', only = null) {
   await save(`fight_${tag}_matrix.png`, await png(drawMatrix(results, tag)));
   await save(`fight_${tag}_scores.json`, JSON.stringify({ tag, date: new Date().toISOString(), results }, null, 1));
   brawl.settings.enemies = keepEnemies;
+  brawl.unscript(); // (the mouse again)
   return results;
 }
