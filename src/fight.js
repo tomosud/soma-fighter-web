@@ -203,7 +203,9 @@ function buildKeys(d) {
         const P0 = rig.positions(d.pose(k, f0, mirrored));
         const ang = Math.atan2(P0[I.Head].x - P0[0].x, P0[I.Head].z - P0[0].z), at = flat(P0[0]);
         const canon = f => [0, 1, 2, 3].map(u => placePose(d.pose(k, f + u, mirrored), -ang, at, at.clone().negate()));
-        getupKeys.push({ clip: k, name: c.name, up: faceUp(P0), flashy: /kip/.test(c.name), kneel: canon(fk), stand: canon(fs) });
+        // moments on the floor before getting up (stirring, rolling to the side, propping up on an elbow)
+        const stir = [0.35, 0.6].map(u => canon(Math.round(f0 + (fk - f0) * u)));
+        getupKeys.push({ clip: k, name: c.name, up: faceUp(P0), flashy: /kip/.test(c.name), kneel: canon(fk), stand: canon(fs), stir });
       }
       return;
     }
@@ -249,6 +251,26 @@ function fromLocalPose(root, L) {
   const rot = [];
   L.forEach((q, j) => { rot.push(rig.parents[j] < 0 ? q.clone() : rot[rig.parents[j]].clone().multiply(q)); });
   return rig.fixRigid({ root: root.clone(), rot });
+}
+/** Closest points of two segments (p1-q1, p2-q2): { d, a, b }. */
+function segSeg(p1, q1, p2, q2) {
+  const d1 = q1.clone().sub(p1), d2 = q2.clone().sub(p2), r = p1.clone().sub(p2);
+  const a = d1.dot(d1), e = d2.dot(d2), f = d2.dot(r);
+  let s2, t2;
+  if (a < 1e-9 && e < 1e-9) { s2 = t2 = 0; }
+  else if (a < 1e-9) { s2 = 0; t2 = clamp(f / e, 0, 1); }
+  else {
+    const c = d1.dot(r);
+    if (e < 1e-9) { t2 = 0; s2 = clamp(-c / a, 0, 1); }
+    else {
+      const b = d1.dot(d2), den = a * e - b * b;
+      s2 = den > 1e-9 ? clamp((b * f - c * e) / den, 0, 1) : 0;
+      t2 = (b * s2 + f) / e;
+      if (t2 < 0) { t2 = 0; s2 = clamp(-c / a, 0, 1); } else if (t2 > 1) { t2 = 1; s2 = clamp((b - c) / a, 0, 1); }
+    }
+  }
+  const A = p1.clone().addScaledVector(d1, s2), B = p2.clone().addScaledVector(d2, t2);
+  return { d: A.distanceTo(B), a: A, b: B };
 }
 function swapSide(n) { return n.startsWith('Left') ? `Right${n.slice(4)}` : n.startsWith('Right') ? `Left${n.slice(5)}` : n; }
 
@@ -376,6 +398,7 @@ class Fighter {
     this.nextAttack = clock + rand(2.5, 4); // (opponents)
     this.knock = new Vector3();
     this.lastMatch = null;
+    this.rag = new Ragdoll(rig); this.ragK = this.rag.k.slice(); this.ragW = 0; this.ragOn = false;
   }
   get opponent() {
     let best = null, bd = Infinity;
@@ -404,10 +427,17 @@ function predict(F, pose, heading) {
   const p = flat(pose.root), v = F.vel.clone();
   const opp = F.opponent;
   const out = [];
+  // standing still, the body turns to the opponent only once it is well off to one side (then it steps round);
+  // small drifts are left alone (turning on the spot by small amounts only slides the feet)
+  if (opp && v.length() < 0.25) {
+    const err = wrap(Math.atan2(opp.P[0].x - p.x, opp.P[0].z - p.z) - heading);
+    if (Math.abs(err) < 0.5 && !F.turning) F.faceHold = true;
+    else { F.faceHold = false; F.turning = Math.abs(err) > 0.15; }
+  } else { F.faceHold = false; F.turning = false; }
   for (let k = 1; k <= TRAJ.at(-1); k++) {
     if (F.spring) springStep(v, p, F.spring.target, 1 / FPS); else approach(v, F.want, 1 / FPS);
     p.addScaledVector(v, 1 / FPS);
-    const face = opp && F.state !== 'fall' && F.state !== 'down' ? Math.atan2(opp.P[0].x - p.x, opp.P[0].z - p.z) : (v.length() > 0.3 ? Math.atan2(v.x, v.z) : yaw);
+    const face = F.faceHold ? heading : opp && F.state !== 'fall' && F.state !== 'down' ? Math.atan2(opp.P[0].x - p.x, opp.P[0].z - p.z) : (v.length() > 0.3 ? Math.atan2(v.x, v.z) : yaw);
     yaw += clamp(wrap(face - yaw), -4.5 / FPS, 4.5 / FPS);
     if (TRAJ.includes(k)) out.push({ pos: p.clone(), yaw });
   }
@@ -705,6 +735,7 @@ function followReq(F, mode = 'end') {
         after: (tr2, a0, gen) => {
           groundFrames(gen);
           gen.forEach((f, i) => { f.rate = 1.6 - 0.7 * (i / Math.max(1, gen.length - 1)); }); // carried through, easing out
+          if (F.attack) F.attack.followSpliced = clock;
           F.until = clock + gen.reduce((s2, f) => s2 + 1 / (FPS * f.rate), 0) - 0.15;
         },
       };
@@ -859,8 +890,11 @@ function fallPlan(F, ctx, energy, dir) {
     groundFrames(gen);
     const left = (tr2.frames.length - 1 - tr2.t) / FPS / rate;
     const end = tr2.frames[tr2.frames.length - 1];
-    for (let k = 0; k < FPS * hold; k++) tr2.frames.push({ pose: end.pose, rate: 1, tag: end.tag });
-    F.state = 'down'; F.until = clock + left + hold;
+    // a breath on the floor, then (unless knocked out) stirring: the body does not lie there like a thing
+    const still = F.ko ? hold + 1 : 0.15 + 0.25 * Math.random();
+    for (let k = 0; k < FPS * still; k++) tr2.frames.push({ pose: end.pose, rate: 1, tag: end.tag });
+    F.state = 'down'; F.until = clock + left + still;
+    if (!F.ko) tr2.request(stirReq(F, hold));
   };
   if (!fly) return { targets: lying, tokens: [8, 9], rate: 1.6, fixEnd: true, tag: { kind: 'down' }, after: settle(1.6) };
   // in the air: the moment on the way down, half way along, lifted
@@ -870,6 +904,36 @@ function fallPlan(F, ctx, energy, dir) {
   return {
     targets: air, tokens: [6], rate: 1.9, fixEnd: true, tag: { kind: 'down' },
     after: (tr2, a0, gen) => { groundFrames(gen, true); F.state = 'fall'; F.until = clock + 5; tr2.request(landing); },
+  };
+}
+/**
+ * On the floor: a moment of the getting-up clip that starts lying the way the body lies (stirring, rolling to the
+ * side, propping up), laid along the body, played slowly; once or twice, then up (the same clip carries on).
+ */
+function stirReq(F, hold, n = 0) {
+  return {
+    kind: 'hit', mode: 'end',
+    build(tr, a, ctx) {
+      const Pn = rig.positions(ctx[3]), up = faceUp(Pn);
+      const ang = Math.atan2(Pn[I.Head].x - Pn[0].x, Pn[I.Head].z - Pn[0].z), at = flat(Pn[0]);
+      let pool = getupKeys.filter(g => g.up === up && !g.flashy);
+      if (!pool.length) pool = getupKeys;
+      const g = F.getupKey && pool.includes(F.getupKey) ? F.getupKey : pool[Math.floor(Math.random() * pool.length)];
+      F.getupKey = g;
+      const fr = g.stir[Math.min(n, g.stir.length - 1)];
+      const targets = fr.map(f => ground(placePose(f, ang, ZERO, at)));
+      const rate = 0.8 + 0.4 * Math.random();
+      F.lastMatch = { name: `${g.name}（床で）`, kind: 'down', cost: 0, frame: 0 };
+      return {
+        targets, tokens: [7, 8], rate, fixEnd: true, tag: { kind: 'down' },
+        after: (tr2, a0, gen) => {
+          groundFrames(gen);
+          F.until = clock + (tr2.frames.length - 1 - tr2.t) / FPS / rate;
+          // a bigger blow: a little longer on the floor (one more stir)
+          if (n === 0 && hold > 0.9) tr2.request(stirReq(F, hold, 1));
+        },
+      };
+    },
   };
 }
 /**
@@ -884,6 +948,8 @@ function getupReq(F) {
       const Pn = rig.positions(ctx[3]), up = faceUp(Pn);
       const ang = Math.atan2(Pn[I.Head].x - Pn[0].x, Pn[I.Head].z - Pn[0].z), at = flat(Pn[0]);
       let pool = getupKeys.filter(g => g.up === up && (!g.flashy || (!F.isPlayer && Math.random() < 0.35)));
+      if (F.getupKey && F.getupKey.up === up) pool = [F.getupKey]; // the same clip as the stirring: it carries on
+      F.getupKey = null;
       if (!pool.length) pool = getupKeys.filter(g => g.up === up);
       if (!pool.length) pool = getupKeys;
       if (!pool.length) return planReq(F, 'getup', 'end').build(tr, a, ctx);
@@ -1006,11 +1072,19 @@ function checkHits(A, B, dt) {
     const onTrunk = hips.clone().addScaledVector(seg, tt);
     let dHead = p.distanceTo(head) - 0.12, dTrunk = p.distanceTo(onTrunk) - 0.16;
     let c = null;
+    // an arm in the way (a guard, or just there): it takes the blow
+    let onArm = false;
+    for (const sd of ['Left', 'Right']) {
+      const a0 = B.P[I[sd + 'Arm']], b0 = B.P[I[sd + 'Hand']];
+      const sg = b0.clone().sub(a0), u = clamp(p.clone().sub(a0).dot(sg) / sg.lengthSq(), 0, 1), on = a0.clone().addScaledVector(sg, u);
+      const dl = p.distanceTo(on) - 0.06;
+      if (dl < dTrunk && dl < dHead - 0.04) { dTrunk = dl; c = on; onArm = true; }
+    }
     // the legs (a sweep, a low kick)
     for (const [a0, b0] of legSeg) {
       const sg = b0.clone().sub(a0), u = clamp(p.clone().sub(a0).dot(sg) / sg.lengthSq(), 0, 1), on = a0.clone().addScaledVector(sg, u);
       const dl = p.distanceTo(on) - 0.09;
-      if (dl < dTrunk && dl < dHead) { dTrunk = dl; c = on; }
+      if (dl < dTrunk && dl < dHead) { dTrunk = dl; c = on; onArm = false; }
     }
     const isHead = !c && dHead < dTrunk + 0.03; // a fist near both is a blow to the head
     const d = Math.min(dHead, dTrunk);
@@ -1019,7 +1093,7 @@ function checkHits(A, B, dt) {
     const n = c.clone().sub(p).normalize();
     const closing = Math.min(11, v.clone().sub(vB).dot(n)); // (a fist or foot of a person: at most about 11 m/s)
     const behind = clamp(vA.clone().sub(vB).dot(n), 0, 4); // the body coming in behind the blow
-    if (!touching || closing > touching.closing) touching = { part, m, closing, behind, isHead, n, at: p.clone() };
+    if (!touching || closing > touching.closing) touching = { part, m: onArm ? m * 0.5 : m, closing, behind, isHead, n, at: p.clone(), onArm };
   }
   const id = A.attack?.id ?? `ram${Math.floor(clock * 2)}`;
   const C = A.contacts.get(B);
@@ -1046,6 +1120,7 @@ function land(A, B, energy, dir, at, isHead) {
   if (B.guard && clock < B.guard.until && B.guard.kind !== 'dodge' && (B.guard.high === isHead || Math.random() < 0.4)) {
     energy *= 0.2;
     B.blocked = true;
+    jolt(B, at, flat(dir).normalize().multiplyScalar(Math.sqrt(2 * energy * 6)), 0.5, 0.3);
     if (A.attack) A.attack.landed = true;
     spark(at, energy, 0x9fd3ff);
     shake = Math.max(shake, 0.02);
@@ -1055,6 +1130,13 @@ function land(A, B, energy, dir, at, isHead) {
     return;
   }
   B.hitAt = clock;
+  {
+    const down0 = B.hp - energy * (A.isPlayer ? settings.damage.player : settings.damage.enemy) <= 0 || energy > settings.knockdown * (B.isPlayer ? 1.6 : 1);
+    const J = flat(dir).normalize().multiplyScalar(Math.sqrt(2 * energy * 6)); // the momentum the blow puts in (kg m/s)
+    J.y = (isHead ? 0.25 : 0.1) * J.length();
+    jolt(B, at, J, clamp(0.35 - energy / 300, down0 ? 0.04 : 0.08, 0.3), clamp(0.3 + energy / 120, 0.3, 0.9), down0);
+    jolt(A, at, J.clone().multiplyScalar(-0.12), 0.75, 0.2);
+  }
   const dmg = energy * (A.isPlayer ? settings.damage.player : settings.damage.enemy);
   B.hp = Math.max(0, B.hp - dmg);
   spark(at, energy);
@@ -1272,6 +1354,24 @@ function autoStrike(F) {
  * The player's fist or foot homes in on the target over the last stretch (up to 20 cm, more the nearer it is):
  * the generated motion is what is shown, bent a little where the target has moved since it was asked for.
  */
+/**
+ * The press answered at once: until the strike's generated motion is shown (the model takes a moment), the body
+ * loads up - the trunk turns away from the side that will strike (toward the rear hand), the shoulders draw back a
+ * little and the hips sink - over 0.12 s, and lets go as the strike's motion takes over.
+ */
+function anticipate(F) {
+  const A = F.antic;
+  if (!A) return;
+  const t = clock - A.t0;
+  if (F.track.tag.kind === 'attack' && !A.until) A.until = clock;
+  const w = A.until ? Math.max(0, 1 - (clock - A.until) / 0.12) : Math.min(1, t / 0.12);
+  if ((A.until && w <= 0) || t > 1.2) { F.antic = null; return; }
+  const p = clonePose(F.shown);
+  rotateSubtree(rig, p, I.Spine1, new Quaternion().setFromAxisAngle(UP, A.side * 0.22 * w));
+  rotateSubtree(rig, p, I.Spine2, new Quaternion().setFromAxisAngle(UP, A.side * 0.12 * w));
+  p.root.y -= 0.03 * w;
+  F.shown = rig.fixRigid(p);
+}
 function homing(F) {
   const A = F.attack, o = F.opponent;
   if (F.state !== 'attack' || !A?.key || A.landed || !o || F.track.tag.kind !== 'attack' || /ForeArm|Shin/.test(A.part)) return;
@@ -1287,13 +1387,79 @@ function strike(F) {
   // during a strike: kept, and the next one starts from where this one ends (a combination)
   if (F.state === 'attack' && F.attack && !F.attack.followed) { F.attackQueued = clock; return; }
   F.attackQueued = null;
-  if (!F.track.request(strikeReq(F))) return;
-  if (F.state !== 'attack') F.attack = null; // (an old strike's record no longer counts) // (a hit or a fall on its way: not now)
+  if (!F.track.request(strikeReq(F))) return; // (a hit or a fall on its way: not now)
+  if (F.state !== 'attack') F.attack = null; // (an old strike's record no longer counts)
+  // the load-up shows at once: turning away from the hand nearer the opponent (that one jabs, the other one winds)
+  if (F.isPlayer && F.opponent) {
+    const h = rig.heading(F.P), left = new Vector3(Math.cos(h), 0, -Math.sin(h)), to = flat(F.opponent.P[0].clone().sub(F.P[0]));
+    F.antic = { t0: clock, side: Math.sign(to.dot(left) || 1) };
+  }
   F.state = 'attack'; F.until = clock + 1.0;
 }
 // the right button pressed while the left one is held gives no pointerdown (a chorded press): take it from
 // mousedown / contextmenu too (once per press)
 canvas.addEventListener('contextmenu', e => e.preventDefault());
+/**
+ * A body slam: the player's hips driven into an opponent's. Its energy is the body's (about 25 kg behind the
+ * shoulder) at the speed they close (the shown speed, or the spring's when the shown motion lags behind it); the
+ * one driving loses half its speed in it. A fast one knocks down or sends flying, a slow one only staggers.
+ */
+function bodySlam(A, B, dt) {
+  if (B.state === 'fall' || B.state === 'down' || B.state === 'getup' || A.state === 'hit' || A.state === 'fall' || A.state === 'down' || A.state === 'getup') return;
+  if (clock < (A.slamAfter ?? 0) || !A.prevP || !B.prevP) return;
+  const d = flat(B.P[0].clone().sub(A.P[0])), len = d.length();
+  if (len > 0.8 || len < 1e-3) return;
+  const n = d.normalize();
+  const vA = flat(A.P[0].clone().sub(A.prevP[0])).divideScalar(dt), vB = flat(B.P[0].clone().sub(B.prevP[0])).divideScalar(dt);
+  const closing = Math.max(vA.dot(n), 0.8 * A.vel.dot(n)); // (the player's own drive: an opponent walking into it is no slam)
+  if (closing < 1.6) return;
+  A.slamAfter = clock + 0.6;
+  const at = A.P[I.Chest].clone().lerp(B.P[I.Spine2], 0.5);
+  land(A, B, 0.5 * 25 * closing * closing * (A.state === 'attack' ? 0.5 : 1), n, at, false);
+  if (lastHit) { lastHit.slam = true; hudFight(); }
+  A.vel.multiplyScalar(0.5);
+}
+/**
+ * The body as a person's under a blow: an active ragdoll (src/ragdoll.js) that follows the generated motion with its
+ * muscles. A blow loosens the muscles (more for a harder one) and drives the struck parts; the muscles then firm up
+ * again over a moment (longer after a harder blow), so the body sways, catches itself and comes back to the motion
+ * - or, knocked down, stays loose until it lies still, its limbs falling as they will. What is shown is the
+ * ragdoll, blended into the motion as it settles.
+ */
+function jolt(F, at, J, loose, recover, feetFree = false) {
+  const R = F.rag;
+  if (!F.ragOn) { R.reset(F.shown); R.last = null; }
+  F.ragOn = true; F.ragW = 1; F.ragFade = false; F.ragT = 0; F.ragRecover = recover; F.ragLoose = loose; F.ragFeetFree = feetFree;
+  R.k = F.ragK.map(k => k * loose);
+  R.rootK = feetFree ? 2000 : 600;
+  const order = R.x.map((x, i) => [x.distanceTo(at), i]).sort((a, b) => a[0] - b[0]).slice(0, 5);
+  const wsum = order.reduce((a, [d]) => a + 1 / (d + 0.05), 0);
+  for (const [d, i] of order) R.v[i].addScaledVector(J, (1 / (d + 0.05)) / wsum / R.mass[i]);
+}
+function ragStep(F, dt) {
+  if (!F.ragOn) return;
+  const R = F.rag;
+  F.ragT += dt;
+  const down = F.state === 'fall';
+  // muscles firm up again (not while going down: the body stays loose until it lies)
+  const u = down ? 0 : clamp(F.ragT / F.ragRecover, 0, 1);
+  const loose = F.ragLoose + (1 - F.ragLoose) * u * u;
+  R.k = F.ragK.map(k => k * (down ? Math.max(F.ragLoose, 0.25) : loose));
+  R.rootK = down ? 2500 : 600 + 2400 * u;
+  const contact = F.ragFeetFree || down ? [0, 0, 0, 0] : null;
+  // (the ragdoll keeps its own state: a reset, should it drift far from the motion, is not shown as a jump)
+  const before = R.x[0].clone();
+  R.step(dt, F.shown, contact, null);
+  const ragged = R.pose(F.shown);
+  const drift = ragged.root.distanceTo(F.shown.root);
+  if (R.x[0].distanceTo(before) > 0.3 || drift > 0.45) F.ragFade = true;
+  // back to the motion once firm again; on the floor (lying, stirring) the motion's own; drifting off: at once
+  if (F.ragFade) F.ragW = Math.max(0, F.ragW - dt / 0.12);
+  else if (F.state === 'down' || F.state === 'getup') F.ragW = Math.max(0, F.ragW - dt / 0.4);
+  else if (!down && u >= 1) F.ragW = Math.max(0, F.ragW - dt / 0.2);
+  if (F.ragW <= 0) { F.ragOn = false; F.ragFade = false; return; }
+  F.shown = lerpPose(F.shown, ragged, F.ragW);
+}
 /** A right press, taken within 0.3 s when the body can strike (after a hit, getting up: dropped). */
 function takeStrikeInput() {
   const P = player;
@@ -1350,6 +1516,11 @@ function simulate(dt) {
     }
     // plans while free
     F.planTimer -= dt;
+    // the player is not held by its own follow-through or a light blow: pulled, it moves on (close in, nothing
+    // should feel stuck)
+    if (F.isPlayer && F.spring?.target && ((F.state === 'attack' && F.attack?.followSpliced && clock - F.attack.followSpliced > 0.08) || (F.state === 'hit' && clock - (F.hitAt ?? 0) > 0.3))) {
+      F.state = 'free'; F.planTimer = 0;
+    }
     if (F.state === 'free' && scheduler.ready && !F.track.busy) {
       const active = F.want.length() > 0.05 || F.vel.length() > 0.05;
       // (the player's speed changes all the time on its spring: only grabbing and letting go count as a change)
@@ -1365,18 +1536,23 @@ function simulate(dt) {
   for (const F of fighters) {
     F.prevP = F.P;
     F.shown = clonePose(F.track.display);
-    if (F.isPlayer) homing(F);
+    ragStep(F, dt);
+    if (F.isPlayer) { anticipate(F); homing(F); }
     F.P = rig.positions(F.shown);
     if (F.P[0].distanceTo(F.prevP[0]) > 0.3) jumps.push({ t: +clock.toFixed(2), who: F.isPlayer ? 'P' : 'E', state: F.state, d: +F.P[0].distanceTo(F.prevP[0]).toFixed(2), match: F.lastMatch?.name, kind: F.lastMatch?.kind, splices: F.track.splices, frames: F.track.frames.length, t2: +F.track.t.toFixed(1) });
   }
   // bodies do not pass through each other: hips closer than 0.7 m are pushed apart (the motion is shifted)
   const live = fighters.filter(f => f.state !== 'out');
+  // the player driving its body into an opponent: a body slam
+  if (player) for (const B of live) if (!B.isPlayer) bodySlam(player, B, dt);
   for (let a = 0; a < live.length; a++) for (let b = a + 1; b < live.length; b++) {
     const A = live[a], B = live[b];
     const d = flat(B.P[0].clone().sub(A.P[0])), len = d.length();
-    const near = A.state === 'attack' || B.state === 'attack' ? 0.45 : 0.75; // a blow may come in close
-    if (len < near && len > 1e-4) {
-      const push = d.normalize().multiplyScalar(Math.min(0.05, (near - len) * 0.4));
+    // the trunks (hips to neck, 17 cm round) do not pass through each other; lying bodies are stepped over
+    const c = segSeg(A.P[0], A.P[I.Neck1], B.P[0], B.P[I.Neck1]);
+    const sep = flat(c.b.clone().sub(c.a)), gap = 0.36 - c.d;
+    if (gap > 0 && len > 1e-4) {
+      const push = (sep.lengthSq() > 1e-6 ? sep.normalize() : d.normalize()).multiplyScalar(Math.min(0.05, gap * 0.5));
       A.track.shift(-push.x, -push.z); B.track.shift(push.x, push.z);
       // (the shown positions move with it, so the push is not taken for a speed)
       for (const v of A.P) { v.x -= push.x; v.z -= push.z; }
@@ -1430,7 +1606,7 @@ function hudFight() {
   const o = player.opponent;
   $('hp-enemy').style.width = o ? `${(o.hp / o.maxHp) * 100}%` : '0%';
   $('kos').textContent = `${kos}`;
-  if (lastHit && clock - lastHit.t < 1.5) $('last-hit').textContent = lastHit.blocked ? `${lastHit.by}の一撃はガードされた（${lastHit.energy.toFixed(0)} J）` : `${lastHit.by}の${lastHit.isHead ? '顔' : '体'}への一撃 ${lastHit.energy.toFixed(0)} J`;
+  if (lastHit && clock - lastHit.t < 1.5) $('last-hit').textContent = lastHit.blocked ? `${lastHit.by}の一撃はガードされた（${lastHit.energy.toFixed(0)} J）` : lastHit.slam ? `${lastHit.by}の体当たり ${lastHit.energy.toFixed(0)} J` : `${lastHit.by}の${lastHit.isHead ? '顔' : '体'}への一撃 ${lastHit.energy.toFixed(0)} J`;
 }
 
 // ---------------------------------------------------------------- model loading
