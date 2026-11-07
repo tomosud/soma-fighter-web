@@ -23,6 +23,7 @@ export const SCENARIOS = [
   { name: 'hand_yank', sec: 5, part: 'LeftHand', path: (t, s) => s.p0('LeftHand').add(s.left(0.9 * Math.min(1, t / 0.2))), release: 1.5 },
   { name: 'hips_down', sec: 7, part: 'Hips', path: (t, s) => s.p0('Hips').add(new Vector3(0, -0.35 * Math.sin(Math.min(Math.PI, t / 4 * Math.PI)), 0)), release: 5 },
   { name: 'hand_up', sec: 6, part: 'RightHand', path: (t, s) => s.p0('RightHand').add(s.fwd(0.15 * Math.min(1, t / 1.5))).add(new Vector3(0, 0.9 * Math.min(1, t / 1.5), 0)), release: 4.5 },
+  { name: 'big_yank', sec: 8, part: 'Hips', path: (t, s) => s.p0('Hips').add(s.dir(0.4, 2.2 * Math.min(1, t / 0.3))), release: 2.5 },
   { name: 'turn_back', sec: 8, part: 'RightHand', path: (t, s) => s.at('RightArm').add(s.dir(Math.PI * Math.min(1, t / 1.5), 1.0)).setY(1.2), follow: true, release: 6 },
 ];
 

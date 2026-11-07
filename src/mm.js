@@ -42,7 +42,7 @@ const scheduler = new Scheduler(rig, worker);
 // tunable (the evaluator searches over these)
 const settings = {
   vmax: 2.2, stiff: 2.6,
-  replan: 0.25, // s between plans while something is going on
+  replan: 0.2, // s between plans while something is going on
   stay: 0.85, // keep following the current clip unless the best is cheaper than this fraction of its cost
   calm: { passive: 2.0, active: 0.4 },
   fix: 'auto', // how hard the target holds at its end: 'auto' (whole pose standing, hips only moving), true, 'root', false
@@ -103,12 +103,12 @@ function approach(v, want, dt) {
   const s = v.length(), w = want.length();
   if (s > 0.2 && w > 0.2) {
     const a = Math.atan2(v.x, v.z), b = Math.atan2(want.x, want.z);
-    const heading = a + clamp(wrap(b - a), -4 * dt, 4 * dt);
-    const speed = s + clamp(w * Math.cos(clamp(wrap(b - a), -Math.PI / 2, Math.PI / 2)) - s, -3 * dt, 2 * dt);
+    const heading = a + clamp(wrap(b - a), -5 * dt, 5 * dt);
+    const speed = s + clamp(w * Math.cos(clamp(wrap(b - a), -Math.PI / 2, Math.PI / 2)) - s, -3.6 * dt, 2.6 * dt);
     return v.set(Math.sin(heading) * speed, 0, Math.cos(heading) * speed);
   }
   const diff = want.clone().sub(v);
-  const acc = (w < s ? 3 : 2) * dt;
+  const acc = (w < s ? 3.6 : 2.6) * dt;
   if (diff.length() > acc) diff.setLength(acc);
   return v.add(diff);
 }
@@ -124,7 +124,7 @@ function predict(pose, heading) {
     if (s > 0.3) {
       const travel = Math.atan2(v.x, v.z), c = Math.cos(travel - yaw);
       // backing up or a slow side step keeps the facing
-      if (!(c < -0.3 && s < 1.3) && !(Math.abs(c) < 0.5 && s < 0.9)) yaw += clamp(wrap(travel - yaw), -3.5 / FPS, 3.5 / FPS);
+      if (!(c < -0.3 && s < 1.3) && !(Math.abs(c) < 0.5 && s < 0.9)) yaw += clamp(wrap(travel - yaw), -4.5 / FPS, 4.5 / FPS);
     }
     if (TRAJ.includes(k)) out.push({ pos: p.clone(), yaw });
   }
@@ -183,6 +183,42 @@ function reachLimb(p, part, goal) {
   if (part.endsWith('Foot')) rotateSubtree(rig, q, c[2], keep.multiply(q.rot[c[2]].clone().invert()));
   return rig.fixRigid(q);
 }
+
+// ---------------------------------------------------------------- staying on the floor
+
+/** The lowest point of a pose against the floor (ankle / toe against their rest heights, other joints 5 cm out). */
+function lowest(P) {
+  let low = Math.min(P[I.LeftFoot].y - ANKLE, P[I.RightFoot].y - ANKLE, P[I.LeftToeBase].y - TOE, P[I.RightToeBase].y - TOE);
+  for (let j = 0; j < P.length; j++) if (!FOOTJ.has(j)) low = Math.min(low, P[j].y - 0.05);
+  return low;
+}
+/**
+ * MotionBricks' motion between the targets can still hang above the floor or dip into it: each new frame is
+ * moved up or down by how far its lowest point is off the floor (smoothed over 0.23 s so nothing pops; nothing
+ * while running, which has a flight phase). Only the hips' height changes, and the corrected frames are what the
+ * next plans start from.
+ */
+function groundFrames(frames) {
+  const n = frames.length;
+  const off = new Float32Array(n);
+  for (let k = 0; k < n; k++) {
+    const p = frames[k].pose, P = rig.positions(p);
+    const prev = frames[Math.max(0, k - 1)].pose.root;
+    const speed = Math.hypot(p.root.x - prev.x, p.root.z - prev.z) * FPS;
+    const low = lowest(P);
+    off[k] = speed > 2 ? 0 : Math.abs(low) > 0.015 ? -low : 0;
+  }
+  let moved = 0;
+  for (let k = 0; k < n; k++) {
+    let m = 0, c = 0;
+    for (let u = Math.max(0, k - 3); u <= Math.min(n - 1, k + 3); u++) { m += off[u]; c++; }
+    const o = m / c;
+    if (Math.abs(o) > 0.005) { frames[k].pose.root.y += o; moved = Math.max(moved, Math.abs(o)); }
+  }
+  if (moved > 0.03) floorFixes++;
+}
+let floorFixes = 0, floatSeen = 0, floatRun = 0;
+const FOOTJ = new Set(['LeftFoot', 'RightFoot', 'LeftToeBase', 'RightToeBase'].map(n => I[n]));
 
 // ---------------------------------------------------------------- matching
 
@@ -292,7 +328,7 @@ function mmReq(mode = 'now') {
       const freeAll = settings.pose === 'free' || (settings.pose === 'mixed' && passive);
       if (freeAll) out = out.map(t => { const q = clonePose(t); q.free = true; return q; });
       else if (settings.pose === 'mixed') out = out.map((t, k) => { if (k === 0) return t; const q = clonePose(t); q.free = true; return q; });
-      return { targets: out, tokens: [6, 7], rate: 1, fixEnd: freeAll ? false : fixEnd, tag: { kind: moving ? 'move' : 'idle' } };
+      return { targets: out, tokens: [6, 7], rate: 1, fixEnd: freeAll ? false : fixEnd, tag: { kind: moving ? 'move' : 'idle' }, after: (_tr, _a, frames) => groundFrames(frames) };
     },
   };
 }
@@ -388,7 +424,7 @@ function simulate(dt) {
     // the pull changed clearly: plan at once
     // (the pointer relative to the body: a pointer that just keeps leading a walking body is not a change)
     const rel = drag ? drag.point.clone().sub(shownP[I[ANCHOR[drag.part]]]) : null;
-    const changed = ctrl.want.distanceTo(lastWant) > 0.5 || (rel && lastPoint && rel.distanceTo(lastPoint) > 0.25) || (!!drag !== !!lastPoint);
+    const changed = ctrl.want.distanceTo(lastWant) > 0.4 || (rel && lastPoint && rel.distanceTo(lastPoint) > 0.18) || (!!drag !== !!lastPoint);
     const active = drag || ctrl.vel.length() > 0.05;
     if (active && (planTimer <= 0 || changed)) {
       track.request(mmReq('now'));
@@ -410,6 +446,8 @@ function simulate(dt) {
   shown.contact = f.contact;
   shownP = rig.positions(shown);
   clock += dt;
+  // watch for hanging in the air on screen (more than 3 cm for 0.2 s, not running)
+  if (lowest(shownP) > 0.03 && ctrl.vel.length() < 1.8) { floatRun += dt; if (floatRun > 0.2 && floatRun - dt <= 0.2) floatSeen++; } else floatRun = 0;
   window.lab?.onStep?.(shown, dt);
 }
 
@@ -438,7 +476,7 @@ function loop(now) { frame(now); requestAnimationFrame(loop); }
 
 function hud() {
   if (!scheduler.ready) return;
-  $('stats').textContent = `${scheduler.backend} · 生成 ${scheduler.lastMs.toFixed(0)} ms · 速さ ${ctrl.vel.length().toFixed(1)} m/s · 描画 ${fps.toFixed(0)} fps`;
+  $('stats').textContent = `${scheduler.backend} · 生成 ${scheduler.lastMs.toFixed(0)} ms · 速さ ${ctrl.vel.length().toFixed(1)} m/s · 描画 ${fps.toFixed(0)} fps · 浮き検知 ${floatSeen} / 接地補正 ${floorFixes}`;
   if (lastMatch) $('match').textContent = `${lastMatch.name}${lastMatch.mirrored ? '（左右反転）' : ''} f${lastMatch.frame} · コスト ${lastMatch.cost.toFixed(1)}${lastMatch.stayed ? ' · 継続' : ''}`;
 }
 
@@ -488,7 +526,7 @@ requestAnimationFrame(loop);
 if (params.has('debug')) {
   window.lab = {
     rig, track, scheduler, settings, ctrl, simulate,
-    get db() { return db; }, get lastMatch() { return lastMatch; }, get clock() { return clock; },
+    get db() { return db; }, get lastMatch() { return lastMatch; }, get clock() { return clock; }, get floatSeen() { return floatSeen; }, get floorFixes() { return floorFixes; },
     get shownP() { return shownP; }, get shown() { return shown; }, get drag() { return drag; }, onStep: null,
     pull(part, point) { drag = part ? { part, point, scripted: true } : null; planTimer = 0; },
     draw: () => frame(performance.now()),
