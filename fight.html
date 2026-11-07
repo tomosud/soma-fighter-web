@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SOMA Brawl</title>
+  <meta name="description" content="腰を引いて動き、右クリックで打つ。Mixamo の参考ポーズからモーションマッチングで選んだ動きを MotionBricks（SOMA）がつなぐ、流れるような殴り合い">
+  <link rel="stylesheet" href="src/style.css">
+  <link rel="stylesheet" href="src/lab.css">
+  <style>
+    .hpbar { position: fixed; top: 14px; width: 34vw; height: 14px; border-radius: 7px; background: #2a2d36; overflow: hidden; box-shadow: 0 1px 4px #0008; }
+    .hpbar > div { height: 100%; transition: width 0.25s; }
+    #hpb-player { left: 16px; } #hp-player { background: #e0b65f; }
+    #hpb-enemy { right: 16px; } #hp-enemy { background: #8ea7da; margin-left: auto; }
+    .fight-info { position: fixed; top: 34px; left: 0; right: 0; text-align: center; color: #ddd; font-size: 14px; pointer-events: none; text-shadow: 0 1px 3px #000; }
+    .fight-info b { color: #ffe08a; font-size: 18px; }
+    #last-hit { display: block; color: #ffe9a8; margin-top: 2px; min-height: 1.2em; }
+    .fight-guide { position: fixed; left: 16px; bottom: 34px; color: #bbb; font-size: 13px; line-height: 1.6; background: #15171ccc; padding: 8px 12px; border-radius: 8px; }
+    .fight-guide label { margin-right: 10px; }
+    #db-info { color: #888; font-size: 12px; }
+  </style>
+  <script type="importmap">
+    { "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.186.1/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.186.1/examples/jsm/"
+    } }
+  </script>
+</head>
+<body class="lab">
+  <canvas id="view"></canvas>
+  <div class="hpbar" id="hpb-player"><div id="hp-player" style="width:100%"></div></div>
+  <div class="hpbar" id="hpb-enemy"><div id="hp-enemy" style="width:0%"></div></div>
+  <div class="fight-info">倒した数 <b id="kos">0</b><span id="last-hit"></span></div>
+
+  <div class="fight-guide">
+    <div><b>左ボタン</b>（どこでも）：押したまま動かすと、腰を引いてそちらへ動く。相手の方を向いたまま、離れると下がり、横へ回る</div>
+    <div><b>右ボタン</b>：打つ（今の動きに合ったパンチ・キックが出る。勢いがそのまま強さ）</div>
+    <div>攻撃のきっかけ：<label><input type="radio" name="trigger" value="click"> 右クリック</label><label><input type="radio" name="trigger" value="ram"> 勢いよくぶつかる</label></div>
+    <div id="db-info">参考ポーズを読み込み中…</div>
+  </div>
+
+  <footer class="help"><span id="stats"></span></footer>
+
+  <section id="overlay">
+    <div class="card">
+      <h1>SOMA Brawl</h1>
+      <p>腰を引っ張って動き、右クリックで打ちます。相手は一人ずつ現れ、倒すと次が来ます。動きはすべて、Mixamo のアニメーションから作った参考ポーズの中からモーションマッチングで選び、そこまでを NVIDIA の MotionBricks（SOMA）がブラウザの中で生成します。当たりの強さは、当たった手足の速さから計算した運動エネルギーで決まります。</p>
+      <fieldset>
+        <legend>モデル</legend>
+        <label><input type="radio" name="model" value="fp16" checked> Mixed FP16（380 MB、おすすめ）</label>
+        <label><input type="radio" name="model" value="fp32"> FP32（758 MB）</label>
+      </fieldset>
+      <p class="note">初回は NVIDIA の GitHub からモデルをダウンロードしてブラウザに保存します。利用条件は <a href="https://github.com/NVlabs/motionbricks/blob/54fc563aeaaf819a753d72cc9fdc6713989cdd43/motionbricks/assets/onnx/LICENSE.md" target="_blank" rel="noopener">NVIDIA Open Model Agreement</a>。</p>
+      <button id="start">モデルを読み込んで始める</button>
+      <div id="progress"><div class="track"><div id="progress-bar"></div></div><div id="progress-label"></div></div>
+    </div>
+  </section>
+
+  <script type="module" src="src/fight.js"></script>
+</body>
+</html>

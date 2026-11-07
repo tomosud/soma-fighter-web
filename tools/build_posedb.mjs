@@ -1,6 +1,9 @@
 // Mixamo FBX clips -> the reference pose database for motion matching (assets/posedb.bin + .json).
 //
-//   node tools/build_posedb.mjs [fbx dir = tools/mixamo_src]
+//   node tools/build_posedb.mjs [fbx dir = tools/mixamo_src] [--fight]
+//
+// --fight: the fighting game's database (assets/fightdb): also the fighting clips (mf_*), strikes included, every
+// clip tagged with what it is (stance / attack / block / hit / fall / getup / move) and each strike's limb and top.
 //
 // Per clip: retarget to the SOMA rig (tools/mixamo_clips.mjs), give in-place stepping the travel its feet imply,
 // repeat a looping clip a few times (so its frames have a future), put the first frame facing +Z with the hips
@@ -17,7 +20,41 @@ const root = path.resolve(path.dirname(new URL(import.meta.url).pathname.replace
 const rig = new Rig(JSON.parse(fs.readFileSync(path.join(root, 'assets/soma_rig.json'), 'utf8')));
 const I = rig.index;
 const mirror = makeMirror(rig);
-const dir = process.argv[2] ?? path.join(root, 'tools/mixamo_src');
+const FIGHT = process.argv.includes('--fight');
+const dir = process.argv.slice(2).find(a => !a.startsWith('--')) ?? path.join(root, 'tools/mixamo_src');
+const OUT = FIGHT ? 'fightdb' : 'posedb';
+// what a clip is, from its name (first match wins)
+const TAGS = ['move', 'stance', 'attack', 'block', 'hit', 'fall', 'getup'];
+function tagOf(name) {
+  // (the fighting clips' file names start with the category guessed when they were picked: not trusted)
+  const n = name.toLowerCase().replace(/^(punch|kick|block|hit|fall|getup|stance)_/, '');
+  if (/getting_up|get_up|stand_up|standing_up|kip_up/.test(n)) return 'getup';
+  if (/receiv|getting_hit|getting_punched|hit_reaction|_hit_|hit_to|hit_on|reaction|react_|stagger|stumble|shove|pushed|impact|clipped|knocked_down|knocked_over/.test(n)) return /knocked|falling|fall/.test(n) ? 'fall' : 'hit';
+  if (/fall|knocked_out|knock_out|knockout|collapse|dying|death/.test(n)) return 'fall';
+  if (/stretch|warm_up|exercise|workout|bag/.test(n)) return 'move';
+  if (/punch|jab|cross|hook|uppercut|elbow|haymaker|kick|knee/.test(n)) return 'attack';
+  if (/block|dodge|evade|duck|weave/.test(n)) return 'block';
+  if (/fight|boxing|bouncing|combat|stance|ready|side_step|step_forward|step_backward|pivot/.test(n)) return 'stance';
+  return 'move';
+}
+const STRIKERS = ['LeftHand', 'RightHand', 'LeftFoot', 'RightFoot', 'LeftShin', 'RightShin', 'LeftForeArm', 'RightForeArm'];
+/** A strike: the limb that moves fastest away from the hips, and the frame it is farthest out (its top). */
+function strikeOf(poses, own, name) {
+  const P = poses.slice(0, own).map(p => rig.positions(p));
+  const knee = /knee/i.test(name), elbow = /elbow/i.test(name), kick = /kick/i.test(name);
+  const cands = STRIKERS.filter(n => (knee ? /Shin/.test(n) : elbow ? /ForeArm/.test(n) : kick ? /Foot/.test(n) : /Hand/.test(n)));
+  let best = null;
+  for (const part of cands) {
+    const j = I[part];
+    for (let f = 2; f < P.length - 2; f++) {
+      const d = P[f][j].clone().sub(P[f][I.Spine2]).length();
+      const v = P[f][j].distanceTo(P[f - 2][j]) * 15;
+      const score = d + 0.08 * v;
+      if (!best || score > best.score) best = { part, apex: f, score, speed: v };
+    }
+  }
+  return best && { part: best.part, apex: best.apex, speed: +best.speed.toFixed(2) };
+}
 const flat = v => new Vector3(v.x, 0, v.z);
 
 const toPoses = frames => frames.map(f => rig.fixRigid({ root: new Vector3(...f.root), rot: f.rot.map(q => new Quaternion(...q).normalize()) }));
@@ -89,8 +126,8 @@ function canonical(poses) {
 
 // jumps are left out: their take-off looks like any quick rise of the hips (getting up from a crouch), and a jump
 // should only come when it is clearly asked for
-const EXCLUDE = /jump|hop|leap|kick|knee|stair|ladder|climb|ledge/i;
-const files = fs.readdirSync(dir).filter(f => /^m[mx]_.*\.fbx$/i.test(f) && !/\(\d+\)/.test(f) && !EXCLUDE.test(f)).sort();
+const EXCLUDE = FIGHT ? /jump|hop|leap|stair|ladder|climb|ledge|mx_kick|mx_knee/i : /jump|hop|leap|kick|knee|stair|ladder|climb|ledge/i;
+const files = fs.readdirSync(dir).filter(f => (FIGHT ? /^m[mxf]_.*\.fbx$/i : /^m[mx]_.*\.fbx$/i).test(f) && !/\(\d+\)/.test(f) && !EXCLUDE.test(f)).sort();
 const clips = [], entries = [];
 const needAfter = Math.max(AHEAD, TRAJ.at(-1)) + 1;
 let skipped = 0, looped = 0, rooted = 0;
@@ -107,9 +144,11 @@ for (const file of files) {
   const fl = onFloor(poses, own); poses = fl.poses; floors.push(fl.floor);
   // a clip standing well above or below the floor is on something (a ledge, a beam): not for walking on the floor
   if (Math.abs(fl.floor) > 0.15) { console.log(`  left out (floor ${(fl.floor * 100).toFixed(0)} cm): ${file}`); skipped++; continue; }
-  const name = file.replace(/^m[mx]_/, '').replace(/\.fbx$/i, '');
+  const name = file.replace(/^m[mxf]_/, '').replace(/\.fbx$/i, '');
   const c = clips.length;
-  clips.push({ name, frames: poses.length, own, loop: lp.loop, poses });
+  const tag = FIGHT ? tagOf(name) : 'move';
+  const strike = tag === 'attack' ? strikeOf(poses, own, name) : null;
+  clips.push({ name, frames: poses.length, own, loop: lp.loop, poses, tag, strike });
   // entries: skip the first and last frames (clips start and end in T-ish transitions or cut motion)
   for (const mirrored of [false, true]) {
     const src = mirrored ? poses.map(mirror) : poses;
@@ -150,7 +189,7 @@ const dv = new DataView(buf);
 let o = 0, start = 0;
 const meta = { about: 'Reference pose database for SOMA Pull (Mixamo clips on the SOMA rig, tools/build_posedb.mjs).', fps: 30, joints: rig.names, clips: [] };
 for (const c of clips) {
-  meta.clips.push({ name: c.name, start, frames: c.frames, own: c.own, loop: c.loop });
+  meta.clips.push({ name: c.name, start, frames: c.frames, own: c.own, loop: c.loop, tag: c.tag, strike: c.strike });
   start += c.frames;
   for (const p of c.poses) {
     dv.setFloat32(o, p.root.x, true); dv.setFloat32(o + 4, p.root.y, true); dv.setFloat32(o + 8, p.root.z, true); o += 12;
@@ -169,6 +208,7 @@ entries.forEach((e, i) => {
 meta.poses = { offset: 0, bytes: poseBytes };
 meta.entries = { count: entries.length, clipOffset: off.clip, frameOffset: off.frame, mirrorOffset: off.mirror };
 meta.features = { offset: off.feat, dim: DIM, quant: QUANT, scale: Array.from(scale), ahead: AHEAD, traj: TRAJ };
-fs.writeFileSync(path.join(root, 'assets/posedb.bin'), Buffer.from(buf));
-fs.writeFileSync(path.join(root, 'assets/posedb.json'), JSON.stringify(meta));
-console.log(`assets/posedb.bin ${(total / 1048576).toFixed(1)} MB (${totalFrames} frames), features scale e.g. feet ${scale[0].toFixed(2)} hipsVel ${scale[12].toFixed(2)} traj ${scale[35].toFixed(2)}`);
+fs.writeFileSync(path.join(root, `assets/${OUT}.bin`), Buffer.from(buf));
+fs.writeFileSync(path.join(root, `assets/${OUT}.json`), JSON.stringify(meta));
+if (FIGHT) { const cnt = {}; clips.forEach(c => { cnt[c.tag] = (cnt[c.tag] ?? 0) + 1; }); console.log('tags', JSON.stringify(cnt)); }
+console.log(`assets/${OUT}.bin ${(total / 1048576).toFixed(1)} MB (${totalFrames} frames), features scale e.g. feet ${scale[0].toFixed(2)} hipsVel ${scale[12].toFixed(2)} traj ${scale[35].toFixed(2)}`);
