@@ -15,7 +15,7 @@ const FPS = 30;
 const ENGAGE_IN = 2.2, ENGAGE_OUT = 3.0; // m between the hips: in close range below, apart above
 const STATE = { free: 0, guard: 1, attack: 2, hit: 3, getup: 4, down: 4.5, fall: 5, out: 5 };
 const PART = { head: 1, body: 2, legs: 3 };
-const PHASE = { approach: 1, circle: 2, lunge: 3, feint: 3.5, retreat: 4 };
+const PHASE = { hold: 0.5, wait: 1, foot: 2, lunge: 3.5, evade: 4.5 };
 
 export function createPlayLog(ctx) {
   const sid = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
@@ -192,7 +192,7 @@ export function createPlayLog(ctx) {
       tx: tgt ? +tgt.x.toFixed(2) : null, tz: tgt ? +tgt.z.toFixed(2) : null, st: tgt ? +Math.hypot(tgt.x - P.P[0].x, tgt.z - P.P[0].z).toFixed(2) : 0,
       aim: P.aim ? PART[P.aim.part] : 0, x: +P.P[0].x.toFixed(2), z: +P.P[0].z.toFixed(2), vx: +vx.toFixed(2), vz: +vz.toFixed(2), hv: +Math.hypot(vx, vz).toFixed(2),
       d: +d.toFixed(2), near: nowNear ? 1 : 0, ps: STATE[P.state] ?? 0, es: near ? STATE[near.state] ?? 0 : 0,
-      hp: Math.round(P.hp), ehp: near ? Math.round(near.hp) : 0, att: ctx.crew.attacker === near ? 1 : 0, eph: near && ctx.crew.attacker === near ? PHASE[near.phase] ?? 0 : 0,
+      hp: Math.round(P.hp), ehp: near ? Math.round(near.hp) : 0, att: ctx.crew.attacker === near ? 1 : 0, eph: near ? PHASE[near.mode] ?? 0 : 0,
       el: near ? +limbSpeed(near, dt).toFixed(2) : 0,
     });
     if (local && clock - lastSave > 20) { lastSave = clock; save(); }
@@ -206,8 +206,8 @@ export function createPlayLog(ctx) {
     const bin = 3; // 0.1 s per column
     const n = Math.ceil(frames.length / bin);
     const col = f => { const out = new Float32Array(n); for (let c = 0; c < n; c++) { let v = 0; for (let i = c * bin; i < Math.min(frames.length, c * bin + bin); i++) v = Math.max(v, f(frames[i], i)); out[c] = v; } return out; };
-    const evRow = (type, val = () => 5, cond = () => true) => { const out = new Float32Array(n); for (const e of events) if (e.type === type && cond(e)) { const c = Math.min(n - 1, Math.floor(e.f / bin)); out[c] = Math.max(out[c], val(e)); } return out; };
-    const pressRow = kind => { const out = new Float32Array(n); for (const p of presses) if (p.kind === kind) { const c = Math.min(n - 1, Math.floor(p.f / bin)); out[c] = Math.max(out[c], OUTCOME(p.outcome)); } return out; };
+    const evRow = (type, val = () => 5, cond = () => true) => { const out = new Float32Array(n); for (const e of events) if (e.type === type && cond(e)) { const c0 = Math.min(n - 1, Math.floor(e.f / bin)); for (let c = c0; c < Math.min(n, c0 + 3); c++) out[c] = Math.max(out[c], val(e)); } return out; }; // (3 columns wide: a single one is lost when the picture is scaled down)
+    const pressRow = kind => { const out = new Float32Array(n); for (const p of presses) if (p.kind === kind) { const c0 = Math.min(n - 1, Math.floor(p.f / bin)); for (let c = c0; c < Math.min(n, c0 + 3); c++) out[c] = Math.max(out[c], OUTCOME(p.outcome)); } return out; };
     const rows = [
       ['入力: カーソルの速さ（画面）', col(fr => fr.ms / 400)],
       ['入力: カーソルの速さ（床）', col(fr => Math.hypot(fr.cvx, fr.cvz) / 0.8)],
@@ -221,7 +221,7 @@ export function createPlayLog(ctx) {
       ['自分の状態', col(fr => fr.ps)],
       ['相手の状態', col(fr => fr.es)],
       ['相手が動けない（被弾・ダウン）', col(fr => (fr.es >= 3 ? 5 : 0))],
-      ['攻め役の段階（近づく→回る→突っ込む→下がる）', col(fr => fr.eph * 1.2)],
+      ['相手の動き（待つ/足運び/踏み込む/外す）', col(fr => fr.eph)],
       ['相手が攻める', evRow('enemyStrike')],
       ['自分の打撃', evRow('strike')],
       ['当てた J', evRow('hit', e => (e.touch ? 0.8 : e.energy / 25), e => !e.blocked)],

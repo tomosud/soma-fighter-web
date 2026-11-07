@@ -630,7 +630,7 @@ function strikeReq(F, family = null, mode = 'now', kindSel = null, pressId = 0) 
       // strike being chained from), and its hands' motion
       const feat = poseFeat(rig.positions(ctx[2]), rig.positions(from));
       const hNow = rig.heading(rig.positions(from));
-      const aimed = F.isPlayer ? F.aim : null;
+      const aimed = F.aim ?? null;
       const opp = aimed?.enemy ?? F.opponent;
       const A = flat(from.root);
       let yaw = opp ? Math.atan2(opp.P[0].x - A.x, opp.P[0].z - A.z) : rig.heading(rig.positions(from));
@@ -846,8 +846,8 @@ function defend(B, A, k) {
     return; // the player keeps its own footwork: stepping out of the way is how it avoids a blow
   } else {
     const r = Math.random(), recentlyHit = clock - (B.hitAt ?? -9) < 1.2;
-    if (!recentlyHit && r < 0.15) kind = 'dodge';
-    else if (!recentlyHit && r < 0.35) kind = k.family === 'low' || !k.high ? 'low' : 'high';
+    if (!recentlyHit && r < 0.08) kind = 'dodge';
+    else if (!recentlyHit && r < 0.22) kind = k.family === 'low' || !k.high ? 'low' : 'high';
   }
   if (!kind) return;
   B.track.request(guardReq(B, A, kind));
@@ -1195,7 +1195,7 @@ function land(A, B, energy, dir, at, isHead) {
   hitstop = down ? 0.04 : energy < 45 ? clamp(0.02 + energy / 1500, 0.02, 0.05) : clamp(0.05 + energy / 2000, 0.05, 0.09);
   shake = Math.max(shake, energy < 45 ? clamp(energy / 900, 0.01, 0.04) : clamp(energy / 500, 0.06, 0.14));
   if (down || energy > 60) slowUntil = performance.now() + clamp(energy * 4, 160, 420); // a heavy one: a moment of slow motion
-  if (!B.isPlayer && (energy > 45 || down)) { crew.watchUntil = clock + 0.9; crew.swapAt = clock + 0.9; } // the others watch, then the next comes
+  if (!B.isPlayer && down) crew.watchUntil = clock + 0.6; // the others hold back a moment
   if (!armored && (B.state === 'attack' || B.attack)) B.attack = null; // a hit cancels the one hit's own strike
   if (B.isPlayer && B.attackQueued != null) plog?.pressResult(B.queuedPress, 'lost:hit');
   if (B.isPlayer && B.strikeInput?.id) plog?.pressResult(B.strikeInput.id, 'lost:hit');
@@ -1226,78 +1226,73 @@ function spawn() {
   hudFight();
 }
 /**
- * The opponents play as a group. One at a time is the attacker: it closes in, circles a little to look for an
- * opening, then lunges (its strike comes out of the lunge), sometimes only feints, and backs off after it has
- * struck (hit and away). The others take places around the player (to its sides and behind, where it is not
- * looking), keep their distance there and circle. After two goes, or when it is hurt, the attacker hands over;
- * whoever has the best angle (the player's blind side) is chosen next. When one takes a big hit or goes down, the
- * others step back a moment to watch, and then one comes in at once.
+ * The opponents fight as the player does. Each moves its hips on the same spring toward a point it chooses (an
+ * unseen cursor: the same momentum, the same top speed) and strikes with the same strikes, chosen the same way
+ * (from its pose and momentum, at a part it aims at). The two nearest fight at once; a third waits a little apart,
+ * circling, and steps in when one of them goes down. A fighter keeps its own range and goes in and out of it, circles,
+ * steps in to strike (from a little out it drives in first), throws one to three blows, now and then steps out of the
+ * player's wind-up, and answers a blow it took. When one takes a heavy blow the others hold back a moment.
  */
-const crew = { attacker: null, goes: 0, swapAt: 0, watchUntil: 0 };
+const crew = { attacker: null, watchUntil: 0 };
 function enemies() { return fighters.filter(f => !f.isPlayer && f.state !== 'out'); }
-function pickAttacker() {
-  const P = player, list = enemies().filter(e => e.state !== 'down' && e.state !== 'fall');
-  if (!list.length) return null;
-  const h = rig.heading(P.P), fwd = new Vector3(Math.sin(h), 0, Math.cos(h));
-  // blind side first (behind and to the sides score higher), near ones a little more, not the same one again
-  let best = null, bc = -Infinity;
-  for (const e of list) {
-    const to = flat(e.P[0].clone().sub(P.P[0])), d = to.length();
-    const behind = -to.normalize().dot(fwd);
-    const c = 0.8 * behind - 0.3 * d + (e === crew.attacker ? -0.8 : 0) + Math.random() * 0.6;
-    if (c > bc) { bc = c; best = e; }
-  }
-  crew.attacker = best; crew.goes = 0; crew.swapAt = clock + rand(5, 8);
-  best.phase = 'approach'; best.phaseUntil = clock + 3;
-  return best;
-}
+const FIGHT = ['free', 'attack', 'guard', 'hit'];
 function think(E, dt) {
   const P = player;
-  if (!P || E.state !== 'free') { E.want.set(0, 0, 0); return; }
-  const to = flat(P.P[0].clone().sub(E.P[0])), d = to.length();
+  if (!P || !FIGHT.includes(E.state)) { E.spring = { target: null }; return; }
+  const pp = flat(P.P[0]), ep = flat(E.P[0]);
+  const to = pp.clone().sub(ep), d = to.length();
   to.normalize();
   const side = new Vector3(to.z, 0, -to.x);
-  const playerDown = P.state === 'down' || P.state === 'fall';
-  if (!crew.attacker || crew.attacker.state === 'out' || clock > crew.swapAt || crew.goes >= 2) pickAttacker();
+  const B = E.brain ??= { range: rand(1.1, 1.4), bob: Math.random() * 6, circle: Math.random() < 0.5 ? 1 : -1, nextAttack: clock + rand(0.4, 1.0), combo: 0, lungeUntil: 0, evadeUntil: 0, evDir: 1 };
+  // who fights: the two nearest that are on their feet
+  const up = enemies().filter(e => FIGHT.includes(e.state)).sort((a, b) => flat(a.P[0]).distanceTo(pp) - flat(b.P[0]).distanceTo(pp));
+  const fighting = up.indexOf(E) < 2;
+  crew.attacker = up[0] ?? null;
   // keep off each other
   const apart = new Vector3();
-  for (const o of enemies()) if (o !== E) { const dd = flat(E.P[0].clone().sub(o.P[0])); const l = dd.length(); if (l < 1.4 && l > 1e-3) apart.addScaledVector(dd.normalize(), (1.4 - l) * 1.5); }
-  if (clock < crew.watchUntil || playerDown) {
-    // watching: back to a ring a little further off, side-stepping
-    E.want.copy(to).multiplyScalar(clamp((d - 2.6) * 1.2, -1.2, 0.8)).addScaledVector(side, 0.3 * Math.sin(clock + E.maxHp)).add(apart);
-    return;
-  }
-  if (E === crew.attacker) {
-    const ph = E.phase ?? 'approach';
-    if (ph === 'approach') {
-      E.want.copy(to).multiplyScalar(clamp((d - 1.45) * 1.8, -0.6, 1.8)).add(apart);
-      if (d < 1.7 || clock > E.phaseUntil) { E.phase = 'circle'; E.phaseUntil = clock + rand(0.25, 0.8); E.circleDir = Math.random() < 0.5 ? 1 : -1; }
-    } else if (ph === 'circle') {
-      // look for an opening: around the player at about 1.5 m
-      E.want.copy(side).multiplyScalar(1.1 * E.circleDir).addScaledVector(to, clamp((d - 1.5) * 1.5, -0.8, 0.8)).add(apart);
-      if (clock > E.phaseUntil) { E.phase = Math.random() < 0.15 ? 'feint' : 'lunge'; E.phaseUntil = clock + (E.phase === 'feint' ? 0.25 : 0.65); }
-    } else if (ph === 'lunge') {
-      E.want.copy(to).multiplyScalar(2.3);
-      if (clock > E.phaseUntil) { E.phase = 'retreat'; E.phaseUntil = clock + rand(0.3, 0.5); crew.goes++; }
-    } else if (ph === 'feint') {
-      E.want.copy(to).multiplyScalar(1.8);
-      if (clock > E.phaseUntil) { E.phase = 'retreat'; E.phaseUntil = clock + 0.4; }
-    } else if (ph === 'retreat') {
-      E.want.copy(to).multiplyScalar(-1.5).addScaledVector(side, 0.5 * (E.circleDir ?? 1)).add(apart);
-      if (clock > E.phaseUntil) { E.phase = 'circle'; E.phaseUntil = clock + rand(0.3, 0.9); }
+  for (const o of enemies()) if (o !== E) { const dd = ep.clone().sub(flat(o.P[0])); const l = dd.length(); if (l < 1.2 && l > 1e-3) apart.addScaledVector(dd.normalize(), (1.2 - l) * 1.2); }
+  let goal;
+  const playerDown = P.state === 'down' || P.state === 'fall' || P.state === 'getup';
+  E.mode = 'foot';
+  if (playerDown || clock < crew.watchUntil) {
+    E.mode = 'hold';
+    goal = pp.clone().addScaledVector(to, -2.4).addScaledVector(side, 0.5 * Math.sin(clock + B.bob));
+  } else if (!fighting) {
+    // waiting: a place a little apart, circling slowly
+    E.mode = 'wait';
+    const at = Math.atan2(-to.x, -to.z) + 0.6 * dt * B.circle;
+    goal = pp.clone().add(new Vector3(Math.sin(at), 0, Math.cos(at)).multiplyScalar(2.6));
+  } else {
+    // footwork: in and out around its range, circling (now and then the other way)
+    if (Math.random() < dt * 0.5) B.circle *= -1;
+    const r = B.range + 0.3 * Math.sin(clock * 3.6 + B.bob);
+    goal = pp.clone().addScaledVector(to, -r).addScaledVector(side, 0.7 * B.circle);
+    // the player winds up close: step out of it now and then (back and to a side)
+    if (P.state === 'attack' && P.attack && !P.attack.landed && d < 1.6 && clock > B.evadeUntil + 0.6 && Math.random() < dt * 4) { B.evadeUntil = clock + 0.35; B.evDir = Math.random() < 0.5 ? -1 : 1; }
+    if (clock < B.evadeUntil) E.mode = 'evade';
+    if (clock < B.evadeUntil) goal = ep.clone().addScaledVector(to, -0.7).addScaledVector(side, 0.6 * B.evDir);
+    // driving in to strike
+    if (clock < B.lungeUntil) { goal = pp.clone().addScaledVector(to, 0.3); E.mode = 'lunge'; }
+    // strike: in range, its turn
+    if (E.state === 'free' && clock > B.nextAttack && clock > B.evadeUntil) {
+      if (d > 1.5) { if (d < 2.4) { B.lungeUntil = clock + 0.3; B.nextAttack = clock + 0.15; } }
+      else {
+        const kind = d > 1.2 ? (Math.random() < 0.6 ? 'kick' : 'punch') : Math.random() < 0.75 ? 'punch' : 'kick';
+        const u = Math.random(), part = kind === 'kick' && u < 0.3 ? 'legs' : u < 0.6 ? 'head' : 'body';
+        E.aim = { enemy: P, part, joint: part === 'head' ? I.Head : part === 'body' ? I.Spine2 : I.LeftShin, off: new Vector3() };
+        if (strike(E, kind) === 'started') {
+          B.combo = Math.random() < 0.5 ? (Math.random() < 0.4 ? 2 : 1) : 0;
+          B.nextAttack = clock + rand(0.7, 1.5);
+        } else B.nextAttack = clock + 0.2;
+      }
     }
-    return;
+    // the rest of a combination: kept while the blow is out (it is chained from the top)
+    if (E.state === 'attack' && B.combo > 0 && E.attack?.spliced && !E.attack.followed && E.attackQueued == null) {
+      B.combo--;
+      strike(E, Math.random() < 0.7 ? 'punch' : 'kick');
+    }
   }
-  // the others: a place around the player (to its sides and behind), kept, circling slowly
-  const others = enemies().filter(e => e !== crew.attacker);
-  const k = others.indexOf(E);
-  const h = rig.heading(P.P) + (k === 0 ? 2.0 : -2.0) + 0.4 * Math.sin(clock * 0.3 + k);
-  // round the player along the circle to the place (not through the player), keeping about 2.3 m
-  const at = Math.atan2(-to.x, -to.z); // where this one is, seen from the player
-  const e = wrap(h - at);
-  // (moving along `side` lowers that angle, so -side goes round to a larger one)
-  E.want.copy(side).multiplyScalar(-Math.sign(e) * Math.min(Math.abs(e) * 1.6, 1.5)).addScaledVector(to, clamp((d - 2.3) * 1.3, -1.2, 1.2)).add(apart);
-  if (E.want.length() > 1.8) E.want.setLength(1.8);
+  E.spring = { target: goal.add(apart) };
 }
 // ---------------------------------------------------------------- input (no camera control)
 
@@ -1572,7 +1567,9 @@ function bodySlam(A, B, dt) {
   const n = d.normalize();
   const vA = flat(A.P[0].clone().sub(A.prevP[0])).divideScalar(dt), vB = flat(B.P[0].clone().sub(B.prevP[0])).divideScalar(dt);
   const closing = Math.max(vA.dot(n), 0.8 * A.vel.dot(n)); // (the player's own drive: an opponent walking into it is no slam)
-  if (closing < 2.3) return; // (a real charge, not walking up to it)
+  if (closing < 2.6) return; // (a real charge, not walking up to it)
+  const T = A.spring?.target; // and only driving through it: where the body is going lies beyond the one hit
+  if (!T || flat(T.clone().sub(A.P[0])).dot(n) < len + 0.4) return;
   A.slamAfter = clock + 1.0;
   const at = A.P[I.Chest].clone().lerp(B.P[I.Spine2], 0.5);
   land(A, B, Math.min(90, 0.5 * 15 * closing * closing * (A.state === 'attack' ? 0.5 : 1)), n, at, false);
@@ -1674,12 +1671,13 @@ function simulate(dt) {
       if (F.counterAt && clock > F.counterAt) {
         F.counterAt = null;
         const d = flat(player.P[0].clone().sub(F.P[0])).length();
-        if (F.state === 'free' && d < 1.5) strike(F);
-        else if (F === crew.attacker && F.state === 'free') { F.phase = 'lunge'; F.phaseUntil = clock + 0.5; }
+        if (F.brain) { if (d < 1.5) F.brain.nextAttack = clock; else F.brain.lungeUntil = clock + 0.3; }
       }
-      think(F, dt); approach(F.vel, F.want, dt);
-      // only the one whose turn it is strikes (the others only when the player comes right up to them)
-      if (F === crew.attacker || flat(player.P[0].clone().sub(F.P[0])).length() < 1.1) autoStrike(F);
+      think(F, dt);
+      springStep(F.vel, flat(F.P[0]), F.spring?.target ?? null, dt);
+      if (!FIGHT.includes(F.state) || F.state === 'hit') F.vel.multiplyScalar(Math.exp(-dt * 4));
+      if (F.state === 'attack' && F.prevP) F.vel.lerp(flat(F.P[0].clone().sub(F.prevP[0])).divideScalar(dt), 1 - Math.exp(-dt * 6));
+      F.want.copy(F.vel);
     }
     // states end
     if (F.state !== 'free' && F.state !== 'out' && clock > F.until && !F.track.busy) {
