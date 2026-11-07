@@ -388,6 +388,7 @@ const fighters = [];
 class Fighter {
   constructor(isPlayer, color, pos, yaw) {
     this.isPlayer = isPlayer;
+    this.id = Fighter.seq = (Fighter.seq ?? 0) + 1;
     this.track = new Track(rig, { stance: standPose ?? rig.restPose() });
     this.track.reset(pos, yaw);
     this.body = new Mannequin(scene, rig, color);
@@ -620,7 +621,7 @@ function onLegs(strikePose, legPose) {
   q.root.y = 0.5 * (strikePose.root.y + legPose.root.y);
   return rig.fixRigid(q);
 }
-function strikeReq(F, family = null, mode = 'now', kindSel = null) {
+function strikeReq(F, family = null, mode = 'now', kindSel = null, pressId = 0) {
   return {
     kind: 'attack', mode, interrupt: mode === 'now',
     build(tr, a, ctx) {
@@ -713,7 +714,7 @@ function strikeReq(F, family = null, mode = 'now', kindSel = null) {
       if (opp) defend(opp, F, k);
       if (opp) targets = targets.map(t => { const r = clonePose(t); gaze(r, head); return rig.fixRigid(r); });
       // (it takes over when its motion is spliced in: until then the strike being played is the one that counts)
-      const atk = { part: k.part, id: Math.random(), kind: k.kind, key: k, yaw, at, followed: false, landed: false, sweep: swing && /hook|round/.test(k.family), t0: clock };
+      const atk = { part: k.part, id: Math.random(), kind: k.kind, key: k, yaw, at, followed: false, landed: false, sweep: swing && /hook|round/.test(k.family), t0: clock, pressId, aimPart };
       F.lastMatch = { name: k.name, kind: 'attack', cost: bc, frame: 0, dPose: +dPose.toFixed(2) };
       F.current = null;
       // already wound up that way: out sooner (less wind-up, a little faster)
@@ -903,6 +904,7 @@ function fallPlan(F, ctx, energy, dir) {
   const fly = energy > settings.knockdown * 1.2 && best.mid;
   F.current = null;
   F.lastMatch = { name: best.name + (fly ? '（吹き飛ぶ）' : ''), kind: 'fall', cost: bc, frame: 0 };
+  F.lastFall = { name: best.name, fly: !!fly, dist: +dist.toFixed(2), t: clock };
   const hold = 0.5 + clamp(energy / 200, 0, 0.8);
   const settle = rate => (tr2, a0, gen) => {
     groundFrames(gen);
@@ -1141,7 +1143,7 @@ function land(A, B, energy, dir, at, isHead) {
     spark(at, energy * 0.3, 0xd8d8d8);
     const J = flat(dir).normalize().multiplyScalar(Math.sqrt(2 * energy * 6) * 0.6);
     jolt(B, at, J, 0.7, 0.25);
-    lastHit = { energy, dmg: 0, isHead, by: A.isPlayer ? 'あなた' : '相手', t: clock, touch: true };
+    lastHit = { energy, dmg: 0, isHead, by: A.isPlayer ? 'あなた' : '相手', t: clock, touch: true, tier: 'touch', victim: B.id, striker: A.id, pressId: A.attack?.pressId ?? 0 };
     hudFight();
     return;
   }
@@ -1154,7 +1156,7 @@ function land(A, B, energy, dir, at, isHead) {
     spark(at, energy, 0x9fd3ff);
     shake = Math.max(shake, 0.02);
     B.hp = Math.max(0, B.hp - energy * (A.isPlayer ? settings.damage.player : settings.damage.enemy));
-    lastHit = { energy, dmg: 0, isHead, by: A.isPlayer ? 'あなた' : '相手', t: clock, blocked: true };
+    lastHit = { energy, dmg: 0, isHead, by: A.isPlayer ? 'あなた' : '相手', t: clock, blocked: true, tier: 'blocked', victim: B.id, striker: A.id, pressId: A.attack?.pressId ?? 0 };
     hudFight();
     return;
   }
@@ -1186,9 +1188,11 @@ function land(A, B, energy, dir, at, isHead) {
   if (down || energy > 60) slowUntil = performance.now() + clamp(energy * 4, 160, 420); // a heavy one: a moment of slow motion
   if (!B.isPlayer && (energy > 45 || down)) { crew.watchUntil = clock + 0.9; crew.swapAt = clock + 0.9; } // the others watch, then the next comes
   if (B.state === 'attack' || B.attack) B.attack = null; // a hit cancels the one hit's own strike
+  if (B.isPlayer && B.attackQueued != null) plog?.pressResult(B.queuedPress, 'lost:hit');
+  if (B.isPlayer && B.strikeInput?.id) plog?.pressResult(B.strikeInput.id, 'lost:hit');
   B.attackQueued = null;
   if (B.hp <= 0) B.ko = true;
-  lastHit = { energy, dmg, isHead, by: A.isPlayer ? 'あなた' : '相手', t: clock };
+  lastHit = { energy, dmg, isHead, by: A.isPlayer ? 'あなた' : '相手', t: clock, tier: down ? (energy > settings.knockdown * 1.2 ? 'fly' : 'down') : energy >= 45 ? 'heavy' : 'hit', victim: B.id, striker: A.id, pressId: A.attack?.pressId ?? 0 };
   hudFight();
 }
 let lastHit = null, hitstop = 0, shake = 0, slowUntil = 0;
@@ -1308,8 +1312,14 @@ function onButtons(e) {
   buttonsPrev = b;
   mouse.x = e.clientX; mouse.y = e.clientY; mouse.seen = true;
   if (!player) return;
-  if (pressed & 1) { player.strikeInput = { t: clock, kind: 'punch' }; cueStrike('punch'); plog?.press('punch'); }
-  if (pressed & 2) { player.strikeInput = { t: clock, kind: 'kick' }; cueStrike('kick'); plog?.press('kick'); }
+  for (const [bit, kind] of [[1, 'punch'], [2, 'kick']]) {
+    if (!(pressed & bit)) continue;
+    // a press not yet taken is replaced by this one (logged as replaced)
+    if (player.strikeInput?.id) plog?.pressResult(player.strikeInput.id, 'replaced');
+    const id = plog?.press(kind) ?? 0;
+    player.strikeInput = { t: clock, kind, id };
+    cueStrike(kind);
+  }
 }
 canvas.addEventListener('pointerdown', e => {
   try { canvas.setPointerCapture(e.pointerId); } catch { /* synthetic */ }
@@ -1441,12 +1451,16 @@ function homing(F) {
   if (w <= 0) return;
   F.shown = lerpPose(F.shown, reachLimb(F.shown, A.part, goal, 0.2), w);
 }
-function strike(F, kind = null) {
-  if (!F.opponent || (F.state !== 'free' && F.state !== 'attack' && F.state !== 'guard')) return;
+function strike(F, kind = null, pressId = 0) {
+  if (!F.opponent) return 'no-opponent';
+  if (F.state !== 'free' && F.state !== 'attack' && F.state !== 'guard') return `refused:${F.state}`;
   // during a strike: kept, and the next one starts from where this one ends (a combination)
-  if (F.state === 'attack' && F.attack && !F.attack.followed) { F.attackQueued = clock; F.queuedKind = kind; return; }
+  if (F.state === 'attack' && F.attack && !F.attack.followed) {
+    if (F.attackQueued != null && F.queuedPress) plog?.pressResult(F.queuedPress, 'merged');
+    F.attackQueued = clock; F.queuedKind = kind; F.queuedPress = pressId; return 'queued';
+  }
   F.attackQueued = null;
-  if (!F.track.request(strikeReq(F, null, 'now', kind))) return; // (a hit or a fall on its way: not now)
+  if (!F.track.request(strikeReq(F, null, 'now', kind, pressId))) return 'refused:busy'; // (a hit or a fall on its way: not now)
   if (F.state !== 'attack') F.attack = null; // (an old strike's record no longer counts)
   // the load-up shows at once: turning away from the hand nearer the opponent (that one jabs, the other one winds)
   if (F.isPlayer && F.opponent) {
@@ -1454,6 +1468,7 @@ function strike(F, kind = null) {
     F.antic = { t0: clock, side: Math.sign(to.dot(left) || 1) };
   }
   F.state = 'attack'; F.until = clock + 1.0;
+  return 'started';
 }
 // the right button pressed while the left one is held gives no pointerdown (a chorded press): take it from
 // mousedown / contextmenu too (once per press)
@@ -1585,11 +1600,11 @@ function ragStep(F, dt) {
 function takeStrikeInput() {
   const P = player, inp = P?.strikeInput;
   if (!inp) return;
-  const t = typeof inp === 'number' ? inp : inp.t, kind = typeof inp === 'number' ? null : inp.kind;
-  if (clock - t > 0.3 || P.state === 'down' || P.state === 'fall' || P.state === 'getup') { if (clock - t > 0.3) P.strikeInput = null; return; }
+  const t = typeof inp === 'number' ? inp : inp.t, kind = typeof inp === 'number' ? null : inp.kind, id = inp.id;
+  if (clock - t > 0.3 || P.state === 'down' || P.state === 'fall' || P.state === 'getup') { if (clock - t > 0.3) { P.strikeInput = null; plog?.pressResult(id, `expired:${P.state}`); } return; }
   if (P.state === 'hit') return;
   P.strikeInput = null;
-  strike(P, kind);
+  plog?.pressResult(id, strike(P, kind, id));
 }
 
 // ---------------------------------------------------------------- loop
@@ -1640,14 +1655,15 @@ function simulate(dt) {
       if (F.state === 'down') {
         if (F.ko && !F.isPlayer) { F.state = 'out'; F.outAt = clock; kos++; spawnAt = clock + 2.5; hudFight(); }
         else { F.track.request(getupReq(F)); F.state = 'getup'; F.until = clock + 5; if (F.isPlayer && F.hp <= 0) F.hp = F.maxHp; }
-      } else if (F.state === 'attack' && F.attackQueued != null && clock - F.attackQueued < 0.8) { F.attackQueued = null; F.state = 'free'; strike(F, F.queuedKind); }
+      } else if (F.state === 'attack' && F.attackQueued != null && clock - F.attackQueued < 0.8) { F.attackQueued = null; F.state = 'free'; const r = strike(F, F.queuedKind, F.queuedPress); if (F.isPlayer) plog?.pressResult(F.queuedPress, `after:${r}`); }
       else if (F.state !== 'down') { F.state = 'free'; F.guard = null; }
     }
     // a strike carries straight on into its follow-through (asked for as the top comes near)
     const paceNow = F.track.frames[Math.min(F.track.frames.length - 1, Math.floor(F.track.t))].rate;
     if (F.state === 'attack' && F.attack?.spliced && !F.attack.followed && !F.track.busy && F.track.remaining / FPS / paceNow < scheduler.latency + 0.12) {
       F.attack.followed = true;
-      if (F.attackQueued != null && clock - F.attackQueued < 0.8) { F.attackQueued = null; F.attack.chained = true; F.track.request(strikeReq(F, null, 'end', F.queuedKind)); F.until = clock + 1.2; }
+      if (F.attackQueued != null && clock - F.attackQueued < 0.8) { F.attackQueued = null; F.attack.chained = true; F.track.request(strikeReq(F, null, 'end', F.queuedKind, F.queuedPress)); if (F.isPlayer) plog?.pressResult(F.queuedPress, 'chained'); F.until = clock + 1.2; }
+      else if (F.attackQueued != null && F.isPlayer) { plog?.pressResult(F.queuedPress, 'lost:late'); F.attackQueued = null; }
       else F.track.request(followReq(F));
     }
     // plans while free
@@ -1802,7 +1818,7 @@ for (const el of document.querySelectorAll('input[name=trigger]')) {
 }
 
 // the play is recorded all along (saved to eval_out/ when served locally; the button downloads it)
-plog = createPlayLog({ get player() { return player; }, get fighters() { return fighters; }, get clock() { return clock; }, mouse, get lastHit() { return lastHit; }, crew });
+plog = createPlayLog({ get player() { return player; }, get fighters() { return fighters; }, get clock() { return clock; }, mouse, get lastHit() { return lastHit; }, crew, cursorFloor, settings, I });
 $('play-log')?.addEventListener('click', async () => { if (plog.local) { await plog.save(); $('play-log-info').textContent = `保存した：eval_out/play_${plog.sid}_*`; } else await plog.download(); });
 if ($('play-log-info')) $('play-log-info').textContent = plog.local ? `記録中（20 秒ごとに eval_out/play_${plog.sid}_* へ）` : '記録中（ボタンで保存）';
 requestAnimationFrame(loop);
