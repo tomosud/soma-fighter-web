@@ -67,7 +67,8 @@ export class Track {
   /** Shift the playing and future frames (push apart, arena walls). */
   shift(dx, dz) {
     const from = Math.max(0, Math.floor(this.t) - 4);
-    for (let i = from; i < this.frames.length; i++) { this.frames[i].pose.root.x += dx; this.frames[i].pose.root.z += dz; }
+    const seen = new Set(); // (frames may share a pose: a held pose is moved once)
+    for (let i = from; i < this.frames.length; i++) { const r = this.frames[i].pose.root; if (seen.has(r)) continue; seen.add(r); r.x += dx; r.z += dz; }
     this.display.root.x += dx; this.display.root.z += dz;
     for (const v of this.P) { v.x += dx; v.z += dz; }
     for (const v of this.extra) { v.x += dx; v.z += dz; }
@@ -159,6 +160,8 @@ export class Scheduler {
       const dec = decodeRequest(this.rig, motions, tokens, b, m.align);
       if (!dec.frames.length || !dec.frames.every(f => Number.isFinite(f.root.x) && f.rot.every(q => Number.isFinite(q.w)))) return; // degenerate output
       const fixed = correctEndpoints(this.rig, dec.frames, m.ctx[3], m.spec.targets[0], m.spec.fixEnd ?? true);
+      // a frame the model throws far off (more than 0.35 m in a 30th of a second: no body moves so) keeps the one before
+      for (let i = 1; i < fixed.length; i++) if (fixed[i].root.distanceTo(fixed[i - 1].root) > 0.35) fixed[i] = clonePose(fixed[i - 1]);
       const frames = fixed.map(pose => ({ pose, rate: m.spec.rate, tag: m.spec.tag }));
       if (m.track.splice(m.a, frames)) m.spec.after?.(m.track, m.a, frames);
     });

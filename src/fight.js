@@ -12,7 +12,7 @@
 //   endless and the camera follows (no camera control).
 import * as THREE from 'three';
 import { Quaternion, Vector3 } from 'three';
-import { Rig, placePose, clonePose, emptyBatch, encodeRequest, FPS } from './soma.js';
+import { Rig, placePose, clonePose, lerpPose, emptyBatch, encodeRequest, FPS } from './soma.js';
 import { Track, Scheduler, BATCH } from './motion.js';
 import { Stage, Mannequin } from './render.js';
 import { rotateSubtree, twoBoneIK } from './poses.js';
@@ -49,8 +49,9 @@ const settings = {
   enemies: clamp(Number(params.get('enemies') ?? 3), 1, 3), // how many opponents at once
   w: { feetPos: 1, feetVel: 0.75, hipsVel: 1, hipsH: 0.7, hipsVy: 0.8, hands: 0.3, head: 0.3, handsVel: 0.1, trajPos: 1, trajDir: 1.2, handle: 1.5, trajH: 1 },
   damage: { player: 0.9, enemy: 0.3 }, // hp per joule (the opponents hit softer)
+  hipsMass: 12, // the part of the body's weight a moving body puts behind a blow (kg)
   regen: 3, // the player's hp back per second after 3 s without being hit
-  knockdown: 60, // J in one blow that puts the one hit on the floor
+  knockdown: 45, // J in one blow that puts the one hit on the floor
 };
 
 // ---------------------------------------------------------------- the reference database
@@ -504,6 +505,43 @@ const WIND = { punch: 0.5, elbow: 0.35, knee: 0.45, kick: 0.6 }; // how far a st
  * fast, as the original SOMA Fighter did. Which strike: one whose reach and height suit the distance and the
  * target, a little at random, not the same one twice running; moving in fast prefers a kick or a stepping blow.
  */
+/**
+ * Pace (per-frame playback rate) of a strike: the wind-up slow, the limb whipping in faster and faster, the
+ * contact played fast enough that the limb is shown at about 8 m/s (so the energy follows the pace), then easing
+ * out. Opponents wind up slower (it shows what is coming, so it can be stepped out of).
+ */
+function warpStrike(F, frames, part, base) {
+  const j = I[part], n = frames.length;
+  const pos = frames.map(f => rig.positions(f.pose)[j]);
+  const sp = pos.map((q, i) => (i ? q.distanceTo(pos[i - 1]) * FPS : 0));
+  let ip = 1;
+  for (let i = 1; i < n; i++) if (sp[i] >= sp[ip]) ip = i;
+  const slow = F.isPlayer ? 0.8 : 0.62;
+  for (let i = 0; i < n; i++) {
+    let r;
+    if (i < ip - 8) r = slow;
+    else if (i < ip) r = slow + (2.3 - slow) * ((i - (ip - 8)) / 8) ** 1.5;
+    else if (i <= ip + 1) r = clamp(8 / Math.max(sp[i], 0.5), 1.4, 2.8);
+    else r = 1.3;
+    frames[i].rate = r * base / 1.7;
+  }
+  return frames.reduce((a, f) => a + 1 / (FPS * f.rate), 0);
+}
+/** Pace of a reaction: snapped by the blow, then drifting (the body carried, slowing down). */
+function warpReact(frames, strength) {
+  frames.forEach((f, k) => { f.rate = k < 3 ? 2.6 : Math.max(0.55 + 0.3 * (1 - strength), 2.6 * 0.8 ** (k - 2)); });
+}
+const LEGS = new Set(rig.names.map((n, j) => (/(Left|Right)(UpLeg|Leg|Shin|Foot|Toe)/.test(n) ? j : -1)).filter(j => j >= 0));
+/**
+ * A hand strike on walking legs: the arms, trunk and head from the strike's key pose, the legs (as they are in the
+ * world) from where normal motion would have the body by then, so the footwork carries on under the blow.
+ */
+function onLegs(strikePose, legPose) {
+  const q = clonePose(strikePose);
+  for (const j of LEGS) q.rot[j] = legPose.rot[j].clone();
+  q.root.y = 0.5 * (strikePose.root.y + legPose.root.y);
+  return rig.fixRigid(q);
+}
 function strikeReq(F, family = null) {
   return {
     kind: 'attack', mode: 'now', interrupt: true,
@@ -511,30 +549,46 @@ function strikeReq(F, family = null) {
       const from = ctx[3];
       const opp = F.opponent;
       const A = flat(from.root);
-      const yaw = opp ? Math.atan2(opp.P[0].x - A.x, opp.P[0].z - A.z) : rig.heading(rig.positions(from));
-      const c = Math.cos(-yaw), sn = Math.sin(-yaw);
+      let yaw = opp ? Math.atan2(opp.P[0].x - A.x, opp.P[0].z - A.z) : rig.heading(rig.positions(from));
+      let c = Math.cos(-yaw), sn = Math.sin(-yaw);
       const local = v => { const dx = v.x - A.x, dz = v.z - A.z; return new Vector3(dx * c + dz * sn, v.y, -dx * sn + dz * c); };
-      const head = opp ? opp.P[I.Head].clone().add(new Vector3(0, -0.02, 0)) : A.clone().add(new Vector3(Math.sin(yaw), 1.5, Math.cos(yaw)));
-      const body = opp ? opp.P[I.Spine2].clone() : head.clone().setY(1.1);
+      // when the blow arrives: the wait for the model, then the stretch up to the contact
+      const tLand = scheduler.latency * 1.15 + 0.45;
+      // where the opponent will be then: its own motion is already generated that far (the player's strikes); an
+      // opponent's strike aims where the player is now, so a step aside in the wind-up makes it miss
+      let OP = opp?.P;
+      if (opp && F.isPlayer) OP = rig.positions(opp.track.frame(opp.track.now + tLand * FPS).pose);
+      const head = opp ? OP[I.Head].clone().add(new Vector3(0, -0.02, 0)) : A.clone().add(new Vector3(Math.sin(yaw), 1.5, Math.cos(yaw)));
+      const body = opp ? OP[I.Spine2].clone() : head.clone().setY(1.1);
       const speedIn = opp ? F.vel.dot(flat(opp.P[0].clone().sub(A)).normalize()) : 0;
-      // where the bodies will be when the strike lands (about 0.4 s on): the body carries on with its momentum
-      const tLand = scheduler.latency * 0 + 0.38;
-      const carry = F.vel.clone().multiplyScalar(tLand).clampLength(0, 1.2);
-      const oppAhead = opp ? opp.vel.clone().multiplyScalar(tLand + scheduler.latency).clampLength(0, 0.8) : new Vector3();
-      head.add(oppAhead); body.add(oppAhead);
-      A.add(carry);
-      const low = opp ? opp.P[I.LeftShin].clone().lerp(opp.P[I.RightShin], 0.5) : body.clone().setY(0.45);
-      if (opp) low.add(oppAhead);
+      // where this body will be: the player's hips run on their spring (it may swing back), others glide on
+      if (F.isPlayer && F.spring) {
+        const v = F.vel.clone(), p = A.clone();
+        for (let t = 0; t < tLand; t += 1 / 30) { springStep(v, p, F.spring.target, 1 / 30); p.addScaledVector(v, 1 / 30); }
+        A.add(p.sub(A).clampLength(0, 1.2));
+      } else A.addScaledVector(F.vel, tLand * 0.6);
+      // face where the two will be (the player's strikes)
+      if (opp && F.isPlayer) { yaw = Math.atan2(OP[0].x - A.x, OP[0].z - A.z); c = Math.cos(-yaw); sn = Math.sin(-yaw); }
+      const low = opp ? OP[I.LeftShin].clone().lerp(OP[I.RightShin], 0.5) : body.clone().setY(0.45);
+      // the swing: moving round the opponent (rather than at it), the blow that sweeps the same way (a hook or a
+      // round kick from the side the body swings from), and the body's speed feeds it
+      const rel = opp ? flat(opp.P[0].clone().sub(flat(from.root))).normalize() : new Vector3(0, 0, 1);
+      const vrel = opp ? F.vel.clone().sub(opp.vel) : F.vel.clone();
+      const radial = vrel.dot(rel), tang = vrel.clone().addScaledVector(rel, -radial).length();
+      const lateral = vrel.dot(new Vector3(rel.z, 0, -rel.x)); // + to the body's left
+      const swing = tang > 1.0 && tang > 1.2 * Math.max(radial, 0.3);
+      const swingSide = lateral > 0 ? 'Right' : 'Left'; // moving left: the right side comes round
       const aimOf = k => (k.family === 'low' ? low : k.high ? head : body);
       let best = null, bc = Infinity;
       const pool = family ? strikeKeys.filter(k => k.family === family) : strikeKeys;
       for (const k of (pool.length ? pool : strikeKeys)) {
         const goal = local(aimOf(k));
-        const step = clamp(goal.z - k.tip.z, -0.2, WIND[k.kind] + 0.2); // (aim assist: it may step further in)
+        const step = clamp(goal.z - k.tip.z + 0.08, -0.2, WIND[k.kind] + (F.isPlayer ? 0.25 : 0.1)); // (aim assist: it may step further in, the player most)
         let cost = Math.abs(goal.z - k.tip.z - step) * 4 + Math.abs(goal.y - k.tip.y) * 2 + Math.abs(goal.x - k.tip.x) * 1.5;
         cost += (k.clip === F.lastStrike ? 1.5 : 0) + (k.clip === F.lastStrike2 ? 0.7 : 0) + Math.random() * 0.8;
         if (speedIn > 2.2 && (k.kind === 'kick' || k.kind === 'knee')) cost -= 0.8; // charging in: a kick or a knee
         else if (speedIn > 1.2 && step > 0.3) cost -= 0.4; // coming in: a stepping blow
+        if (swing && /hook|round|elbow/.test(k.family)) cost += k.part.startsWith(swingSide) ? -1.2 : 0.4; // swinging round: a sweeping blow
         if (cost < bc) { bc = cost; best = { k, step, goal }; }
       }
       if (!best) return planReq(F, 'move').build(tr, a, ctx);
@@ -542,19 +596,33 @@ function strikeReq(F, family = null) {
       F.lastStrike2 = F.lastStrike; F.lastStrike = k.clip;
       const fwd = new Vector3(Math.sin(yaw), 0, Math.cos(yaw));
       const at = A.clone().addScaledVector(fwd, step);
-      const aim = aimOf(k).clone().addScaledVector(fwd, k.family === 'low' ? 0.1 : 0.22); // through the target, not at it
+      const aim = aimOf(k).clone();
       let targets = k.frames.map(f => ground(placePose(f, yaw, ZERO, at)));
-      targets = targets.map((t, i) => reachLimb(t, k.part, aim.clone().addScaledVector(fwd, 0.03 * i), 0.5)); // bent onto it (aim assist)
+      // hand strikes: the legs keep walking (from normal motion at this moment), the arms strike
+      if (k.kind === 'punch' || k.kind === 'elbow') {
+        const keep = { current: F.current, lastMatch: F.lastMatch, recent: F.recent.slice() };
+        const loco = planReq(F, 'move').build(tr, a, ctx);
+        Object.assign(F, keep);
+        targets = targets.map((t, i) => ground(onLegs(t, loco.targets[i])));
+      }
+      // the four target frames run through the target (from short of it to well past it): they carry the
+      // limb's speed into the contact; the fist / foot is bent onto that line (an elbow or a knee is placed by the step)
+      const through = [-0.22, -0.08, 0.06, 0.2];
+      if (!/ForeArm|Shin/.test(k.part)) targets = targets.map((t, i) => reachLimb(t, k.part, aim.clone().addScaledVector(fwd, through[i]), F.isPlayer ? 0.5 : 0.35));
       // the one being struck sees it coming: a guard or a dodge, or it takes it
       if (opp) defend(opp, F, k);
       if (opp) targets = targets.map(t => { const r = clonePose(t); gaze(r, head); return rig.fixRigid(r); });
-      F.attack = { part: k.part, id: Math.random(), kind: k.kind, key: k, yaw, at, followed: false, landed: false };
+      F.attack = { part: k.part, id: Math.random(), kind: k.kind, key: k, yaw, at, followed: false, landed: false, sweep: swing && /hook|round/.test(k.family) };
       F.lastMatch = { name: k.name, kind: 'attack', cost: bc, frame: 0 };
       F.current = null;
       const rate = RATE[k.kind];
       return {
         targets, tokens: [6], rate, fixEnd: true, tag: { kind: 'attack' },
-        after: (tr2, a0, frames) => { groundFrames(frames); F.state = 'attack'; F.until = clock + frames.length / FPS / rate + 0.6; if (F.attack) F.attack.spliced = true; },
+        after: (tr2, a0, frames) => {
+          groundFrames(frames);
+          const dur = warpStrike(F, frames, k.part, rate);
+          F.state = 'attack'; F.until = clock + dur + 0.6; if (F.attack) F.attack.spliced = true;
+        },
       };
     },
   };
@@ -564,9 +632,9 @@ function strikeReq(F, family = null) {
  * through, with the body's momentum); a blow that met something comes back sooner. Soft (not held to the pose):
  * MotionBricks settles it, then normal motion carries on.
  */
-function followReq(F) {
+function followReq(F, mode = 'end') {
   return {
-    kind: 'attack', mode: 'end',
+    kind: 'attack', mode, interrupt: mode === 'now',
     build(tr, a, ctx) {
       const A = F.attack;
       if (!A?.key) return planReq(F, 'move', 'end').build(tr, a, ctx);
@@ -577,7 +645,11 @@ function followReq(F) {
       return {
         targets: targets.map((t, k) => { if (k === 0) return t; const r = clonePose(t); r.free = true; return r; }),
         tokens: [6], rate, fixEnd: false, tag: { kind: 'move' },
-        after: (tr2, a0, gen) => { groundFrames(gen); F.until = clock + (tr2.frames.length - 1 - tr2.t) / FPS / rate - 0.15; },
+        after: (tr2, a0, gen) => {
+          groundFrames(gen);
+          gen.forEach((f, i) => { f.rate = 1.6 - 0.7 * (i / Math.max(1, gen.length - 1)); }); // carried through, easing out
+          F.until = clock + gen.reduce((s2, f) => s2 + 1 / (FPS * f.rate), 0) - 0.15;
+        },
       };
     },
   };
@@ -663,8 +735,7 @@ function defend(B, A, k) {
   const away = flat(B.P[0].clone().sub(A.P[0])).normalize();
   let kind = null;
   if (B.isPlayer) {
-    const pulling = B.spring?.target && flat(B.spring.target.clone().sub(B.P[0])).dot(away) > 0.4;
-    if (pulling) kind = 'dodge'; else if (B.vel.length() < 0.6 && Math.random() < 0.35) kind = k.family === 'low' || !k.high ? 'low' : 'high';
+    return; // the player keeps its own footwork: stepping out of the way is how it avoids a blow
   } else {
     const r = Math.random(), recentlyHit = clock - (B.hitAt ?? -9) < 1.2;
     if (!recentlyHit && r < 0.15) kind = 'dodge';
@@ -830,7 +901,8 @@ function reactReq(F, from, energy, isHead, down, dir = null, hitAt = null) {
         targets, tokens: down ? [8, 9] : [6], rate: down ? 1.6 : rate, fixEnd: true, tag: { kind: down ? 'down' : 'hit' },
         after: (tr2, a0, frames) => {
           groundFrames(frames);
-          const left = (tr2.frames.length - 1 - tr2.t) / FPS / rate;
+          if (!down) warpReact(frames, clamp(energy / 45, 0, 1));
+          const left = down ? (tr2.frames.length - 1 - tr2.t) / FPS / rate : frames.reduce((s2, f) => s2 + 1 / (FPS * f.rate), 0);
           if (down) {
             const end = tr2.frames[tr2.frames.length - 1];
             for (let k = 0; k < FPS * 0.8; k++) tr2.frames.push({ pose: end.pose, rate: 1, tag: end.tag });
@@ -858,43 +930,59 @@ function spark(at, energy, color = 0xffe9a8) {
  * body on its way out is not counted at its slowest moment). Energy = 0.5 m v^2 with the limb's effective mass.
  */
 function checkHits(A, B, dt) {
-  if (A.state === 'out' || B.state === 'out' || B.state === 'fall' || B.state === 'down' || B.state === 'getup') { A.contact = null; return; } // (no hits on the floor or while getting up)
+  // one contact per target (a swing can go through several bodies)
+  A.contacts ??= new Map();
+  if (A.state === 'out' || B.state === 'out' || B.state === 'fall' || B.state === 'down' || B.state === 'getup') { A.contacts.delete(B); return; } // (no hits on the floor or while getting up)
   const striking = A.state === 'attack' || settings.trigger === 'ram';
-  if (!striking) { A.contact = null; return; }
+  if (!striking) { A.contacts.delete(B); return; }
   const head = B.P[I.Head].clone().add(new Vector3(0, 0.06, 0)), hips = B.P[0], neck = B.P[I.Neck1];
-  const vB = B.P[0].clone().sub(B.prevP[0]).divideScalar(dt);
+  const vB = B.P[0].clone().sub(B.prevP[0]).divideScalar(dt), vA = A.P[0].clone().sub(A.prevP[0]).divideScalar(dt);
+  const legSeg = ['Left', 'Right'].map(sd => [B.P[I[sd + 'Leg']], B.P[I[sd + 'Foot']]]);
+  const side = A.attack?.part?.startsWith('Left') ? 'Left' : 'Right';
   let touching = null;
   for (const [part, m] of Object.entries(STRIKE_MASS)) {
-    if (A.state === 'attack' && A.attack && part !== A.attack.part && !/ForeArm|Shin/.test(part)) continue;
+    // the striking limb (and its own forearm / shin): not the other arm or leg brushing past
+    if (A.state === 'attack' && A.attack && part !== A.attack.part && !(part.startsWith(side) && /ForeArm|Shin/.test(part))) continue;
     const p = A.P[I[part]], v = p.clone().sub(A.prevP[I[part]]).divideScalar(dt);
     A.peak = Math.max(A.peak ?? 0, v.length());
     const seg = neck.clone().sub(hips), tt = clamp(p.clone().sub(hips).dot(seg) / seg.lengthSq(), 0, 1);
     const onTrunk = hips.clone().addScaledVector(seg, tt);
-    const dHead = p.distanceTo(head) - 0.12, dTrunk = p.distanceTo(onTrunk) - 0.16;
-    const isHead = dHead < dTrunk + 0.03; // a fist near both is a blow to the head
+    let dHead = p.distanceTo(head) - 0.12, dTrunk = p.distanceTo(onTrunk) - 0.16;
+    let c = null;
+    // the legs (a sweep, a low kick)
+    for (const [a0, b0] of legSeg) {
+      const sg = b0.clone().sub(a0), u = clamp(p.clone().sub(a0).dot(sg) / sg.lengthSq(), 0, 1), on = a0.clone().addScaledVector(sg, u);
+      const dl = p.distanceTo(on) - 0.09;
+      if (dl < dTrunk && dl < dHead) { dTrunk = dl; c = on; }
+    }
+    const isHead = !c && dHead < dTrunk + 0.03; // a fist near both is a blow to the head
     const d = Math.min(dHead, dTrunk);
-    if (d > 0.06) continue;
-    const c = isHead ? head : onTrunk;
+    if (d > 0.07) continue;
+    c ??= isHead ? head : onTrunk;
     const n = c.clone().sub(p).normalize();
-    const closing = v.clone().sub(vB).dot(n);
-    if (!touching || closing > touching.closing) touching = { part, m, closing, isHead, n, at: p.clone() };
+    const closing = Math.min(11, v.clone().sub(vB).dot(n)); // (a fist or foot of a person: at most about 11 m/s)
+    const behind = clamp(vA.clone().sub(vB).dot(n), 0, 4); // the body coming in behind the blow
+    if (!touching || closing > touching.closing) touching = { part, m, closing, behind, isHead, n, at: p.clone() };
   }
   const id = A.attack?.id ?? `ram${Math.floor(clock * 2)}`;
-  const C = A.contact;
+  const C = A.contacts.get(B);
   if (touching && touching.closing > 0.5) {
-    if (!C || C.id !== id) A.contact = { id, best: touching, done: false };
+    if (!C || C.id !== id) A.contacts.set(B, { id, best: touching, done: false });
     else if (!C.done) {
       if (touching.closing > C.best.closing) C.best = touching;
       else if (touching.closing < 0.7 * C.best.closing) settle(A, B, C);
     }
   } else if (C && !C.done) settle(A, B, C);
+  if (C?.done && !C.landed) A.contacts.delete(B); // a brush that did not land: the real contact may still come
 }
 function settle(A, B, C) {
   C.done = true;
   const b = C.best;
   if (b.closing < 1.2 || B.lastHitBy === C.id) return;
-  B.lastHitBy = C.id;
-  land(A, B, 0.5 * b.m * b.closing * b.closing * (b.isHead ? 1.2 : 1), b.n, b.at, b.isHead);
+  B.lastHitBy = C.id; C.landed = true;
+  // the limb's energy, and the body's own momentum behind it (a swinging, charging body hits heavier)
+  const e = 0.5 * b.m * b.closing * b.closing * (b.isHead ? 1.2 : 1) + 0.5 * settings.hipsMass * (A.isPlayer ? 1 : 0.3) * b.behind * b.behind; // (the opponents lunge lighter)
+  land(A, B, e, b.n, b.at, b.isHead);
 }
 function land(A, B, energy, dir, at, isHead) {
   // a guard up at the right height takes most of it; the strike is stopped (it comes back as a hit)
@@ -915,16 +1003,19 @@ function land(A, B, energy, dir, at, isHead) {
   spark(at, energy);
   const push = flat(dir).normalize().multiplyScalar(clamp(0.35 * Math.sqrt(energy), 0.6, 2.6));
   B.knock.copy(push);
-  const down = B.hp <= 0 || energy > settings.knockdown;
+  const down = B.hp <= 0 || energy > settings.knockdown * (B.isPlayer ? 1.6 : 1); // (the player stays up longer)
   B.state = down ? 'fall' : 'hit';
   B.until = clock + 3;
   B.track.request(reactReq(B, A.P[0], energy, isHead, down, dir, at));
-  if (A.attack) A.attack.landed = true;
+  if (A.attack) {
+    if (A.attack.followed && !A.attack.landed && !A.attack.sweep) A.track.request(followReq(A, 'now'));
+    A.attack.landed = true;
+  }
   B.body.flash = 1;
   hitstop = clamp(0.05 + energy / 1500, 0.05, 0.14);
   shake = Math.max(shake, clamp(energy / 500, 0.02, 0.14));
-  if (energy > 40) slowUntil = performance.now() + 220; // a big one: a moment of slow motion
-  if (!B.isPlayer && (energy > 40 || down)) { crew.watchUntil = clock + 0.9; crew.swapAt = clock + 0.9; } // the others watch, then the next comes
+  if (energy > 30) slowUntil = performance.now() + clamp(energy * 4, 140, 420); // a big one: a moment of slow motion
+  if (!B.isPlayer && (energy > 30 || down)) { crew.watchUntil = clock + 0.9; crew.swapAt = clock + 0.9; } // the others watch, then the next comes
   if (B.state === 'attack' || B.attack) B.attack = null; // a hit cancels the one hit's own strike
   if (B.hp <= 0) B.ko = true;
   lastHit = { energy, dmg, isHead, by: A.isPlayer ? 'あなた' : '相手', t: clock };
@@ -1097,12 +1188,30 @@ function autoStrike(F) {
   // (the body's actual speed, from what is shown: the commanded one runs ahead of it)
   const vSelf = flat(F.P[0].clone().sub(F.prevP[0])).multiplyScalar(60), vOpp = flat(o.P[0].clone().sub(o.prevP[0])).multiplyScalar(60);
   F.vShown = (F.vShown ?? vSelf).lerp(vSelf, 0.2); o.vShown = (o.vShown ?? vOpp).lerp(vOpp, 0.2);
-  const closing = F.vShown.clone().sub(o.vShown).dot(rel.clone().normalize());
-  if (closing < (F.isPlayer ? 1.1 : 0.9)) return;
-  const tc = (d - 0.85) / closing; // until the bodies are at striking distance
-  if (tc > 0.55 || tc < -0.1) return;
+  const dir = rel.clone().normalize(), vr = F.vShown.clone().sub(o.vShown);
+  const closing = vr.dot(dir), tang = vr.clone().addScaledVector(dir, -closing).length();
+  const swinging = F.isPlayer && d < 1.5 && tang > 1.5 && closing > -0.3; // swinging past, close
+  if (!swinging) {
+    if (closing < (F.isPlayer ? 1.1 : 0.9)) return;
+    const tc = (d - 0.85) / closing; // until the bodies are at striking distance
+    if (tc > 0.7 || tc < -0.1) return;
+  }
   F.strikeAfter = clock + 0.7;
   strike(F);
+}
+/**
+ * The player's fist or foot homes in on the target over the last stretch (up to 20 cm, more the nearer it is):
+ * the generated motion is what is shown, bent a little where the target has moved since it was asked for.
+ */
+function homing(F) {
+  const A = F.attack, o = F.opponent;
+  if (F.state !== 'attack' || !A?.key || A.landed || !o || F.track.tag.kind !== 'attack' || /ForeArm|Shin/.test(A.part)) return;
+  const tip = rig.positions(F.shown)[I[A.part]];
+  const k = A.key;
+  const goal = k.family === 'low' ? o.P[I.LeftShin].clone().lerp(o.P[I.RightShin], 0.5) : k.high ? o.P[I.Head].clone() : o.P[I.Spine2].clone();
+  const w = clamp((0.7 - tip.distanceTo(goal)) / 0.45, 0, 1) * 0.7;
+  if (w <= 0) return;
+  F.shown = lerpPose(F.shown, reachLimb(F.shown, A.part, goal, 0.2), w);
 }
 function strike(F) {
   if (!F.opponent || (F.state !== 'free' && F.state !== 'attack')) return;
@@ -1121,7 +1230,7 @@ let acc = 0, last = performance.now(), clock = 0, fpsAcc = 0, fpsN = 0, fps = 0;
 const camTarget = new Vector3(0, 0.9, 0), camSide = new Vector3(1, 0, 0);
 function simulate(dt) {
   if (!db) return;
-  if (hitstop > 0) { hitstop -= dt; return; } // a landed blow holds the picture a moment
+  if (hitstop > 0) { hitstop -= dt; scheduler.tick(fighters.filter(f => f.state !== 'out').map(f => f.track)); return; } // a landed blow holds the picture a moment (the model keeps working)
   if (player && fighters.filter(f => !f.isPlayer && f.state !== 'out').length < settings.enemies && clock > spawnAt) { spawn(); spawnAt = clock + 1.5; }
   // the player's leash on the hips
   if (player) {
@@ -1150,7 +1259,8 @@ function simulate(dt) {
       else if (F.state !== 'down') { F.state = 'free'; F.guard = null; }
     }
     // a strike carries straight on into its follow-through (asked for as the top comes near)
-    if (F.state === 'attack' && F.attack?.spliced && !F.attack.followed && !F.track.busy && F.track.remaining / FPS < scheduler.latency + 0.2) {
+    const paceNow = F.track.frames[Math.min(F.track.frames.length - 1, Math.floor(F.track.t))].rate;
+    if (F.state === 'attack' && F.attack?.spliced && !F.attack.followed && !F.track.busy && F.track.remaining / FPS / paceNow < scheduler.latency + 0.12) {
       F.attack.followed = true;
       F.track.request(followReq(F));
     }
@@ -1171,6 +1281,7 @@ function simulate(dt) {
   for (const F of fighters) {
     F.prevP = F.P;
     F.shown = clonePose(F.track.display);
+    if (F.isPlayer) homing(F);
     F.P = rig.positions(F.shown);
     if (F.P[0].distanceTo(F.prevP[0]) > 0.3) jumps.push({ t: +clock.toFixed(2), who: F.isPlayer ? 'P' : 'E', state: F.state, d: +F.P[0].distanceTo(F.prevP[0]).toFixed(2), match: F.lastMatch?.name, kind: F.lastMatch?.kind, splices: F.track.splices, frames: F.track.frames.length, t2: +F.track.t.toFixed(1) });
   }
@@ -1179,9 +1290,13 @@ function simulate(dt) {
   for (let a = 0; a < live.length; a++) for (let b = a + 1; b < live.length; b++) {
     const A = live[a], B = live[b];
     const d = flat(B.P[0].clone().sub(A.P[0])), len = d.length();
-    if (len < 0.75 && len > 1e-4) {
-      const push = d.normalize().multiplyScalar(Math.min(0.05, (0.75 - len) * 0.4));
+    const near = A.state === 'attack' || B.state === 'attack' ? 0.45 : 0.75; // a blow may come in close
+    if (len < near && len > 1e-4) {
+      const push = d.normalize().multiplyScalar(Math.min(0.05, (near - len) * 0.4));
       A.track.shift(-push.x, -push.z); B.track.shift(push.x, push.z);
+      // (the shown positions move with it, so the push is not taken for a speed)
+      for (const v of A.P) { v.x -= push.x; v.z -= push.z; }
+      for (const v of B.P) { v.x += push.x; v.z += push.z; }
     }
   }
   // hits both ways
