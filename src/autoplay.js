@@ -61,12 +61,13 @@ export async function run(brawl, seconds = 60, opt = {}) {
     if (mode === 'counter' && now > modeUntil) mode = 'press';
     // the cursor
     const hips = P.P[0];
-    let aimPt = near.P[I.Head].clone();
+    let [x, y] = toScreen(near.P[I.Head]);
     if (mode === 'dodge') {
-      const to = new V(near.P[0].x - hips.x, 0, near.P[0].z - hips.z).normalize(), side = new V(to.z, 0, -to.x).multiplyScalar(dodgeSide);
-      aimPt = hips.clone().addScaledVector(side, 1.1).addScaledVector(to, -0.3); aimPt.y = 0.95;
+      // a person's dodge: a quick flick of the hand sideways on the screen (across the line to the attacker), about 140 px
+      const [px, py] = toScreen(hips), [ex, ey] = toScreen(watching?.e?.P[0] ?? near.P[0]);
+      let ax = ex - px, ay = ey - py; const al = Math.hypot(ax, ay) || 1; ax /= al; ay /= al;
+      x += -ay * 140 * dodgeSide - ax * 30; y += ax * 140 * dodgeSide - ay * 30;
     }
-    let [x, y] = toScreen(aimPt);
     x += (rng() - 0.5) * 2 * kind.jitter; y += (rng() - 0.5) * 2 * kind.jitter;
     send('pointermove', -1, 0, x, y);
     // presses
@@ -87,13 +88,13 @@ export async function run(brawl, seconds = 60, opt = {}) {
 export function score(sum, tally, sec, kind = 'skilled') {
   const per = x => (x / sec) * 60;
   const band = (v, lo, hi, scale) => (v == null ? 1 : v < lo ? (lo - v) / scale : v > hi ? (v - hi) / scale : 0);
-  const landed = kind === 'novice' ? [0.45, 0.6] : [0.25, 0.4];
+  const landed = kind === 'novice' ? [0.35, 0.55] : [0.25, 0.4];
   const parts = {
     enemyAttacks: band(per(sum.enemyStrikes), 28, 45, 8),
     enemyLanded: band(sum.enemyLanded, landed[0], landed[1], 0.1),
     stunned: band(sum.enemyStunned, 0, 0.32, 0.08),
     flat: band(sum.flatFrac, 0, 0.08, 0.05),
-    counterRate: tally.counters >= 3 ? band(tally.counterRate, 0.4, 0.75, 0.15) : 0,
+    counterRate: tally.counters >= 6 ? band(tally.counterRate, 0.4, 0.75, 0.15) : 0, // (fewer than 6 tries: noise)
     counters: kind === 'skilled' ? band(per(sum.counters ?? 0), 4, 12, 2) : 0,
     downStill: band(sum.downStill ?? 0, 0, 0.15, 0.08),
     playerStill: band(sum.playerStill, 0, 0.03, 0.02),

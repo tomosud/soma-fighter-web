@@ -24,12 +24,14 @@ export class Mannequin {
     this.group = new THREE.Group();
     this.bones = BONES.map(([a, b, r]) => {
       const len = pick(a, P, X).distanceTo(pick(b, P, X));
-      const mesh = new THREE.Mesh(new THREE.CapsuleGeometry(r, Math.max(0.001, len), 4, 10), this.material);
+      // (each bone its own material: a striking limb can glow on its own)
+      const mesh = new THREE.Mesh(new THREE.CapsuleGeometry(r, Math.max(0.001, len), 4, 10), this.material.clone());
       mesh.castShadow = true;
       this.group.add(mesh);
       return { a, b, mesh };
     });
-    this.head = new THREE.Mesh(new THREE.SphereGeometry(0.115, 20, 14), this.material);
+    this.head = new THREE.Mesh(new THREE.SphereGeometry(0.115, 20, 14), this.material.clone());
+    this.tint = 0; this.limb = null; this.limbGlow = 0; // (a wind-up: the body glows orange, the striking limb more)
     this.head.castShadow = true;
     this.group.add(this.head);
     scene.add(this.group);
@@ -46,7 +48,13 @@ export class Mannequin {
     const head = P[this.rig.index.Head], end = X[0];
     this.head.position.addVectors(head, end).multiplyScalar(0.5);
     this.flash = Math.max(0, this.flash - dt * 4);
-    this.material.emissive.setRGB(this.flash * 0.9, this.flash * 0.25, this.flash * 0.1);
+    const er = this.flash * 0.9 + this.tint * 0.5, eg = this.flash * 0.25 + this.tint * 0.16, eb = this.flash * 0.1;
+    const chain = this.limb ? (/Hand|ForeArm/.test(this.limb) ? [this.limb.replace(/Hand|ForeArm/, 'ForeArm'), this.limb.replace(/Hand|ForeArm/, 'Hand')] : [this.limb.replace(/Foot|Shin/, 'Shin'), this.limb.replace(/Foot|Shin/, 'Foot')]) : [];
+    for (const { a, b, mesh } of this.bones) {
+      const on = chain.includes(a) || chain.includes(b);
+      mesh.material.emissive.setRGB(er + (on ? this.limbGlow : 0), eg + (on ? this.limbGlow * 0.4 : 0), eb);
+    }
+    this.head.material.emissive.setRGB(er, eg, eb);
   }
 }
 
