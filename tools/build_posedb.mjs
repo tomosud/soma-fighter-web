@@ -71,6 +71,17 @@ function extendLoop(poses, minFrames) {
   return { poses: out, loop: true };
 }
 
+/**
+ * Clips stand on floors of their own (some a little above or below): put each clip's floor at 0, the floor being
+ * where its feet are lowest most of the time (ankle and toe against their heights at rest, 10th percentile).
+ */
+const ANK = rig.restPos[I.LeftFoot].y, TOE = rig.restPos[I.LeftToeBase].y;
+function onFloor(poses, own) {
+  const lows = poses.slice(0, own).map(p => { const P = rig.positions(p); return Math.min(P[I.LeftFoot].y - ANK, P[I.RightFoot].y - ANK, P[I.LeftToeBase].y - TOE, P[I.RightToeBase].y - TOE); }).sort((a, b) => a - b);
+  const floor = lows[Math.floor(lows.length * 0.1)] ?? 0;
+  return { poses: poses.map(p => { const q = clonePose(p); q.root.y -= floor; return q; }), floor };
+}
+
 function canonical(poses) {
   const h = rig.heading(rig.positions(poses[0])), at = flat(poses[0].root);
   return poses.map(p => placePose(p, -h, at, at.clone().negate()));
@@ -83,6 +94,7 @@ const files = fs.readdirSync(dir).filter(f => /^m[mx]_.*\.fbx$/i.test(f) && !/\(
 const clips = [], entries = [];
 const needAfter = Math.max(AHEAD, TRAJ.at(-1)) + 1;
 let skipped = 0, looped = 0, rooted = 0;
+const floors = [];
 for (const file of files) {
   let frames;
   try { frames = convert(path.join(dir, file)).frames; } catch (e) { console.log('skip', file, e.message); skipped++; continue; }
@@ -92,6 +104,9 @@ for (const file of files) {
   const own = poses.length; // entries only on the clip's own frames (not on the repeated or held ones)
   const lp = extendLoop(poses, poses.length + needAfter + 6); poses = lp.poses; if (lp.loop) looped++;
   poses = canonical(poses);
+  const fl = onFloor(poses, own); poses = fl.poses; floors.push(fl.floor);
+  // a clip standing well above or below the floor is on something (a ledge, a beam): not for walking on the floor
+  if (Math.abs(fl.floor) > 0.15) { console.log(`  left out (floor ${(fl.floor * 100).toFixed(0)} cm): ${file}`); skipped++; continue; }
   const name = file.replace(/^m[mx]_/, '').replace(/\.fbx$/i, '');
   const c = clips.length;
   clips.push({ name, frames: poses.length, own, loop: lp.loop, poses });
@@ -104,6 +119,8 @@ for (const file of files) {
   }
 }
 console.log(`${clips.length} clips (${skipped} skipped, ${looped} looping, ${rooted} given root motion), ${entries.length} entries`);
+const fs2 = floors.map(Math.abs).sort((a, b) => a - b);
+console.log(`floors moved: median ${(fs2[fs2.length >> 1] * 100).toFixed(1)} cm, largest ${(fs2.at(-1) * 100).toFixed(1)} cm`);
 
 // per-dimension scale: robust spread over the database (with a floor so a near-constant feature is not blown up)
 const scale = new Float32Array(DIM);

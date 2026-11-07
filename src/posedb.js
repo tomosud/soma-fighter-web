@@ -98,7 +98,7 @@ export function features(rig, C, f, out = new Float32Array(DIM)) {
  * Query features from what SOMA is doing (the last two context frames, positions given) and what is wanted
  * (hips trajectory [{pos, yaw}] at TRAJ frames ahead; the grabbed handle's target in the world, or null).
  */
-export function queryFeatures(rig, Pprev, Pnow, heading, traj, part, target, out = new Float32Array(DIM)) {
+export function queryFeatures(rig, Pprev, Pnow, heading, traj, part, target, out = new Float32Array(DIM), extra = []) {
   const I = rig.index, fps = 30;
   const B = bodyFrame(Pnow[0], heading);
   const put = (k, a) => { for (let i = 0; i < a.length; i++) out[k + i] = a[i]; };
@@ -117,6 +117,7 @@ export function queryFeatures(rig, Pprev, Pnow, heading, traj, part, target, out
   });
   out.fill(0, 43, 64);
   if (part && target) put(handleSlot(part), B.point(target));
+  for (const e of extra) put(handleSlot(e.part), B.point(e.target)); // other handles held where they are
   // hips height: kept, unless the hips themselves are pulled up or down
   if (part === 'Hips' && target) TRAJ.forEach((d, k) => { out[61 + k] = clampH(target.y - Pnow[0].y) * Math.min(1, d / AHEAD); });
   return out;

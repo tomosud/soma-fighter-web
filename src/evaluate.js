@@ -63,8 +63,9 @@ export function residuals(rig, poses, opt = {}) {
   const M = measure(rig, poses);
   const n = M.length, half = Math.floor(WIN / 2);
   const ankle = opt.ankle ?? rig.restPos[rig.index.LeftFoot].y, toeRest = rig.restPos[rig.index.LeftToeBase].y;
+  const footJ = new Set(['LeftFoot', 'RightFoot', 'LeftToeBase', 'RightToeBase'].map(nm => rig.index[nm]));
   const pos = joints.map(() => new Float32Array(n)), rot = joints.map(() => new Float32Array(n));
-  const glob = { hipSpeed: new Float32Array(n), yawRate: new Float32Array(n), hipHeight: new Float32Array(n), slideL: new Float32Array(n), slideR: new Float32Array(n), below: new Float32Array(n) };
+  const glob = { hipSpeed: new Float32Array(n), yawRate: new Float32Array(n), hipHeight: new Float32Array(n), slideL: new Float32Array(n), slideR: new Float32Array(n), below: new Float32Array(n), float: new Float32Array(n) };
   const speed = new Float32Array(n), yaw = new Float32Array(n);
   // each contact point's floor: the low 5 % of its heights in this motion
   const low = arr => { const a = Float32Array.from(arr).sort(); return a[Math.floor(a.length * 0.05)] ?? 0; };
@@ -103,7 +104,12 @@ export function residuals(rig, poses, opt = {}) {
       const a = useToe ? M[t - 1].toes[side] : M[t - 1].feet[side], b = useToe ? M[t].toes[side] : M[t].feet[side];
       glob[key][t] = Math.hypot(b.x - a.x, b.z - a.z) * EVAL_FPS * 100; // cm/s
     }
-    glob.below[t] = Math.max(0, ankle - 0.03 - Math.min(M[t].feet[0].y, M[t].feet[1].y)) * 100; // cm
+    // against the scene's floor (y = 0): the lowest point of the body (ankle / toe against their heights at rest,
+    // any other joint 5 cm above its centre) going through it, or hanging above it while not running
+    let low = Math.min(M[t].feet[0].y - ankle, M[t].feet[1].y - ankle, M[t].toes[0].y - toeRest, M[t].toes[1].y - toeRest);
+    low = Math.min(low, ...M[t].body.filter((_, j) => !footJ.has(j)).map(v => v.y - 0.05));
+    glob.below[t] = Math.max(0, -low - 0.01) * 100; // cm
+    glob.float[t] = speed[t] < 1.8 ? Math.max(0, low - 0.03) * 100 : 0; // cm
   }
   // standing or moving (hips speed averaged over 0.5 s): which reference spread applies
   const moving = new Uint8Array(n);
@@ -167,6 +173,7 @@ export function score(rig, poses, stats, marks = []) {
   rows.push({ name: '左足すべり', z: Array.from(r.glob.slideL, footZ), whole: true, raw: r.glob.slideL });
   rows.push({ name: '右足すべり', z: Array.from(r.glob.slideR, footZ), whole: true, raw: r.glob.slideR });
   rows.push({ name: '床めり込み', z: Array.from(r.glob.below, v => 5 * Math.min(1, v / BELOW_BAD)), whole: true, raw: r.glob.below });
+  rows.push({ name: '浮き', z: Array.from(r.glob.float, v => 5 * Math.min(1, v / 5)), whole: true, raw: r.glob.float });
   // summaries (the first and last half window are unreliable)
   const t0 = Math.min(r.n, WIN), t1 = Math.max(t0, r.n - WIN);
   const body = rows.filter(x => !x.whole && !x.minor);
@@ -187,6 +194,8 @@ export function score(rig, poses, stats, marks = []) {
     slideBadPlanted: +(planted.length ? planted.filter(v => v > SLIDE_BAD).length / planted.length : 0).toFixed(3),
     slideBadFrac: +(slide.filter(v => v > SLIDE_BAD).length / Math.max(1, slide.length)).toFixed(3),
     belowMaxCm: +Math.max(0, ...r.glob.below).toFixed(1),
+    floatFrac: +(Array.from(r.glob.float.slice(t0, t1)).filter(v => v > 0).length / Math.max(1, t1 - t0)).toFixed(3),
+    floatMaxCm: +Math.max(0, ...r.glob.float).toFixed(1),
     yawZ95: +((rows.find(x => x.name === '向きの回転').z.slice(t0, t1).sort((a, b) => a - b)[Math.floor((t1 - t0) * 0.95)]) ?? 0).toFixed(2),
     worst: worstBones,
   };

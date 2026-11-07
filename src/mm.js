@@ -163,17 +163,54 @@ function plantedThrough(clip, f0, f1, mirrored) {
 }
 const ANKLE = rig.restPos[I.LeftFoot].y;
 
+/**
+ * The grabbed hand or foot onto the pointer, on the posed target only (the reference rarely has exactly that
+ * reach; a held-up foot hardly at all). Within the limb's reach, the elbow / knee bending the way it already does.
+ */
+function reachLimb(p, part, goal) {
+  const side = part.startsWith('Left') ? 'Left' : 'Right';
+  const names = part.endsWith('Hand') ? ['Arm', 'ForeArm', 'Hand'] : ['Leg', 'Shin', 'Foot'];
+  const c = names.map(n => I[side + n]);
+  const q = clonePose(p);
+  const P = rig.positions(q);
+  const len = P[c[1]].distanceTo(P[c[0]]) + P[c[2]].distanceTo(P[c[1]]);
+  const to = goal.clone().sub(P[c[0]]);
+  const tip = to.length() > len * 0.98 ? P[c[0]].clone().addScaledVector(to.normalize(), len * 0.98) : goal.clone();
+  if (part.endsWith('Foot')) tip.y = Math.max(tip.y, ANKLE);
+  const bend = P[c[1]].clone().sub(P[c[0]].clone().lerp(P[c[2]], 0.5));
+  const keep = q.rot[c[2]].clone();
+  twoBoneIK(rig, q, c[0], c[1], c[2], tip, bend.lengthSq() > 1e-6 ? bend : new Vector3(0, part.endsWith('Hand') ? -1 : 0.5, 1));
+  if (part.endsWith('Foot')) rotateSubtree(rig, q, c[2], keep.multiply(q.rot[c[2]].clone().invert()));
+  return rig.fixRigid(q);
+}
+
 // ---------------------------------------------------------------- matching
 
 const recent = []; // clips left recently ({ clip, t })
 let current = null; // { clip, mirror, frame, anchor } the clip being followed (frame at the anchor of the last plan)
 let lastMatch = null, leadPoint = null;
 const qbuf = new Float32Array(DIM);
+// While a hand is pulled the other one should stay about where it is (the reference otherwise happily lifts both);
+// while a foot is pulled the other one stays planted where it stands.
+const OTHER = { LeftHand: ['RightHand', 0.8], RightHand: ['LeftHand', 0.8], LeftFoot: ['RightFoot', 1.5], RightFoot: ['LeftFoot', 1.5] };
 function weightsFor(part) {
   const w = weightVector(settings.w);
   w.fill(0, 43, 61);
   if (part) for (let d = 0; d < 3; d++) w[handleSlot(part) + d] = settings.w.handle;
+  if (OTHER[part]) for (let d = 0; d < 3; d++) w[handleSlot(OTHER[part][0]) + d] = OTHER[part][1];
   return w;
+}
+const TOE = rig.restPos[I.LeftToeBase].y;
+/**
+ * Put a target on the floor: its lowest point (an ankle or toe against its height at rest, any other joint 5 cm
+ * above its centre) touches the floor. Lifting is left alone while running (a stride has a flight phase).
+ */
+function ground(t, running) {
+  const P = rig.positions(t);
+  let low = Math.min(P[I.LeftFoot].y - ANKLE, P[I.RightFoot].y - ANKLE, P[I.LeftToeBase].y - TOE, P[I.RightToeBase].y - TOE);
+  for (let j = 0; j < P.length; j++) if (!/Foot|Toe/.test(rig.names[j])) low = Math.min(low, P[j].y - 0.05);
+  if (low < -0.01 || (low > 0.02 && !running)) { const q = clonePose(t); q.root.y -= low; return rig.fixRigid(q); }
+  return t;
 }
 const goalW = weightVector({ trajPos: 1, trajDir: 0.7, trajH: 1 });
 function costOf(i, q, w) {
@@ -198,7 +235,8 @@ function mmReq(mode = 'now') {
         leadPoint.y = Math.max(0.05, leadPoint.y);
         target = leadPoint;
       }
-      const q = queryFeatures(rig, Pp, Pn, heading, traj, drag?.part ?? null, target, qbuf);
+      const extra = drag && OTHER[drag.part] ? [{ part: OTHER[drag.part][0], target: Pn[I[OTHER[drag.part][0]]].clone() }] : [];
+      const q = queryFeatures(rig, Pp, Pn, heading, traj, drag?.part ?? null, target, qbuf, extra);
       const w = weightsFor(drag?.part ?? null);
       if (!drag && ctrl.vel.length() < 0.05) for (let d = 25; d < 31; d++) w[d] = 0.6;
       // where the followed clip has got to: a plan made at the end of the motion starts from its target frame, one
@@ -236,6 +274,9 @@ function mmReq(mode = 'now') {
       const yaw = wrap(heading - hAt);
       const pivot = flat(at.root), offset = flat(from.root).sub(pivot);
       let targets = [0, 1, 2, 3].map(k => placePose(db.pose(best.clip, best.frame + AHEAD + k, best.mirrored), yaw, pivot, offset));
+      // on the floor (reference floors differ a little, and lying or kneeling must not sink or float)
+      const running = traj.at(-1).pos.distanceTo(flat(from.root)) / (TRAJ.at(-1) / FPS) > 1.8;
+      targets = targets.map(t => ground(t, running));
       // feet that stay planted in the reference keep their place on the floor now
       const keep = plantedThrough(best.clip, best.frame, best.frame + AHEAD + 3, best.mirrored);
       for (const side of ['Left', 'Right']) {
@@ -243,6 +284,7 @@ function mmReq(mode = 'now') {
         const now = Pn[I[side + 'Foot']].clone();
         targets = targets.map(t => { const q = clonePose(t); legTo(q, side, new Vector3(now.x, Math.max(now.y, ANKLE), now.z)); return rig.fixRigid(q); });
       }
+      if (drag && target && drag.part !== 'Hips' && drag.part !== 'Head') targets[0] = reachLimb(targets[0], drag.part, target);
       ghostPose = targets[0];
       const moving = traj.at(-1).pos.distanceTo(flat(from.root)) > 0.25;
       const fixEnd = settings.fix === 'auto' ? (moving ? 'root' : true) : settings.fix;

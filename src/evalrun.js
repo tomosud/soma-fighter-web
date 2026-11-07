@@ -7,6 +7,7 @@ import { EVAL_FPS, score, drawHeatmap } from './evaluate.js';
 
 // a hidden tab throttles its timers to once a second after a few minutes: tick from a worker instead
 let ticker = null;
+const OTHER_HAND = { LeftHand: 'RightHand', RightHand: 'LeftHand' };
 const wait = () => new Promise(r => {
   ticker ??= new Worker(URL.createObjectURL(new Blob(['setInterval(() => postMessage(0), 16)'], { type: 'text/javascript' })));
   ticker.addEventListener('message', () => r(), { once: true });
@@ -21,6 +22,7 @@ export const SCENARIOS = [
   { name: 'foot_lift', sec: 6, part: 'RightFoot', path: (t, s) => s.p0('RightFoot').add(s.fwd(0.35 * Math.min(1, t / 1.5))).add(new Vector3(0, 0.45 * Math.min(1, t / 1.5), 0)), release: 4 },
   { name: 'hand_yank', sec: 5, part: 'LeftHand', path: (t, s) => s.p0('LeftHand').add(s.left(0.9 * Math.min(1, t / 0.2))), release: 1.5 },
   { name: 'hips_down', sec: 7, part: 'Hips', path: (t, s) => s.p0('Hips').add(new Vector3(0, -0.35 * Math.sin(Math.min(Math.PI, t / 4 * Math.PI)), 0)), release: 5 },
+  { name: 'hand_up', sec: 6, part: 'RightHand', path: (t, s) => s.p0('RightHand').add(s.fwd(0.15 * Math.min(1, t / 1.5))).add(new Vector3(0, 0.9 * Math.min(1, t / 1.5), 0)), release: 4.5 },
   { name: 'turn_back', sec: 8, part: 'RightHand', path: (t, s) => s.at('RightArm').add(s.dir(Math.PI * Math.min(1, t / 1.5), 1.0)).setY(1.2), follow: true, release: 6 },
 ];
 
@@ -38,12 +40,15 @@ export async function runScenario(lab, sc) {
     dir: (a, d) => F.clone().multiplyScalar(Math.cos(a) * d).add(L.clone().multiplyScalar(Math.sin(a) * d)),
   };
   const frames = [], marks = [], follow = [];
+  let otherRise = 0;
   let step = 0, lastSplices = lab.track.splices ?? 0;
   lab.onStep = shown => {
     if (step++ % 2 === 0) { // 60 Hz simulation -> 30 Hz
       frames.push({ root: shown.root.clone(), rot: shown.rot.map(q => q.clone()), contact: shown.contact ? [...shown.contact] : null });
       // how far the grabbed part is from the pointer (while it is held)
       if (lab.drag && sc.part) follow.push(lab.shownP[I[sc.part]].distanceTo(lab.drag.point));
+      // the other hand while a hand is pulled: how far it rises above where it hung
+      if (lab.drag && OTHER_HAND[sc.part]) otherRise = Math.max(otherRise, lab.shownP[I[OTHER_HAND[sc.part]]].y - P0[I[OTHER_HAND[sc.part]]].y);
       const sp = lab.track.splices ?? 0;
       if (sp !== lastSplices) { marks.push({ t: frames.length - 1, color: 'rgba(255,255,255,0.25)' }); lastSplices = sp; }
     }
@@ -61,7 +66,7 @@ export async function runScenario(lab, sc) {
   if (!released) lab.pull(null);
   lab.onStep = null;
   const held = follow.slice(Math.min(follow.length, 30)); // after the first second
-  return { poses: frames, marks, follow: held.length ? +(held.reduce((a, b) => a + b, 0) / held.length).toFixed(3) : 0 };
+  return { poses: frames, marks, follow: held.length ? +(held.reduce((a, b) => a + b, 0) / held.length).toFixed(3) : 0, otherRise: +otherRise.toFixed(2) };
 }
 
 const packRec = rec => JSON.stringify({ marks: rec.marks, follow: rec.follow, frames: rec.poses.map(p => ({ r: p.root.toArray().map(v => +v.toFixed(4)), q: p.rot.map(q => q.toArray().map(v => +v.toFixed(5))), c: p.contact })) });
@@ -80,7 +85,7 @@ async function report(rig, rec, stats, tag, name) {
 async function summarize(tag, results) {
   const keys = Object.keys(results);
   const avg = k => +(keys.reduce((a, n) => a + results[n][k], 0) / Math.max(1, keys.length)).toFixed(3);
-  const total = { meanZ: avg('meanZ'), p95Z: avg('p95Z'), eventsPerMin: avg('eventsPerMin'), slideCmPerS: avg('slideCmPerS'), slideBadPlanted: avg('slideBadPlanted'), follow: avg('follow') };
+  const total = { meanZ: avg('meanZ'), p95Z: avg('p95Z'), eventsPerMin: avg('eventsPerMin'), slideCmPerS: avg('slideCmPerS'), slideBadPlanted: avg('slideBadPlanted'), follow: avg('follow'), floatFrac: avg('floatFrac'), belowMaxCm: avg('belowMaxCm') };
   await fetch(`/save/${tag}_scores.json`, { method: 'POST', body: JSON.stringify({ tag, total, results }, null, 1) });
   return { total, results };
 }
@@ -94,7 +99,7 @@ export async function runAll(lab, tag = 'run', only = null) {
     for (const t0 = performance.now(); performance.now() - t0 < 1500;) { lab.draw(); await wait(); }
     const rec = await runScenario(lab, sc);
     await fetch(`/save/${tag}_${sc.name}.rec.json`, { method: 'POST', body: packRec(rec) });
-    results[sc.name] = { ...(await report(lab.rig, rec, stats, tag, sc.name)), follow: rec.follow };
+    results[sc.name] = { ...(await report(lab.rig, rec, stats, tag, sc.name)), follow: rec.follow, otherRise: rec.otherRise };
   }
   return summarize(tag, results);
 }
