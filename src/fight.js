@@ -18,6 +18,8 @@ import { Stage, Mannequin } from './render.js';
 import { rotateSubtree, twoBoneIK } from './poses.js';
 import { PoseDB, queryFeatures, weightVector, meanHeading, bodyFrame, AHEAD, TRAJ, DIM } from './posedb.js';
 import { Ragdoll } from './ragdoll.js';
+import { createPlayLog } from './playlog.js';
+let plog = null; // the play log (src/playlog.js)
 
 const MB_REV = '54fc563aeaaf819a753d72cc9fdc6713989cdd43';
 const MODELS = {
@@ -1306,8 +1308,8 @@ function onButtons(e) {
   buttonsPrev = b;
   mouse.x = e.clientX; mouse.y = e.clientY; mouse.seen = true;
   if (!player) return;
-  if (pressed & 1) { player.strikeInput = { t: clock, kind: 'punch' }; cueStrike('punch'); }
-  if (pressed & 2) { player.strikeInput = { t: clock, kind: 'kick' }; cueStrike('kick'); }
+  if (pressed & 1) { player.strikeInput = { t: clock, kind: 'punch' }; cueStrike('punch'); plog?.press('punch'); }
+  if (pressed & 2) { player.strikeInput = { t: clock, kind: 'kick' }; cueStrike('kick'); plog?.press('kick'); }
 }
 canvas.addEventListener('pointerdown', e => {
   try { canvas.setPointerCapture(e.pointerId); } catch { /* synthetic */ }
@@ -1700,6 +1702,7 @@ function simulate(dt) {
   // knocked-out opponents go away after a while
   for (let k = fighters.length - 1; k >= 0; k--) { const F = fighters[k]; if (F.state === 'out' && clock - F.outAt > 2) { F.remove(); fighters.splice(k, 1); } }
   clock += dt;
+  plog?.step(dt);
   window.brawl?.onStep?.(dt);
 }
 
@@ -1798,10 +1801,14 @@ for (const el of document.querySelectorAll('input[name=trigger]')) {
   el.addEventListener('change', () => { settings.trigger = el.value; });
 }
 
+// the play is recorded all along (saved to eval_out/ when served locally; the button downloads it)
+plog = createPlayLog({ get player() { return player; }, get fighters() { return fighters; }, get clock() { return clock; }, mouse, get lastHit() { return lastHit; }, crew });
+$('play-log')?.addEventListener('click', async () => { if (plog.local) { await plog.save(); $('play-log-info').textContent = `保存した：eval_out/play_${plog.sid}_*`; } else await plog.download(); });
+if ($('play-log-info')) $('play-log-info').textContent = plog.local ? `記録中（20 秒ごとに eval_out/play_${plog.sid}_* へ）` : '記録中（ボタンで保存）';
 requestAnimationFrame(loop);
 if (params.has('debug')) {
   window.brawl = {
-    rig, scheduler, settings, fighters, simulate, strike, land, crew, camera, keys: { fallKeys, getupKeys, guardKeys },
+    rig, scheduler, settings, fighters, simulate, strike, land, crew, camera, get plog() { return plog; }, keys: { fallKeys, getupKeys, guardKeys },
     get player() { return player; }, jumps, get db() { return db; }, get clock() { return clock; }, get kos() { return kos; }, get lastHit() { return lastHit; },
     pull(point) { scripted = { point: point ?? null }; },
     unscript() { scripted = null; },
