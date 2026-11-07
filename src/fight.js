@@ -418,13 +418,19 @@ class Fighter {
  * the other way makes the body swing back hard (like a yo-yo) and a body that is moving keeps its momentum.
  * Let go and it coasts to a stop.
  */
-function springStep(v, pos, target, dt) {
-  const sp = settings.spring;
-  const a = target ? flat(target.clone().sub(pos)).multiplyScalar(sp.k).addScaledVector(v, -sp.c) : v.clone().multiplyScalar(-sp.coast);
+function springStep(v, pos, target, dt, feel = null) {
+  const sp = settings.spring, k = sp.k * (feel?.k ?? 1), c = sp.c * (feel?.c ?? 1), vmax = settings.vmax * (feel?.vmax ?? 1);
+  const a = target ? flat(target.clone().sub(pos)).multiplyScalar(k).addScaledVector(v, -c) : v.clone().multiplyScalar(-sp.coast);
   v.addScaledVector(a, dt);
   v.y = 0;
-  if (v.length() > settings.vmax) v.setLength(settings.vmax);
+  if (v.length() > vmax) v.setLength(vmax);
   return v;
+}
+/** How a fighter's spring feels now: reeling from a blow sluggish (it still steers), stepping out of a blow crisp. */
+function feelOf(F) {
+  if (F.dodge && clock < F.dodge.until) return { k: 2.4, c: 2.3, vmax: 1.3 };
+  if (F.stun && clock < F.stun) return { k: 0.25, c: 2, vmax: 0.6 };
+  return null;
 }
 function predict(F, pose, heading) {
   let yaw = heading;
@@ -595,7 +601,7 @@ function warpStrike(F, frames, part, base, ready = 0) {
   const sp = pos.map((q, i) => (i ? q.distanceTo(pos[i - 1]) * FPS : 0));
   let ip = 1;
   for (let i = 1; i < n; i++) if (sp[i] >= sp[ip]) ip = i;
-  const slow = F.isPlayer ? 1.0 + 0.3 * ready : 0.62, ramp = Math.round(8 - 4 * ready); // (wound up already: a short, quick wind-up)
+  const slow = F.isPlayer ? 1.0 + 0.3 * ready : 0.5, ramp = F.isPlayer ? Math.round(8 - 4 * ready) : 6; // (wound up already: a short, quick wind-up)
   for (let i = 0; i < n; i++) {
     let r;
     if (i < ip - ramp) r = slow;
@@ -642,7 +648,7 @@ function strikeReq(F, family = null, mode = 'now', kindSel = null, pressId = 0) 
       // opponent's strike aims where the player is now, so a step aside in the wind-up makes it miss
       let OP = opp?.P;
       if (opp && F.isPlayer) OP = rig.positions(opp.track.frame(opp.track.now + tLand * FPS).pose);
-      else if (opp) OP = rig.positions(opp.track.frame(opp.track.now + 0.35 * tLand * FPS).pose);
+      else if (opp) OP = rig.positions(opp.track.frame(opp.track.now + 0.25 * tLand * FPS).pose);
       const head = opp ? OP[I.Head].clone().add(new Vector3(0, -0.02, 0)) : A.clone().add(new Vector3(Math.sin(yaw), 1.5, Math.cos(yaw)));
       const body = opp ? OP[I.Spine2].clone() : head.clone().setY(1.1);
       const speedIn = opp ? F.vel.dot(flat(opp.P[0].clone().sub(A)).normalize()) : 0;
@@ -748,7 +754,7 @@ function followReq(F, mode = 'end') {
       const frames = A.landed ? A.key.hit : A.key.miss;
       const targets = frames.map(f => ground(placePose(f, A.yaw, ZERO, A.at)));
       F.lastMatch = { name: `${A.key.name} → ${A.landed ? '当たって戻る' : '振り抜く'}`, kind: 'follow', cost: 0, frame: 0 };
-      const rate = A.landed ? 1.5 : 1.3;
+      const rate = A.landed ? 1.5 : F.isPlayer ? 1.3 : 0.9; // (an opponent's miss carries it on, slowly: it is open)
       return {
         targets: targets.map((t, k) => { if (k === 0) return t; const r = clonePose(t); r.free = true; return r; }),
         tokens: [6], rate, fixEnd: false, tag: { kind: 'move' },
@@ -756,7 +762,9 @@ function followReq(F, mode = 'end') {
           groundFrames(gen);
           gen.forEach((f, i) => { f.rate = 1.6 - 0.7 * (i / Math.max(1, gen.length - 1)); }); // carried through, easing out
           if (F.attack) F.attack.followSpliced = clock;
-          F.until = clock + gen.reduce((s2, f) => s2 + 1 / (FPS * f.rate), 0) - 0.15;
+          const dur = gen.reduce((s2, f) => s2 + 1 / (FPS * f.rate), 0);
+          F.until = clock + dur - 0.15;
+          if (!F.isPlayer && !A.landed) { F.exposed = clock + dur + 0.35; F.until += 0.35; } // a whiff: open for a counter
         },
       };
     },
@@ -911,11 +919,11 @@ function fallPlan(F, ctx, energy, dir) {
     groundFrames(gen);
     const left = (tr2.frames.length - 1 - tr2.t) / FPS / rate;
     const end = tr2.frames[tr2.frames.length - 1];
-    // a breath on the floor, then (unless knocked out) stirring: the body does not lie there like a thing
-    const still = F.ko ? hold + 1 : 0.15 + 0.25 * Math.random();
+    // knocked out: it lies there; alive: it stirs at once (crawling away, or toward where the player points)
+    const still = F.ko ? hold + 1 : 0;
     for (let k = 0; k < FPS * still; k++) tr2.frames.push({ pose: end.pose, rate: 1, tag: end.tag });
-    F.state = 'down'; F.until = clock + left + still;
-    if (!F.ko) tr2.request(stirReq(F, hold));
+    F.state = 'down'; F.until = clock + left + still + 0.1;
+    if (!F.ko) { tr2.request(stirReq(F, hold)); jolt(F, F.P[0].clone(), new Vector3(), 0.5, 0.5, true); }
   };
   if (!fly) return { targets: lying, tokens: [8, 9], rate: 1.6, fixEnd: true, tag: { kind: 'down' }, after: settle(1.6) };
   // in the air: the moment on the way down, half way along, lifted
@@ -942,16 +950,20 @@ function stirReq(F, hold, n = 0) {
       const g = F.getupKey && pool.includes(F.getupKey) ? F.getupKey : pool[Math.floor(Math.random() * pool.length)];
       F.getupKey = g;
       const fr = g.stir[Math.min(n, g.stir.length - 1)];
-      const targets = fr.map(f => ground(placePose(f, ang, ZERO, at)));
-      const rate = 0.8 + 0.4 * Math.random();
+      // which way it crawls: an opponent away from the player; the player toward the cursor
+      let away = new Vector3();
+      if (!F.isPlayer && player) away = flat(Pn[0].clone().sub(player.P[0])).normalize().multiplyScalar(0.35);
+      else if (F.isPlayer) { const c = cursorFloor(); if (c && flat(c).distanceTo(flat(Pn[0])) > 0.5) away = flat(c.clone().sub(Pn[0])).normalize().multiplyScalar(0.4); }
+      const targets = fr.map(f => ground(placePose(f, ang, ZERO, at.clone().add(away))));
+      const rate = 0.65 + 0.3 * Math.random();
       F.lastMatch = { name: `${g.name}（床で）`, kind: 'down', cost: 0, frame: 0 };
       return {
         targets, tokens: [7, 8], rate, fixEnd: true, tag: { kind: 'down' },
         after: (tr2, a0, gen) => {
           groundFrames(gen);
           F.until = clock + (tr2.frames.length - 1 - tr2.t) / FPS / rate;
-          // a bigger blow: a little longer on the floor (one more stir)
-          if (n === 0 && hold > 0.9) tr2.request(stirReq(F, hold, 1));
+          // a second stir (crawling on), then up
+          if (n === 0) tr2.request(stirReq(F, hold, 1));
         },
       };
     },
@@ -990,7 +1002,13 @@ function getupReq(F) {
       };
       return {
         targets: kneel, tokens: [7, 8], rate, fixEnd: true, tag: { kind: 'hit' },
-        after: (tr2, a0, gen) => { groundFrames(gen); F.state = 'getup'; F.until = clock + 5; tr2.request(rise); },
+        after: (tr2, a0, gen) => {
+          groundFrames(gen);
+          if (!F.failedGetup && (F.hp < 0.3 * F.maxHp || Math.random() < 0.25)) {
+            F.failedGetup = true; F.state = 'down'; F.until = clock + 3; tr2.request(stirReq(F, 1, 1)); return;
+          }
+          F.failedGetup = false; F.state = 'getup'; F.until = clock + 5; tr2.request(rise);
+        },
       };
     },
   };
@@ -1051,7 +1069,7 @@ function reactReq(F, from, energy, isHead, down, dir = null, hitAt = null) {
             const end = tr2.frames[tr2.frames.length - 1];
             for (let k = 0; k < FPS * 0.8; k++) tr2.frames.push({ pose: end.pose, rate: 1, tag: end.tag });
             F.state = 'down'; F.until = clock + left + 0.8;
-          } else { F.state = 'hit'; F.until = clock + left + 0.5; tr2.request(recoverReq(F)); }
+          } else { F.state = 'hit'; F.until = clock + left + (F.isPlayer ? 0.5 : 0.15); tr2.request(recoverReq(F)); } // (an opponent is back in it soon)
         },
       };
     },
@@ -1076,7 +1094,8 @@ function spark(at, energy, color = 0xffe9a8) {
 function checkHits(A, B, dt) {
   // one contact per target (a swing can go through several bodies)
   A.contacts ??= new Map();
-  if (A.state === 'out' || B.state === 'out' || B.state === 'fall' || B.state === 'down' || B.state === 'getup') { A.contacts.delete(B); return; } // (no hits on the floor or while getting up)
+  if (A.state === 'out' || B.state === 'out' || B.state === 'fall') { A.contacts.delete(B); return; } // (not while flying)
+  if (B.dodge && clock < B.dodge.iframes) { if (A.attack && !A.attack.dodgedBy) { A.attack.dodgedBy = B.id; plog?.note('dodged', { by: A.id }); } A.contacts.delete(B); return; }
   const striking = A.state === 'attack' || settings.trigger === 'ram';
   if (!striking) { A.contacts.delete(B); return; }
   const head = B.P[I.Head].clone().add(new Vector3(0, 0.06, 0)), hips = B.P[0], neck = B.P[I.Neck1];
@@ -1136,7 +1155,47 @@ function settle(A, B, C) {
   const e = 0.5 * b.m * b.closing * b.closing * (b.isHead ? 1.2 : 1) + 0.5 * settings.hipsMass * (A.isPlayer ? 1 : 0.3) * b.behind * b.behind; // (the opponents lunge lighter)
   land(A, B, e, b.n, b.at, b.isHead);
 }
+// readable blows: a red edge on the screen (the player hurt), a camera kick, numbers where a blow lands
+const hurtEl = document.createElement('div');
+hurtEl.style.cssText = 'position:fixed;inset:0;pointer-events:none;z-index:5;box-shadow:inset 0 0 160px 40px rgba(220,20,20,0.9);opacity:0;transition:none';
+document.body.appendChild(hurtEl);
+let hurt = 0;
+const camKick = new Vector3();
+function damageNumber(at, text, color, size) {
+  const r = canvas.getBoundingClientRect(), q = at.clone().project(camera);
+  const el = document.createElement('div');
+  el.textContent = text;
+  el.style.cssText = `position:fixed;left:${r.left + (q.x + 1) / 2 * r.width}px;top:${r.top + (1 - q.y) / 2 * r.height}px;color:${color};font:bold ${size}px sans-serif;pointer-events:none;z-index:6;text-shadow:0 0 4px #000;transform:translate(-50%,-50%);transition:transform 0.8s ease-out, opacity 0.8s ease-in`;
+  document.body.appendChild(el);
+  requestAnimationFrame(() => { el.style.transform = 'translate(-50%,-150%)'; el.style.opacity = '0'; });
+  setTimeout(() => el.remove(), 850);
+}
+/** A blow on a body lying (or getting up): it hurts less, jolts and pushes the body along the floor; a body getting up goes back down. */
+function groundHit(A, B, energy, dir, at, isHead) {
+  const dmg = energy * 0.6 * (A.isPlayer ? settings.damage.player : settings.damage.enemy);
+  B.hp = Math.max(0, B.hp - dmg);
+  spark(at, energy * 0.6);
+  const n = flat(dir).normalize();
+  jolt(B, at, n.clone().multiplyScalar(Math.sqrt(2 * energy * 6) * 1.2), 0.25, 0.6, true);
+  const push = n.clone().multiplyScalar(Math.min(0.3, energy / 300));
+  B.track.shift(push.x, push.z);
+  for (const v of B.P) { v.x += push.x; v.z += push.z; }
+  if (B.state === 'getup') { B.state = 'down'; B.until = clock + 2; B.getupKey = null; B.track.request(stirReq(B, 1, 0)); }
+  else if (B.state === 'down') B.until += clamp(energy / 150, 0.1, 0.5);
+  if (B.hp <= 0 && !B.isPlayer) B.ko = true;
+  hitstop = Math.max(hitstop, 0.03); shake = Math.max(shake, 0.03);
+  if (B.isPlayer) hurt = Math.max(hurt, 0.5);
+  damageNumber(at, `-${Math.round(dmg)}`, B.isPlayer ? '#ff6060' : '#ffe9a8', 14 + Math.min(14, energy / 6));
+  lastHit = { energy, dmg, isHead, by: A.isPlayer ? 'あなた' : '相手', t: clock, tier: 'ground', victim: B.id, striker: A.id, pressId: A.attack?.pressId ?? 0 };
+  if (A.attack) A.attack.landed = true;
+  hudFight();
+}
 function land(A, B, energy, dir, at, isHead) {
+  if (B.state === 'down' || B.state === 'getup') { groundHit(A, B, energy, dir, at, isHead); return; }
+  // a counter: an opponent caught in the recovery of a missed blow, or a blow right after the player stepped out of one
+  let counter = false;
+  if (!B.isPlayer && clock < (B.exposed ?? 0)) { energy *= 1.35; counter = true; }
+  else if (A.isPlayer && clock - (A.dodge?.at ?? -9) < 0.6) { energy *= 1.15; counter = true; }
   // a touch (a glancing contact, little in it): a small mark, a small sway of the body; no stop, no shake, no
   // reaction motion - the striker carries on through
   if (energy < 12 && B.hp - energy * (A.isPlayer ? settings.damage.player : settings.damage.enemy) > 0) {
@@ -1145,6 +1204,7 @@ function land(A, B, energy, dir, at, isHead) {
     const J = flat(dir).normalize().multiplyScalar(Math.sqrt(2 * energy * 6) * 0.6);
     jolt(B, at, J, 0.7, 0.25);
     lastHit = { energy, dmg: 0, isHead, by: A.isPlayer ? 'あなた' : '相手', t: clock, touch: true, tier: 'touch', victim: B.id, striker: A.id, pressId: A.attack?.pressId ?? 0 };
+    if (B.isPlayer) { hurt = Math.max(hurt, 0.2); shake = Math.max(shake, 0.02); }
     hudFight();
     return;
   }
@@ -1176,7 +1236,7 @@ function land(A, B, energy, dir, at, isHead) {
   B.knock.copy(push);
   const down = B.hp <= 0 || energy > settings.knockdown * (B.isPlayer ? 0.9 : 1); // (the player stays up a little less)
   // an opponent already throwing its blow takes a light one through it (it sways, the blow goes on): a trade
-  const armored = !B.isPlayer && B.state === 'attack' && B.attack?.spliced && !down && energy < 30;
+  const armored = !counter && !B.isPlayer && B.state === 'attack' && B.attack?.spliced && !down && energy < 18;
   if (!armored) {
     B.state = down ? 'fall' : 'hit';
     B.until = clock + 3;
@@ -1192,8 +1252,19 @@ function land(A, B, energy, dir, at, isHead) {
   }
   B.body.flash = 1;
   // the stop and the shake grow with the blow (a heavy one is felt, an ordinary one only marked)
-  hitstop = down ? 0.04 : energy < 45 ? clamp(0.02 + energy / 1500, 0.02, 0.05) : clamp(0.05 + energy / 2000, 0.05, 0.09);
-  shake = Math.max(shake, energy < 45 ? clamp(energy / 900, 0.01, 0.04) : clamp(energy / 500, 0.06, 0.14));
+  hitstop = down ? 0.12 : energy < 45 ? clamp(0.04 + energy / 1200, 0.04, 0.08) : clamp(0.08 + energy / 2000, 0.08, 0.12);
+  shake = Math.max(shake, energy < 45 ? clamp(energy / 600, 0.02, 0.06) : clamp(energy / 500, 0.06, 0.14));
+  // the player hurt: felt (a red edge, a stronger shake and stop, the camera knocked along the blow) and reeling a
+  // moment (sluggish, presses held), so the blow reads
+  if (B.isPlayer) {
+    hurt = Math.max(hurt, clamp(energy / 60, 0.35, 1));
+    shake = Math.max(shake, clamp(energy / 250, 0.05, 0.18));
+    hitstop = Math.max(hitstop, clamp(0.06 + energy / 1300, 0.06, 0.12));
+    camKick.addScaledVector(flat(dir).normalize(), clamp(energy / 400, 0.04, 0.14));
+    B.stun = clock + clamp(0.25 + energy / 120, 0.3, 0.9);
+  }
+  damageNumber(at, counter ? `カウンター -${Math.round(dmg)}` : `-${Math.round(dmg)}`, B.isPlayer ? '#ff5050' : counter ? '#ffd040' : '#ffffff', (B.isPlayer ? 20 : 15) + Math.min(16, energy / 5));
+  if (counter) spark(at, energy * 1.3, 0xffc030);
   if (down || energy > 60) slowUntil = performance.now() + clamp(energy * 4, 160, 420); // a heavy one: a moment of slow motion
   if (!B.isPlayer && down) crew.watchUntil = clock + 0.6; // the others hold back a moment
   if (!armored && (B.state === 'attack' || B.attack)) B.attack = null; // a hit cancels the one hit's own strike
@@ -1201,7 +1272,7 @@ function land(A, B, energy, dir, at, isHead) {
   if (B.isPlayer && B.strikeInput?.id) plog?.pressResult(B.strikeInput.id, 'lost:hit');
   if (!armored) B.attackQueued = null;
   if (B.hp <= 0) B.ko = true;
-  lastHit = { energy, dmg, isHead, by: A.isPlayer ? 'あなた' : '相手', t: clock, tier: down ? (energy > settings.knockdown * 1.2 ? 'fly' : 'down') : energy >= 45 ? 'heavy' : 'hit', victim: B.id, striker: A.id, pressId: A.attack?.pressId ?? 0 };
+  lastHit = { energy, dmg, isHead, by: A.isPlayer ? 'あなた' : '相手', t: clock, tier: down ? (energy > settings.knockdown * 1.2 ? 'fly' : 'down') : energy >= 45 ? 'heavy' : 'hit', victim: B.id, striker: A.id, pressId: A.attack?.pressId ?? 0, counter };
   hudFight();
 }
 let lastHit = null, hitstop = 0, shake = 0, slowUntil = 0;
@@ -1221,7 +1292,7 @@ function spawn() {
   const h = rig.heading(player.P) + (others ? (others % 2 ? 0.9 : -0.9) : 0), d = 5.5;
   const pos = flat(player.P[0]).add(new Vector3(Math.sin(h), 0, Math.cos(h)).multiplyScalar(d));
   const e = new Fighter(false, 0x7f97c9, pos, h + Math.PI);
-  e.hp = e.maxHp = 120 + 15 * Math.min(kos, 6);
+  e.hp = e.maxHp = 150 + 15 * Math.min(kos, 6);
   fighters.push(e);
   hudFight();
 }
@@ -1254,7 +1325,16 @@ function think(E, dt) {
   let goal;
   const playerDown = P.state === 'down' || P.state === 'fall' || P.state === 'getup';
   E.mode = 'foot';
-  if (playerDown || clock < crew.watchUntil) {
+  if (!playerDown) B.groundAttack = null;
+  else if (B.groundAttack == null) B.groundAttack = Math.random() < 0.55;
+  if (playerDown && fighting && B.groundAttack && clock > crew.watchUntil) {
+    E.mode = 'lunge';
+    goal = pp.clone().addScaledVector(to, -1.0);
+    if (E.state === 'free' && d < 1.4 && clock > B.nextAttack) {
+      E.aim = { enemy: P, part: Math.random() < 0.5 ? 'body' : 'legs', joint: I.Spine2, off: new Vector3() };
+      if (strike(E, 'kick') === 'started') B.nextAttack = clock + rand(1.0, 1.6);
+    }
+  } else if (playerDown || clock < crew.watchUntil) {
     E.mode = 'hold';
     goal = pp.clone().addScaledVector(to, -2.4).addScaledVector(side, 0.5 * Math.sin(clock + B.bob));
   } else if (!fighting) {
@@ -1268,21 +1348,26 @@ function think(E, dt) {
     const r = B.range + 0.3 * Math.sin(clock * 3.6 + B.bob);
     goal = pp.clone().addScaledVector(to, -r).addScaledVector(side, 0.7 * B.circle);
     // the player winds up close: step out of it now and then (back and to a side)
-    if (P.state === 'attack' && P.attack && !P.attack.landed && d < 1.6 && clock > B.evadeUntil + 0.6 && Math.random() < dt * 4) { B.evadeUntil = clock + 0.35; B.evDir = Math.random() < 0.5 ? -1 : 1; }
+    if (clock > (E.exposed ?? 0) && P.state === 'attack' && P.attack && !P.attack.landed && d < 1.6 && clock > B.evadeUntil + 0.6 && Math.random() < dt * 4) { B.evadeUntil = clock + 0.35; B.evDir = Math.random() < 0.5 ? -1 : 1; }
     if (clock < B.evadeUntil) E.mode = 'evade';
     if (clock < B.evadeUntil) goal = ep.clone().addScaledVector(to, -0.7).addScaledVector(side, 0.6 * B.evDir);
     // driving in to strike
     if (clock < B.lungeUntil) { goal = pp.clone().addScaledVector(to, 0.3); E.mode = 'lunge'; }
     // strike: in range, its turn
+    if (clock < (E.exposed ?? 0)) B.nextAttack = Math.max(B.nextAttack, E.exposed + rand(0.3, 0.6));
     if (E.state === 'free' && clock > B.nextAttack && clock > B.evadeUntil) {
       if (d > 1.5) { if (d < 2.4) { B.lungeUntil = clock + 0.3; B.nextAttack = clock + 0.15; } }
       else {
         const kind = d > 1.2 ? (Math.random() < 0.6 ? 'kick' : 'punch') : Math.random() < 0.75 ? 'punch' : 'kick';
         const u = Math.random(), part = kind === 'kick' && u < 0.3 ? 'legs' : u < 0.6 ? 'head' : 'body';
         E.aim = { enemy: P, part, joint: part === 'head' ? I.Head : part === 'body' ? I.Spine2 : I.LeftShin, off: new Vector3() };
-        if (strike(E, kind) === 'started') {
-          B.combo = Math.random() < 0.5 ? (Math.random() < 0.4 ? 2 : 1) : 0;
-          B.nextAttack = clock + rand(0.7, 1.5);
+        // one at a time: the other waits a moment after one starts (a one-two from two sides, never together)
+        if (clock - (crew.lastStrikeAt ?? -9) < 0.45 && crew.lastStriker !== E) B.nextAttack = clock + rand(0.15, 0.3);
+        else if (strike(E, kind) === 'started') {
+          crew.lastStrikeAt = clock; crew.lastStriker = E;
+          E.antic = { t0: clock, side: Math.random() < 0.5 ? 1 : -1 }; // the wind-up shows
+          B.combo = Math.random() < 0.65 ? (Math.random() < 0.4 ? 2 : 1) : 0;
+          B.nextAttack = clock + rand(0.45, 1.0);
         } else B.nextAttack = clock + 0.2;
       }
     }
@@ -1462,7 +1547,7 @@ function knockOn(F) {
 }
 function homing(F) {
   const A = F.attack, o = F.aim?.enemy ?? F.opponent;
-  if (F.state !== 'attack' || !A?.key || A.landed || !o || F.track.tag.kind !== 'attack' || /ForeArm|Shin/.test(A.part)) return;
+  if (F.state !== 'attack' || !A?.key || A.landed || !o || ['down', 'getup', 'fall'].includes(o.state) || F.track.tag.kind !== 'attack' || /ForeArm|Shin/.test(A.part)) return;
   const tip = rig.positions(F.shown)[I[A.part]];
   const k = A.key;
   const goal = F.aim && F.aim.part !== 'legs' ? o.P[F.aim.joint].clone().add(F.aim.off) : k.family === 'low' ? o.P[I.LeftShin].clone().lerp(o.P[I.RightShin], 0.5) : k.high ? o.P[I.Head].clone() : o.P[I.Spine2].clone();
@@ -1602,7 +1687,7 @@ function ragStep(F, dt) {
   const u = down ? 0 : clamp(F.ragT / F.ragRecover, 0, 1);
   const loose = F.ragLoose + (1 - F.ragLoose) * u * u;
   R.k = F.ragK.map(k => k * (down ? Math.max(F.ragLoose, 0.25) : loose));
-  R.rootK = down ? 2500 : 600 + 2400 * u;
+  R.rootK = down || F.state === 'down' || F.state === 'getup' ? 2500 : 600 + 2400 * u;
   const contact = F.ragFeetFree || down ? [0, 0, 0, 0] : null;
   // (the ragdoll keeps its own state: a reset, should it drift far from the motion, is not shown as a jump)
   const before = R.x[0].clone();
@@ -1612,7 +1697,8 @@ function ragStep(F, dt) {
   if (R.x[0].distanceTo(before) > 0.3 || drift > 0.45) F.ragFade = true;
   // back to the motion once firm again; on the floor (lying, stirring) the motion's own; drifting off: at once
   if (F.ragFade) F.ragW = Math.max(0, F.ragW - dt / 0.12);
-  else if (F.state === 'down' || F.state === 'getup') F.ragW = Math.max(0, F.ragW - dt / 0.4);
+  else if (F.state === 'down') F.ragW = Math.max(0.35, F.ragW - dt / 0.4);
+  else if (F.state === 'getup') F.ragW = Math.max(0, F.ragW - dt / 0.4);
   else if (!down && u >= 1) F.ragW = Math.max(0, F.ragW - dt / 0.2);
   if (F.ragW <= 0) { F.ragOn = false; F.ragFade = false; return; }
   F.shown = lerpPose(F.shown, ragged, F.ragW);
@@ -1622,9 +1708,10 @@ function takeStrikeInput() {
   const P = player, inp = P?.strikeInput;
   if (!inp) return;
   const t = typeof inp === 'number' ? inp : inp.t, kind = typeof inp === 'number' ? null : inp.kind, id = inp.id;
-  if (clock - t > 0.3 || P.state === 'down' || P.state === 'fall' || P.state === 'getup') { if (clock - t > 0.3) { P.strikeInput = null; plog?.pressResult(id, `expired:${P.state}`); } return; }
+  const keep = Math.max(0.3, (P.stun ?? 0) - t + 0.15); // (a press while reeling waits for the end of it)
+  if (clock - t > keep || P.state === 'down' || P.state === 'fall' || P.state === 'getup') { if (clock - t > keep) { P.strikeInput = null; plog?.pressResult(id, `expired:${P.state}`); } return; }
   // reeling from a light blow: after a quarter of a second the player can hit back (a press is not lost in a trade)
-  if (P.state === 'hit') { if (clock - (P.hitAt ?? 0) > 0.25) P.state = 'free'; else return; }
+  if (P.state === 'hit') { if (clock - (P.hitAt ?? 0) > 0.25 && clock > (P.stun ?? 0)) P.state = 'free'; else return; }
   P.strikeInput = null;
   plog?.pressResult(id, strike(P, kind, id));
 }
@@ -1637,7 +1724,7 @@ const camTarget = new Vector3(0, 0.9, 0), camSide = new Vector3(1, 0, 0);
 function simulate(dt) {
   if (!db) return;
   if (settings.trigger !== 'auto') takeStrikeInput();
-  if (hitstop > 0) { hitstop -= dt; scheduler.tick(fighters.filter(f => f.state !== 'out').map(f => f.track)); return; } // a landed blow holds the picture a moment (the model keeps working)
+  // (a landed blow: time runs at 15 % for a moment - see frame(); the struck body's ragdoll keeps reeling at more)
   if (player && fighters.filter(f => !f.isPlayer && f.state !== 'out').length < settings.enemies && clock > spawnAt) { spawn(); spawnAt = clock + 1.5; }
   // the player's leash on the hips
   if (player) {
@@ -1657,8 +1744,25 @@ function simulate(dt) {
       if (goal.distanceTo(hips) < 0.2) goal = null; // close enough: stand
     }
     if (player.aim) player.lookAt = player.aim.enemy.P[player.aim.joint].clone().add(player.aim.off); // on what the cursor is on
-    player.spring = { target: goal && free ? goal.clone() : null };
-    springStep(player.vel, flat(player.P[0]), player.spring.target, dt);
+    const reeling = player.state === 'hit' && player.stun && clock < player.stun;
+    player.spring = { target: goal && (free || reeling) ? goal.clone() : null };
+    // a dodge: a quick flick of the cursor to the side (or back) while an opponent close by is winding up
+    {
+      const c = cursorFloor();
+      if (c && player.cPrev) { player.cVel = (player.cVel ?? new Vector3()).lerp(flat(c.clone().sub(player.cPrev)).divideScalar(dt), 0.5); }
+      player.cPrev = c ? c.clone() : null;
+      const threat = enemies().find(E => E.state === 'attack' && E.attack && !E.attack.followed && flat(E.P[0]).distanceTo(flat(player.P[0])) < 2.2);
+      if (threat && player.cVel && (player.state === 'free' || player.state === 'attack') && clock > (player.dodge?.at ?? -9) + 0.6) {
+        const along = flat(threat.P[0].clone().sub(player.P[0])).normalize(), v = player.cVel;
+        const par = v.dot(along), perp = v.clone().addScaledVector(along, -par).length();
+        if ((perp > 1.8 && Math.abs(par) < 0.8 * perp) || par < -1.8) {
+          player.dodge = { at: clock, until: clock + 0.3, iframes: clock + 0.22 };
+          player.vel.addScaledVector(v.clone().setY(0).normalize(), 1.6); // the burst of the step
+          plog?.note('dodge', { from: threat.id });
+        }
+      }
+    }
+    springStep(player.vel, flat(player.P[0]), player.spring.target, dt, feelOf(player));
     if (!free) player.vel.multiplyScalar(Math.exp(-dt * 4));
     // striking: the spring's speed follows what the body really does (no speed stored up for a lurch afterwards)
     if (player.state === 'attack' && player.prevP) player.vel.lerp(flat(player.P[0].clone().sub(player.prevP[0])).divideScalar(dt), 1 - Math.exp(-dt * 6));
@@ -1680,7 +1784,7 @@ function simulate(dt) {
       F.want.copy(F.vel);
     }
     // states end
-    if (F.state !== 'free' && F.state !== 'out' && clock > F.until && !F.track.busy) {
+    if (F.state !== 'free' && F.state !== 'out' && (clock > F.until || (F.state === 'down' && !F.ko && F.until - clock < scheduler.latency + 0.1)) && !F.track.busy) {
       if (F.state === 'down') {
         if (F.ko && !F.isPlayer) { F.state = 'out'; F.outAt = clock; kos++; spawnAt = clock + 2.5; hudFight(); }
         else { F.track.request(getupReq(F)); F.state = 'getup'; F.until = clock + 5; if (F.isPlayer && F.hp <= 0) F.hp = F.maxHp; }
@@ -1699,7 +1803,7 @@ function simulate(dt) {
     F.planTimer -= dt;
     // the player is not held by its own follow-through or a light blow: pulled, it moves on (close in, nothing
     // should feel stuck)
-    if (F.isPlayer && F.spring?.target && ((F.state === 'attack' && F.attack?.followSpliced && clock - F.attack.followSpliced > 0.08) || (F.state === 'hit' && clock - (F.hitAt ?? 0) > 0.3))) {
+    if (F.isPlayer && F.spring?.target && ((F.state === 'attack' && F.attack?.followSpliced && clock - F.attack.followSpliced > 0.08) || (F.state === 'hit' && clock - (F.hitAt ?? 0) > 0.3 && clock > (F.stun ?? 0)))) {
       F.state = 'free'; F.planTimer = 0;
     }
     if (F.state === 'free' && scheduler.ready && !F.track.busy) {
@@ -1717,10 +1821,11 @@ function simulate(dt) {
   for (const F of fighters) {
     F.prevP = F.P;
     F.shown = clonePose(F.track.display);
-    ragStep(F, dt);
+    ragStep(F, hitstop > 0 ? dt * 4 : dt);
     knockOn(F);
     footLock(F);
-    if (F.isPlayer) { anticipate(F); homing(F); }
+    anticipate(F);
+    if (F.isPlayer) homing(F);
     F.P = rig.positions(F.shown);
     if (F.P[0].distanceTo(F.prevP[0]) > 0.3) jumps.push({ t: +clock.toFixed(2), who: F.isPlayer ? 'P' : 'E', state: F.state, d: +F.P[0].distanceTo(F.prevP[0]).toFixed(2), match: F.lastMatch?.name, kind: F.lastMatch?.kind, splices: F.track.splices, frames: F.track.frames.length, t2: +F.track.t.toFixed(1) });
   }
@@ -1753,7 +1858,10 @@ function simulate(dt) {
 }
 
 function frame(now) {
-  const dt = Math.min(0.1, (now - last) / 1000) * (now < slowUntil ? 0.35 : 1);
+  const real = Math.min(0.1, (now - last) / 1000);
+  if (hitstop > 0) hitstop -= real;
+  hurt = Math.max(0, hurt - real / 0.35);
+  const dt = real * (hitstop > 0 ? 0.15 : now < slowUntil ? 0.35 : 1);
   last = now;
   acc += dt;
   while (acc >= STEP) { simulate(STEP); acc -= STEP; }
@@ -1772,7 +1880,9 @@ function frame(now) {
     camTarget.lerp(new Vector3(mid.x, 0.95, mid.z), 1 - Math.exp(-dt * 3));
     camera.position.copy(camTarget).addScaledVector(camSide, dist).add(new Vector3(0, 1.2, 0));
     camera.lookAt(camTarget);
-    if (shake > 0.001) { camera.position.add(new Vector3(rand(-1, 1), rand(-1, 1), rand(-1, 1)).multiplyScalar(shake)); shake *= Math.exp(-dt * 12); }
+    if (shake > 0.001) { camera.position.add(new Vector3(rand(-1, 1), rand(-1, 1), rand(-1, 1)).multiplyScalar(shake)); shake *= Math.exp(-real * 12); }
+    camera.position.add(camKick); camKick.multiplyScalar(Math.exp(-real / 0.08));
+    hurtEl.style.opacity = hurt.toFixed(2);
     stage.followFloor(player.P[0]);
   }
   stage.render();

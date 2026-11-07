@@ -79,7 +79,7 @@ export function createPlayLog(ctx) {
     const fol = follow(F);
     const reacts = [...given, ...taken].filter(e => !e.touch && !e.blocked);
     const fallsHere = reacts.filter(e => e.fall);
-    const downEnds = E.filter(e => e.type === 'downEnd');
+    const downEnds = E.filter(e => e.type === 'downEnd' && e.next !== 'out'); // (alive: a knocked-out body may lie still)
     return {
       sec: +sec.toFixed(1), nearSec: +(near / FPS).toFixed(1),
       flatFrac: near ? +(flat / near).toFixed(2) : null, longestLull: lulls.length ? Math.max(...lulls) : 0, lulls,
@@ -102,10 +102,11 @@ export function createPlayLog(ctx) {
       enemyStunned: n ? +(F.filter(fr => fr.es >= 3).length / n).toFixed(2) : null,
       enemyAttackerNear: n ? +(F.filter(fr => fr.att && fr.near).length / Math.max(1, near)).toFixed(2) : null,
       // blows and falls
-      reactDelay: med(reacts.map(e => e.react)), knockDelay: med(reacts.map(e => e.knock)),
+      reactDelay: med(reacts.map(e => e.react)), knockDelay: med(reacts.filter(e => ['heavy', 'down', 'fly'].includes(e.tier)).map(e => e.knock)),
       reactDisp: med(reacts.map(e => e.disp06)),
       reactSpread: reacts.length > 2 ? +Math.sqrt(mean(reacts.map(e => (e.disp06 ?? 0) ** 2)) - (mean(reacts.map(e => e.disp06 ?? 0)) ** 2)).toFixed(2) : null,
-      falls: fallsHere.length, fallKinds: new Set(fallsHere.map(e => e.fall.name)).size,
+      falls: fallsHere.length, fallKinds: new Set(fallsHere.map(e => e.fall.name)).size, kos: E.filter(e => e.type === 'ko').length, dodges: E.filter(e => e.type === 'dodge').length, dodged: E.filter(e => e.type === 'dodged').length, counters: given.filter(e => e.counter).length,
+      playerStill: n ? +(F.filter(fr => fr.ps >= 3 && fr.hv < 0.05).length / n).toFixed(2) : null,
       downStill: downEnds.length ? +mean(downEnds.map(e => e.still)).toFixed(2) : null,
       downMotion: downEnds.length ? +mean(downEnds.map(e => e.motion)).toFixed(2) : null,
       meanDist: n ? +(F.reduce((a, fr) => a + fr.d, 0) / n).toFixed(2) : null,
@@ -136,7 +137,7 @@ export function createPlayLog(ctx) {
     const lh = ctx.lastHit;
     if (lh && lh !== lastHit) {
       lastHit = lh;
-      const e = ev(lh.by === 'あなた' ? 'hit' : 'taken', { energy: +lh.energy.toFixed(1), tier: lh.tier, touch: !!lh.touch, slam: !!lh.slam, blocked: !!lh.blocked, head: !!lh.isHead, victim: lh.victim, pressId: lh.pressId || null });
+      const e = ev(lh.by === 'あなた' ? 'hit' : 'taken', { energy: +lh.energy.toFixed(1), tier: lh.tier, counter: !!lh.counter, touch: !!lh.touch, slam: !!lh.slam, blocked: !!lh.blocked, head: !!lh.isHead, victim: lh.victim, pressId: lh.pressId || null });
       const pr = lh.pressId && pressById.get(lh.pressId);
       if (pr && lh.by === 'あなた' && pr.tContact == null) { pr.tContact = +(clock - pr.t).toFixed(2); pr.energy = e.energy; pr.tier = lh.tier; }
       const V = ctx.fighters.find(f => f.id === lh.victim);
@@ -310,6 +311,7 @@ export function createPlayLog(ctx) {
       a.href = URL.createObjectURL(blob); a.download = name; a.click(); URL.revokeObjectURL(a.href);
     }
   }
+  function note(type, data = {}) { ev(type, data); }
   function press(kind) {
     const p = { id: ++pressSeq, kind, t: +ctx.clock.toFixed(3), f: frames.length, outcome: null };
     presses.push(p); pressById.set(p.id, p);
@@ -324,5 +326,5 @@ export function createPlayLog(ctx) {
     else p.later = outcome;
   }
   addEventListener('pagehide', () => { if (local) navigator.sendBeacon?.(`/save/play_${sid}_log.json`, json()); });
-  return { step: stepLog, press, pressResult, save, download, get sid() { return sid; }, get local() { return local; }, summary: () => summarize({ f0: 0, f1: frames.length, events }), segments, frames, events, presses };
+  return { step: stepLog, press, pressResult, note, save, download, get sid() { return sid; }, get local() { return local; }, summary: () => summarize({ f0: 0, f1: frames.length, events }), segments, frames, events, presses };
 }
