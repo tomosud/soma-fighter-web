@@ -33,9 +33,8 @@
   <div class="fight-info">倒した数 <b id="kos">0</b><span id="last-hit"></span></div>
 
   <div class="fight-guide">
-    <div><b>左ボタン</b>（どこでも）：押したまま動かすと、腰を引いてそちらへ動く。相手の方を向いたまま、離れると下がり、横へ回る</div>
-    <div><b>右ボタン</b>：打つ（今の動きに合ったパンチ・キックが出る。勢いがそのまま強さ）</div>
-    <div>攻撃のきっかけ：<label><input type="radio" name="trigger" value="click"> 右クリック</label><label><input type="radio" name="trigger" value="ram"> 勢いよくぶつかる</label></div>
+    <div><b>左ボタン</b>（どこでも）：押したまま動かすと、腰がばねで指へ引かれる。勢いがつき、切り返すと振り子のように強く戻る。いつも相手の方を向く</div>
+    <div><b>打つ</b>：相手へ勢いよく向かうと、ぶつかる所へ打撃が出る（速く突っ込むほど重い技、勢いがそのまま強さ）</div>
     <div>同時の相手：<a href="?enemies=1">1</a> · <a href="?enemies=2">2</a> · <a href="?enemies=3">3</a></div>
     <div id="db-info">参考ポーズを読み込み中…</div>
   </div>
@@ -45,7 +44,7 @@
   <section id="overlay">
     <div class="card">
       <h1>SOMA Brawl</h1>
-      <p>腰を引っ張って動き、右クリックで打ちます。相手は一人ずつ現れ、倒すと次が来ます。動きはすべて、Mixamo のアニメーションから作った参考ポーズの中からモーションマッチングで選び、そこまでを NVIDIA の MotionBricks（SOMA）がブラウザの中で生成します。当たりの強さは、当たった手足の速さから計算した運動エネルギーで決まります。</p>
+      <p>腰を引っ張って動き、勢いよく相手へ向かうと打ちます。相手は一人ずつ現れ、倒すと次が来ます。動きはすべて、Mixamo のアニメーションから作った参考ポーズの中からモーションマッチングで選び、そこまでを NVIDIA の MotionBricks（SOMA）がブラウザの中で生成します。当たりの強さは、当たった手足の速さから計算した運動エネルギーで決まります。</p>
       <fieldset>
         <legend>モデル</legend>
         <label><input type="radio" name="model" value="fp16" checked> Mixed FP16（380 MB、おすすめ）</label>

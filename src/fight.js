@@ -17,6 +17,7 @@ import { Track, Scheduler, BATCH } from './motion.js';
 import { Stage, Mannequin } from './render.js';
 import { rotateSubtree, twoBoneIK } from './poses.js';
 import { PoseDB, queryFeatures, weightVector, meanHeading, bodyFrame, AHEAD, TRAJ, DIM } from './posedb.js';
+import { Ragdoll } from './ragdoll.js';
 
 const MB_REV = '54fc563aeaaf819a753d72cc9fdc6713989cdd43';
 const MODELS = {
@@ -42,7 +43,8 @@ const worker = new Worker(new URL('./infer.worker.js', import.meta.url), { type:
 const scheduler = new Scheduler(rig, worker);
 
 const settings = {
-  vmax: 2.0, stiff: 2.4, replan: 0.2, stay: 0.85,
+  vmax: 3.5, replan: 0.2, stay: 0.85,
+  spring: { k: 14, c: 2.6, coast: 3 }, // the player's hips on a spring to the pointer (1/s^2, 1/s): under-damped, so it swings
   trigger: params.get('trigger') ?? 'click', // 'click' (right button) or 'ram' (strike when the body drives into the opponent)
   enemies: clamp(Number(params.get('enemies') ?? 1), 1, 3), // how many opponents at once
   w: { feetPos: 1, feetVel: 0.75, hipsVel: 1, hipsH: 0.7, hipsVy: 0.8, hands: 0.3, head: 0.3, handsVel: 0.1, trajPos: 1, trajDir: 1.2, handle: 1.5, trajH: 1 },
@@ -124,6 +126,8 @@ function buildKeys(d) {
         if (dd > bd) { bd = dd; best = f; }
       }
       const name = c.name.toLowerCase();
+      // falls: only from standing to lying (not a landing from a height, not a dive), lying at the chosen moment
+      if (c.tag === 'fall' && (/land|mid_air|in_the_air|falling_idle|jump|explosion|flying|dive|roll/.test(name) || d.pose(k, best).root.y > 0.45)) return;
       const where = /head|face|jaw|chin|nose/.test(name) ? 'head' : /body|stomach|rib|kidney|liver|side|gut|chest/.test(name) ? 'body' : 'any';
       for (const mirrored of [false, true]) {
         const key = { clip: k, name: c.name, frames: keyFrames(d, k, best, mirrored), where, strength: bd };
@@ -274,13 +278,26 @@ class Fighter {
 }
 
 /** Hips path at TRAJ frames: velocity easing toward the wanted one, the facing turning toward the opponent. */
+/**
+ * The player's hips are a weight on a spring to the pointer: the force is k * stretch - c * velocity, so pulling
+ * the other way makes the body swing back hard (like a yo-yo) and a body that is moving keeps its momentum.
+ * Let go and it coasts to a stop.
+ */
+function springStep(v, pos, target, dt) {
+  const sp = settings.spring;
+  const a = target ? flat(target.clone().sub(pos)).multiplyScalar(sp.k).addScaledVector(v, -sp.c) : v.clone().multiplyScalar(-sp.coast);
+  v.addScaledVector(a, dt);
+  v.y = 0;
+  if (v.length() > settings.vmax) v.setLength(settings.vmax);
+  return v;
+}
 function predict(F, pose, heading) {
   let yaw = heading;
   const p = flat(pose.root), v = F.vel.clone();
   const opp = F.opponent;
   const out = [];
   for (let k = 1; k <= TRAJ.at(-1); k++) {
-    approach(v, F.want, 1 / FPS);
+    if (F.spring) springStep(v, p, F.spring.target, 1 / FPS); else approach(v, F.want, 1 / FPS);
     p.addScaledVector(v, 1 / FPS);
     const face = opp && F.state !== 'fall' && F.state !== 'down' ? Math.atan2(opp.P[0].x - p.x, opp.P[0].z - p.z) : (v.length() > 0.3 ? Math.atan2(v.x, v.z) : yaw);
     yaw += clamp(wrap(face - yaw), -4.5 / FPS, 4.5 / FPS);
@@ -433,13 +450,20 @@ function strikeReq(F) {
       const head = opp ? opp.P[I.Head].clone().add(new Vector3(0, -0.02, 0)) : A.clone().add(new Vector3(Math.sin(yaw), 1.5, Math.cos(yaw)));
       const body = opp ? opp.P[I.Spine2].clone() : head.clone().setY(1.1);
       const speedIn = opp ? F.vel.dot(flat(opp.P[0].clone().sub(A)).normalize()) : 0;
+      // where the bodies will be when the strike lands (about 0.4 s on): the body carries on with its momentum
+      const tLand = scheduler.latency * 0 + 0.38;
+      const carry = F.vel.clone().multiplyScalar(tLand).clampLength(0, 1.2);
+      const oppAhead = opp ? opp.vel.clone().multiplyScalar(tLand + scheduler.latency).clampLength(0, 0.8) : new Vector3();
+      head.add(oppAhead); body.add(oppAhead);
+      A.add(carry);
       let best = null, bc = Infinity;
       for (const k of strikeKeys) {
         const goal = local(k.high ? head : body);
         const step = clamp(goal.z - k.tip.z, -0.15, WIND[k.kind]);
         let cost = Math.abs(goal.z - k.tip.z - step) * 4 + Math.abs(goal.y - k.tip.y) * 2 + Math.abs(goal.x - k.tip.x) * 1.5;
         cost += (k.clip === F.lastStrike ? 1.5 : 0) + (k.clip === F.lastStrike2 ? 0.7 : 0) + Math.random() * 0.8;
-        if (speedIn > 0.8 && (k.kind === 'kick' || step > 0.3)) cost -= 0.4; // coming in fast: a kick or a stepping blow
+        if (speedIn > 2.2 && (k.kind === 'kick' || k.kind === 'knee')) cost -= 0.8; // charging in: a kick or a knee
+        else if (speedIn > 1.2 && step > 0.3) cost -= 0.4; // coming in: a stepping blow
         if (cost < bc) { bc = cost; best = { k, step, goal }; }
       }
       if (!best) return planReq(F, 'move').build(tr, a, ctx);
@@ -537,6 +561,25 @@ function recoverReq(F) {
     },
   };
 }
+// An unseen ragdoll takes the blow: the body as it is, an impulse where the blow lands, muscles and footing loosened
+// for a moment; a third of a second on, where it has been knocked to is the target, and where its centre of mass is
+// heading says whether a foot must step out to catch it (or whether it goes down).
+const rd = new Ragdoll(rig);
+function takeBlow(pose, at, impulse) {
+  rd.reset(pose);
+  const keepK = rd.k.slice(), keepRoot = rd.rootK;
+  rd.k = rd.k.map(k => k * 0.3);
+  rd.rootK = 60;
+  const order = rd.x.map((x, i) => [x.distanceTo(at), i]).sort((a, b) => a[0] - b[0]).slice(0, 4);
+  const wsum = order.reduce((a, [d]) => a + 1 / (d + 0.05), 0);
+  for (const [d, i] of order) rd.v[i].addScaledVector(impulse, (1 / (d + 0.05)) / wsum / rd.mass[i]);
+  for (let t = 0; t < 0.32; t += 1 / 120) rd.step(1 / 120, pose, [1, 1, 1, 1], null);
+  const out = rd.pose(pose);
+  const { pos, vel } = rd.com();
+  const cp = pos.clone().addScaledVector(vel, 0.31);
+  rd.k = keepK; rd.rootK = keepRoot;
+  return { pose: out, cp: flat(cp), push: flat(vel) };
+}
 /** Hit: the reaction built from the blow, mixed with a reference reaction at its strongest; then back. */
 function reactReq(F, from, energy, isHead, down, dir = null, hitAt = null) {
   return {
@@ -558,8 +601,21 @@ function reactReq(F, from, energy, isHead, down, dir = null, hitAt = null) {
       const yaw = Math.atan2(-away.x, -away.z); // reactions face the attacker
       let targets = best.frames.map(f => ground(placePose(f, yaw, ZERO, dest)));
       if (!down) {
-        // the impact on the body as it is now, half way into the reference reaction
-        const imp = impactPose(ctx[3], dir ?? away, energy, isHead, hitAt);
+        // the body knocked by the blow (the unseen ragdoll), and, if its centre of mass is heading off its feet,
+        // a foot stepping out under it; the head and trunk turns of the blow on top
+        const J = flat(dir ?? away).normalize().multiplyScalar(Math.sqrt(2 * energy * 4)); // impulse of the limb (kg m/s), as felt
+        J.y = 0.15 * J.length();
+        const blow = takeBlow(ctx[3], hitAt ?? ctx[3].root.clone().setY(1.2), J);
+        const Pk = rig.positions(blow.pose);
+        const feet = { Left: Pk[I.LeftFoot], Right: Pk[I.RightFoot] };
+        const off = Math.min(...['Left', 'Right'].map(sd => blow.cp.distanceTo(flat(feet[sd]))));
+        if (off > 0.25) {
+          const pushDir = blow.push.lengthSq() > 1e-6 ? blow.push.clone().normalize() : away;
+          const back = feet.Left.clone().sub(Pk[0]).dot(pushDir) > feet.Right.clone().sub(Pk[0]).dot(pushDir) ? 'Left' : 'Right';
+          const stepTo = flat(Pk[0]).addScaledVector(pushDir, clamp(off, 0.25, 0.6));
+          legTo(blow.pose, back, new Vector3(stepTo.x, ANKLE, stepTo.z));
+        }
+        const imp = impactPose(blow.pose, dir ?? away, energy * 0.6, isHead, hitAt);
         const L = toLocal(imp), Lr = toLocal(targets[0]);
         L.forEach((q, j) => { if (j > 0) q.slerp(Lr[j], 0.4); });
         const mixed = fromLocalPose(imp.root.clone().lerp(targets[0].root, 0.3), L);
@@ -658,6 +714,7 @@ function land(A, B, energy, dir, at, isHead) {
   hudFight();
 }
 let lastHit = null, hitstop = 0;
+const jumps = [];
 
 // ---------------------------------------------------------------- the player and the opponents
 
@@ -688,11 +745,12 @@ function think(E, dt) {
   E.want.copy(to).multiplyScalar(clamp((d - keep) * 1.4, -0.9, 1.3)).addScaledVector(side, 0.35 * Math.sin(clock * 0.45 + E.maxHp));
   const nearest = P.opponent === E;
   if (!nearest) E.want.addScaledVector(to, -0.4); // the others wait their turn a little further off
-  if (nearest && d < 1.45 && clock > E.nextAttack && P.state !== 'down' && P.state !== 'fall') {
-    E.track.request(strikeReq(E));
-    E.state = 'attack'; E.until = clock + 1.0;
-    E.nextAttack = clock + rand(2.2, 4.0);
+  // now and then the nearest one lunges in (and its strike comes out of the lunge)
+  if (nearest && d < 2.4 && clock > E.nextAttack && P.state !== 'down' && P.state !== 'fall') {
+    E.lungeUntil = clock + 0.6;
+    E.nextAttack = clock + rand(2.4, 4.2);
   }
+  if (clock < (E.lungeUntil ?? 0)) E.want.copy(to).multiplyScalar(2.0);
 }
 
 // ---------------------------------------------------------------- input (no camera control)
@@ -708,7 +766,6 @@ function floorPoint(x, y) {
 }
 canvas.addEventListener('pointerdown', e => {
   if (!player) return;
-  if (e.button === 2) { rightButton(e); return; }
   if (e.button !== 0) return;
   drag = { screen: { x: e.clientX, y: e.clientY }, point: null };
   try { canvas.setPointerCapture(e.pointerId); } catch { /* synthetic */ }
@@ -718,6 +775,26 @@ canvas.addEventListener('pointermove', e => { if (drag) drag.screen = { x: e.cli
 const release = () => { drag = null; if (player) player.planTimer = 0; };
 canvas.addEventListener('pointerup', e => { if (e.button === 0) release(); });
 canvas.addEventListener('pointercancel', release);
+/**
+ * A strike comes from the motion: driving at the opponent fast enough, the strike is set off so that it lands
+ * where the two bodies will meet (the time to contact from the closing speed); the faster the approach, the
+ * heavier the strike (kicks, stepping blows), and the body's momentum goes into it.
+ */
+function autoStrike(F) {
+  const o = F.opponent;
+  if (!o || F.state !== 'free' || clock < (F.strikeAfter ?? 0) || o.state === 'down' || o.state === 'fall') return;
+  const rel = flat(o.P[0].clone().sub(F.P[0])), d = rel.length();
+  if (d > 1.9 || d < 0.3) return;
+  // (the body's actual speed, from what is shown: the commanded one runs ahead of it)
+  const vSelf = flat(F.P[0].clone().sub(F.prevP[0])).multiplyScalar(60), vOpp = flat(o.P[0].clone().sub(o.prevP[0])).multiplyScalar(60);
+  F.vShown = (F.vShown ?? vSelf).lerp(vSelf, 0.2); o.vShown = (o.vShown ?? vOpp).lerp(vOpp, 0.2);
+  const closing = F.vShown.clone().sub(o.vShown).dot(rel.clone().normalize());
+  if (closing < (F.isPlayer ? 1.1 : 0.9)) return;
+  const tc = (d - 0.85) / closing; // until the bodies are at striking distance
+  if (tc > 0.55 || tc < -0.1) return;
+  F.strikeAfter = clock + 0.7;
+  strike(F);
+}
 function strike(F) {
   if (!F.opponent || (F.state !== 'free' && F.state !== 'attack')) return;
   if (F.state === 'attack' && clock < F.until - 0.2) { F.attackQueued = true; return; } // one more right after this one
@@ -726,15 +803,7 @@ function strike(F) {
 }
 // the right button pressed while the left one is held gives no pointerdown (a chorded press): take it from
 // mousedown / contextmenu too (once per press)
-let lastRight = 0;
-function rightButton(e) {
-  e.preventDefault();
-  if (performance.now() - lastRight < 120 || !player) return;
-  lastRight = performance.now();
-  strike(player);
-}
-canvas.addEventListener('mousedown', e => { if (e.button === 2) rightButton(e); });
-canvas.addEventListener('contextmenu', rightButton);
+canvas.addEventListener('contextmenu', e => e.preventDefault());
 
 // ---------------------------------------------------------------- loop
 
@@ -748,20 +817,15 @@ function simulate(dt) {
   // the player's leash on the hips
   if (player) {
     if (drag && !drag.scripted) drag.point = floorPoint(drag.screen.x, drag.screen.y) ?? drag.point;
-    if (drag?.point && (player.state === 'free' || player.state === 'attack')) {
-      const d = flat(drag.point.clone().sub(player.P[0]));
-      const stretch = d.length() - 0.1;
-      player.want.copy(stretch > 0 ? d.normalize().multiplyScalar(settings.vmax * (1 - Math.exp(-stretch * settings.stiff / settings.vmax))) : ZERO);
-    } else player.want.set(0, 0, 0);
-    if (settings.trigger === 'ram' && player.opponent && player.state === 'free') {
-      // drive into the opponent fast enough and the body strikes by itself
-      const o = player.opponent, to = flat(o.P[0].clone().sub(player.P[0]));
-      if (to.length() < 1.5 && player.vel.dot(to.normalize()) > 0.9) strike(player);
-    }
+    const free = player.state === 'free' || player.state === 'attack';
+    player.spring = { target: drag?.point && free ? drag.point.clone() : null };
+    springStep(player.vel, flat(player.P[0]), player.spring.target, dt);
+    if (!free) player.vel.multiplyScalar(Math.exp(-dt * 4));
+    player.want.copy(player.vel);
+    autoStrike(player);
   }
   for (const F of fighters) {
-    if (!F.isPlayer) think(F, dt);
-    approach(F.vel, F.want, dt);
+    if (!F.isPlayer) { think(F, dt); approach(F.vel, F.want, dt); autoStrike(F); }
     // states end
     if (F.state !== 'free' && F.state !== 'out' && clock > F.until && !F.track.busy) {
       if (F.state === 'down') {
@@ -779,7 +843,10 @@ function simulate(dt) {
     F.planTimer -= dt;
     if (F.state === 'free' && scheduler.ready && !F.track.busy) {
       const active = F.want.length() > 0.05 || F.vel.length() > 0.05;
-      const changed = F.want.distanceTo(F.lastWant) > 0.4;
+      // (the player's speed changes all the time on its spring: only grabbing and letting go count as a change)
+      const pulling = !!F.spring?.target;
+      const changed = F.isPlayer ? pulling !== !!F.wasPulling : F.want.distanceTo(F.lastWant) > 0.4;
+      F.wasPulling = pulling;
       if (active && (F.planTimer <= 0 || changed)) { F.track.request(planReq(F, 'move')); F.planTimer = settings.replan; F.lastWant.copy(F.want); }
       else if (!active && F.track.remaining / FPS < scheduler.latency + 0.25) F.track.request(planReq(F, 'move', 'end'));
     }
@@ -790,6 +857,7 @@ function simulate(dt) {
     F.prevP = F.P;
     F.shown = clonePose(F.track.display);
     F.P = rig.positions(F.shown);
+    if (F.P[0].distanceTo(F.prevP[0]) > 0.3) jumps.push({ t: +clock.toFixed(2), who: F.isPlayer ? 'P' : 'E', state: F.state, d: +F.P[0].distanceTo(F.prevP[0]).toFixed(2), match: F.lastMatch?.name, kind: F.lastMatch?.kind, splices: F.track.splices, frames: F.track.frames.length, t2: +F.track.t.toFixed(1) });
   }
   // bodies do not pass through each other: hips closer than 0.7 m are pushed apart (the motion is shifted)
   const live = fighters.filter(f => f.state !== 'out');
@@ -906,7 +974,7 @@ requestAnimationFrame(loop);
 if (params.has('debug')) {
   window.brawl = {
     rig, scheduler, settings, fighters, simulate, strike,
-    get player() { return player; }, get db() { return db; }, get clock() { return clock; }, get kos() { return kos; }, get lastHit() { return lastHit; },
+    get player() { return player; }, jumps, get db() { return db; }, get clock() { return clock; }, get kos() { return kos; }, get lastHit() { return lastHit; },
     pull(point) { drag = point ? { point, scripted: true } : null; },
     draw: () => frame(performance.now()),
     onStep: null,
