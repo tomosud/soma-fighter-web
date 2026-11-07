@@ -1591,6 +1591,7 @@ function simulate(dt) {
   shown.contact = f.contact;
   shownP = rig.positions(shown);
   clock += dt;
+  window.lab?.onStep?.(shown, dt);
   let lookAt = look.detached || !drag || !(drag.part.endsWith('Hand') || drag.part === 'Head') ? look.point : drag.point;
   if (drag && mood.reluctant && !look.detached) { // looks away from where it is being taken
     const away = flat(shownP[0].clone().sub(drag.point)).normalize();
@@ -1818,7 +1819,7 @@ requestAnimationFrame(frame);
 if (params.has('debug')) {
   window.lab = {
     track, scheduler, simulate, settings, ctrl, library, reactions, rig, mirror, kickTarget, camera, stage, look, cascade, ragdoll, get planned() { return planned; }, get deviation() { return deviation; }, get pushedUntil() { return pushedUntil; }, get clock() { return clock; },
-    get shownP() { return shownP; }, get drag() { return drag; }, get bodyMotion() { return bodyMotion; },
+    get shownP() { return shownP; }, get shown() { return shown; }, onStep: null, get drag() { return drag; }, get bodyMotion() { return bodyMotion; },
     // a scripted pull: `point` is used as is (no screen ray)
     pull(part, point) { if (!part) releaseFoot(); drag = part ? { part, point, sent: null, scripted: true, freeArm: freeArmOf(part), start: clonePose(shown), seed: grabSeed() } : null; if (!part) planTimer = 0; },
     poseBook, mood, style, book, get mix() { return mix; }, get lastKick() { return lastKick; },

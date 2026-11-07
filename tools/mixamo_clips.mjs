@@ -49,7 +49,7 @@ function load(file) {
   return { g, bone, clip: g.animations[0] };
 }
 
-function convert(file) {
+export function convert(file) {
   const { g, bone, clip } = load(file);
   g.updateMatrixWorld(true);
   const wq = o => o.getWorldQuaternion(new Quaternion());
@@ -121,22 +121,25 @@ function check(file, frames, scale) {
   return { mean: +(sum / cnt).toFixed(3), worst: +worst.toFixed(3) };
 }
 
-const dir = process.argv[2];
-const out = process.argv[3] ?? path.join(root, 'assets/mixamo_clips.json');
-const files = fs.readdirSync(dir).filter(f => /^mx_.*\.fbx$/i.test(f)).sort();
-const clips = {};
-for (const f of files) {
-  const key = f.replace(/^mx_/, '').replace(/\.fbx$/i, '');
-  const file = path.join(dir, f);
-  const { frames, scale } = convert(file);
-  const err = check(file, frames, scale);
-  // long clips (idles, getting up) are kept at 15 fps; the short ones (kicks, jumps, steps) at 30
-  const step = frames.length > 120 ? 2 : 1;
-  clips[key] = { fps: 30 / step, frames: frames.filter((_, k) => k % step === 0) };
-  console.log(`${key.padEnd(16)} ${String(frames.length).padStart(4)} frames  error mean ${err.mean} m, worst ${err.worst} m`);
+// run as a script (it is also imported by tools/build_posedb.mjs for convert())
+if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'))) {
+  const dir = process.argv[2];
+  const out = process.argv[3] ?? path.join(root, 'assets/mixamo_clips.json');
+  const files = fs.readdirSync(dir).filter(f => /^mx_.*\.fbx$/i.test(f)).sort();
+  const clips = {};
+  for (const f of files) {
+    const key = f.replace(/^mx_/, '').replace(/\.fbx$/i, '');
+    const file = path.join(dir, f);
+    const { frames, scale } = convert(file);
+    const err = check(file, frames, scale);
+    // long clips (idles, getting up) are kept at 15 fps; the short ones (kicks, jumps, steps) at 30
+    const step = frames.length > 120 ? 2 : 1;
+    clips[key] = { fps: 30 / step, frames: frames.filter((_, k) => k % step === 0) };
+    console.log(`${key.padEnd(16)} ${String(frames.length).padStart(4)} frames  error mean ${err.mean} m, worst ${err.worst} m`);
+  }
+  fs.writeFileSync(out, JSON.stringify({
+    about: 'Mixamo animations (X Bot) retargeted to the SOMA rig by tools/mixamo_clips.mjs. SOMA model space, metres, Y up, 30 fps; per frame the hips position and the world rotations of the 30 model joints; `fps` per clip (long clips at 15).',
+    joints: rig.names, clips,
+  }));
+  console.log(`${Object.keys(clips).length} clips -> ${out} (${(fs.statSync(out).size / 1048576).toFixed(1)} MB)`);
 }
-fs.writeFileSync(out, JSON.stringify({
-  about: 'Mixamo animations (X Bot) retargeted to the SOMA rig by tools/mixamo_clips.mjs. SOMA model space, metres, Y up, 30 fps; per frame the hips position and the world rotations of the 30 model joints; `fps` per clip (long clips at 15).',
-  joints: rig.names, clips,
-}));
-console.log(`${Object.keys(clips).length} clips -> ${out} (${(fs.statSync(out).size / 1048576).toFixed(1)} MB)`);
