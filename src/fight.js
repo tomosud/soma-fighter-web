@@ -44,6 +44,7 @@ const scheduler = new Scheduler(rig, worker);
 const settings = {
   vmax: 2.0, stiff: 2.4, replan: 0.2, stay: 0.85,
   trigger: params.get('trigger') ?? 'click', // 'click' (right button) or 'ram' (strike when the body drives into the opponent)
+  enemies: clamp(Number(params.get('enemies') ?? 1), 1, 3), // how many opponents at once
   w: { feetPos: 1, feetVel: 0.75, hipsVel: 1, hipsH: 0.7, hipsVy: 0.8, hands: 0.3, head: 0.3, handsVel: 0.1, trajPos: 1, trajDir: 1.2, handle: 1.5, trajH: 1 },
   damage: { player: 0.9, enemy: 0.45 }, // hp per joule (the opponents hit softer)
   knockdown: 60, // J in one blow that puts the one hit on the floor
@@ -436,7 +437,9 @@ function start() {
   spawnAt = clock + 0.5;
 }
 function spawn() {
-  const h = rig.heading(player.P), d = 5.5;
+  // in front of the player, a little to one side when others are already there
+  const others = fighters.filter(f => !f.isPlayer && f.state !== 'out').length;
+  const h = rig.heading(player.P) + (others ? (others % 2 ? 0.9 : -0.9) : 0), d = 5.5;
   const pos = flat(player.P[0]).add(new Vector3(Math.sin(h), 0, Math.cos(h)).multiplyScalar(d));
   const e = new Fighter(false, 0x7f97c9, pos, h + Math.PI);
   e.hp = e.maxHp = 50 + 10 * Math.min(kos, 5);
@@ -452,7 +455,9 @@ function think(E, dt) {
   const side = new Vector3(to.z, 0, -to.x);
   const keep = P.state === 'down' || P.state === 'fall' ? 2.2 : 1.15;
   E.want.copy(to).multiplyScalar(clamp((d - keep) * 1.4, -0.9, 1.3)).addScaledVector(side, 0.35 * Math.sin(clock * 0.45 + E.maxHp));
-  if (d < 1.45 && clock > E.nextAttack && P.state !== 'down' && P.state !== 'fall') {
+  const nearest = P.opponent === E;
+  if (!nearest) E.want.addScaledVector(to, -0.4); // the others wait their turn a little further off
+  if (nearest && d < 1.45 && clock > E.nextAttack && P.state !== 'down' && P.state !== 'fall') {
     E.track.request(planReq(E, 'attack'));
     E.state = 'attack'; E.until = clock + 1.5;
     E.nextAttack = clock + rand(2.2, 4.0);
@@ -497,7 +502,7 @@ let acc = 0, last = performance.now(), clock = 0, fpsAcc = 0, fpsN = 0, fps = 0;
 const camTarget = new Vector3(0, 0.9, 0), camSide = new Vector3(1, 0, 0);
 function simulate(dt) {
   if (!db) return;
-  if (player && !fighters.some(f => !f.isPlayer && f.state !== 'out') && clock > spawnAt) spawn();
+  if (player && fighters.filter(f => !f.isPlayer && f.state !== 'out').length < settings.enemies && clock > spawnAt) { spawn(); spawnAt = clock + 1.5; }
   // the player's leash on the hips
   if (player) {
     if (drag && !drag.scripted) drag.point = floorPoint(drag.screen.x, drag.screen.y) ?? drag.point;
@@ -638,6 +643,13 @@ $('start').addEventListener('click', () => {
   $('progress').classList.add('show');
   worker.postMessage({ type: 'load', url, ep: params.get('ep') ?? 'webgpu', batch: BATCH });
 });
+// the "how many opponents" links keep the other settings of the address (the model, the trigger)
+for (const el of document.querySelectorAll('a[href^="?enemies="]')) {
+  const u = new URLSearchParams(location.search);
+  u.set('enemies', new URLSearchParams(el.getAttribute('href').slice(1)).get('enemies'));
+  el.href = `?${u}`;
+  if (Number(u.get('enemies')) === settings.enemies) el.style.fontWeight = 'bold';
+}
 for (const el of document.querySelectorAll('input[name=trigger]')) {
   if (el.value === settings.trigger) el.checked = true;
   el.addEventListener('change', () => { settings.trigger = el.value; });
