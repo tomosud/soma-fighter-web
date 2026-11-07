@@ -45,7 +45,7 @@ const scheduler = new Scheduler(rig, worker);
 const settings = {
   vmax: 3.5, replan: 0.2, stay: 0.85,
   spring: { k: 14, c: 2.6, coast: 3 }, // the player's hips on a spring to the pointer (1/s^2, 1/s): under-damped, so it swings
-  trigger: params.get('trigger') ?? 'click', // 'click' (right button) or 'ram' (strike when the body drives into the opponent)
+  trigger: params.get('trigger') ?? 'click', // 'click' (right button) or 'auto' (strikes set off by the motion, as before)
   enemies: clamp(Number(params.get('enemies') ?? 3), 1, 3), // how many opponents at once
   w: { feetPos: 1, feetVel: 0.75, hipsVel: 1, hipsH: 0.7, hipsVy: 0.8, hands: 0.3, head: 0.3, handsVel: 0.1, trajPos: 1, trajDir: 1.2, handle: 1.5, trajH: 1 },
   damage: { player: 0.9, enemy: 0.3 }, // hp per joule (the opponents hit softer)
@@ -58,11 +58,19 @@ const settings = {
 
 const TAGS = ['move', 'stance', 'attack', 'block', 'hit', 'fall', 'getup'];
 const T = Object.fromEntries(TAGS.map((t, k) => [t, k]));
-let db = null, entTag = null, change = null, strikes = [], entryAt = new Map(), standPose = null;
+let db = null, entTag = null, change = null, sunk = null, strikes = [], entryAt = new Map(), standPose = null;
 PoseDB.load(rig, new URL('../assets/fightdb', import.meta.url).href).then(d => {
   db = d;
   entTag = new Uint8Array(d.n);
   change = new Float32Array(d.n);
+  // entries whose motion takes the hips low before its target (a fall, a trip, a slide, a crouch, lying down):
+  // not for moving about (the body would sit down out of nothing)
+  const hipsY = d.clips.map((c, k) => Float32Array.from({ length: c.frames }, (_, f) => d.pose(k, f).root.y));
+  sunk = new Uint8Array(d.n);
+  for (let i = 0; i < d.n; i++) {
+    const ys = hipsY[d.entClip[i]], f0 = d.entFrame[i], f1 = Math.min(ys.length - 1, f0 + AHEAD + 3);
+    for (let f = f0; f <= f1; f++) if (ys[f] < 0.72) { sunk[i] = 1; break; }
+  }
   for (let i = 0; i < d.n; i++) {
     const c = d.clips[d.entClip[i]];
     entTag[i] = T[c.tag ?? 'move'];
@@ -112,6 +120,28 @@ function keyFrames(d, c, f, mirrored, ref = f) {
   const h = rig.heading(rig.positions(p0)), at = flat(p0.root);
   return [0, 1, 2, 3].map(k => placePose(d.pose(c, f + k, mirrored), -h, at, at.clone().negate()));
 }
+/**
+ * What a body is doing, in its own frame (hips at the origin, facing +Z, x to its left), for comparing a moment of
+ * a strike clip with the body now: where the hands and feet are, the hands' speed, the trunk's twist, the hips'
+ * height. Each part scaled to about 1.
+ */
+const FEAT_W = [1, 1, 1, 1, 1, 1, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 1.2, 0.3, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5];
+const FEAT_SUM = FEAT_W.reduce((a, b) => a + b, 0);
+function poseFeat(P, Pnext, dtFrames = 1) {
+  const h = rig.heading(P), c = Math.cos(-h), sn = Math.sin(-h), o = P[0];
+  const loc = v => [(v.x - o.x) * c + (v.z - o.z) * sn, v.y - o.y, -(v.x - o.x) * sn + (v.z - o.z) * c];
+  const f = [];
+  for (const sd of ['Left', 'Right']) { const q = loc(P[I[sd + 'Hand']]); f.push(q[0] / 0.4, q[1] / 0.4, q[2] / 0.4); }
+  for (const sd of ['Left', 'Right']) { const q = loc(P[I[sd + 'Foot']]); f.push(q[0] / 0.35, (q[1] + o.y) / 0.2, q[2] / 0.35); }
+  const sl = loc(P[I.LeftArm]).map((x, i) => x - loc(P[I.RightArm])[i]);
+  f.push(Math.atan2(sl[2], sl[0]) / 0.5, (o.y - 0.95) / 0.1);
+  for (const sd of ['Left', 'Right']) {
+    const a = loc(P[I[sd + 'Hand']]), b = loc(Pnext[I[sd + 'Hand']]);
+    f.push(...[0, 1, 2].map(i => ((b[i] - a[i]) * FPS / dtFrames) / 3));
+  }
+  return f;
+}
+const featCost = (a, b) => a.reduce((s2, x, i) => s2 + FEAT_W[i] * (x - b[i]) ** 2, 0) / FEAT_SUM;
 function buildKeys(d) {
   d.clips.forEach((c, k) => {
     if (c.tag === 'attack' && c.strike && !/getting|hand_stand|restrain/.test(c.name)) {
@@ -121,12 +151,22 @@ function buildKeys(d) {
         const tip = rig.positions(frames[0])[I[part]];
         const kind = /Foot/.test(part) ? 'kick' : /Shin/.test(part) ? 'knee' : /ForeArm/.test(part) ? 'elbow' : 'punch';
         if (tip.z < 0.25) continue; // a strike that does not reach forward (a spin, a back kick)
+        let lowest = 9;
+        for (let f = Math.max(0, c.strike.apex - 10); f <= Math.min(c.frames - 1, c.strike.apex + 12); f++) lowest = Math.min(lowest, d.pose(k, f).root.y);
+        if (lowest < 0.7) continue; // the hips drop (a lunge to the floor, a dive): it reads as sitting down
         // what comes after the top, in the same frame of reference: the swing carrying on (a miss) and the limb
         // coming back a little sooner (a blow that met something)
         const own = (c.own ?? c.frames) - 4;
         const miss = keyFrames(d, k, Math.min(own, c.strike.apex + 9), mirrored, c.strike.apex);
         const hit = keyFrames(d, k, Math.min(own, c.strike.apex + 5), mirrored, c.strike.apex);
-        strikeKeys.push({ clip: k, name: c.name, part, kind, family: familyOf(c.name, kind), frames, tip, high: tip.y > 1.25, miss, hit });
+        // the wind-up (6 and 10 frames before the top, in the top's frame): what the body looks like as the blow
+        // starts, and how far the clip's hips travel into it
+        const chamber = [6, 10].map(N => {
+          const fr = keyFrames(d, k, Math.max(0, c.strike.apex - N), mirrored, c.strike.apex);
+          return { N, pose: fr[0], feat: poseFeat(rig.positions(fr[0]), rig.positions(fr[1])) };
+        });
+        const travel = flat(chamber[0].pose.root).negate().divideScalar(6 / FPS); // (m/s, in the top's frame: +z forward)
+        strikeKeys.push({ clip: k, name: c.name, part, kind, family: familyOf(c.name, kind), frames, tip, high: tip.y > 1.25, miss, hit, chamber, travel });
       }
     }
     if (c.tag === 'block' && !/restrain|transition/.test(c.name)) {
@@ -431,20 +471,20 @@ function planReq(F, kind, mode = 'now') {
           const f = F.current.frame + (mode === 'end' ? AHEAD : a - F.current.anchor);
           const fe = f - (f % 2);
           const i = entryAt.get(`${F.current.clip}:${F.current.mirror ? 1 : 0}:${fe}`);
-          if (i != null && allow.includes(entTag[i])) cont = { i, frame: fe };
+          if (i != null && allow.includes(entTag[i]) && !sunk[i]) cont = { i, frame: fe };
         }
         const recentSet = new Set(F.recent.filter(r => clock - r.t < 1.5).map(r => r.clip));
         const passive = F.vel.length() < 0.05 && F.want.length() < 0.05;
         const calm = kind === 'move' ? (passive ? 2 : 0.4) : 0;
         const bias = i => {
-          if (!allow.includes(entTag[i])) return Infinity;
+          if (!allow.includes(entTag[i]) || (kind === 'move' && sunk[i])) return Infinity;
           let b = calm * change[i];
           if (cont && db.entClip[i] === F.current.clip && db.entFrame[i] < cont.frame && db.entFrame[i] > cont.frame - 40) b += 4;
           if (recentSet.has(db.entClip[i]) && !(cont && db.entClip[i] === F.current.clip)) b += 2;
           return b;
         };
         best = db.search(q, w, bias);
-        if (best.i < 0) best = db.search(q, w, i => (ALLOW.move.includes(entTag[i]) ? 0 : Infinity)); // nothing of that kind
+        if (best.i < 0) best = db.search(q, w, i => (ALLOW.move.includes(entTag[i]) && !sunk[i] ? 0 : Infinity)); // nothing of that kind
         if (cont) {
           const c = costOf(cont.i, q, w) + calm * change[cont.i];
           if (best.cost > settings.stay * c) best = { i: cont.i, cost: c, clip: F.current.clip, frame: cont.frame, mirrored: F.current.mirror, stayed: true };
@@ -510,17 +550,17 @@ const WIND = { punch: 0.5, elbow: 0.35, knee: 0.45, kick: 0.6 }; // how far a st
  * contact played fast enough that the limb is shown at about 8 m/s (so the energy follows the pace), then easing
  * out. Opponents wind up slower (it shows what is coming, so it can be stepped out of).
  */
-function warpStrike(F, frames, part, base) {
+function warpStrike(F, frames, part, base, ready = 0) {
   const j = I[part], n = frames.length;
   const pos = frames.map(f => rig.positions(f.pose)[j]);
   const sp = pos.map((q, i) => (i ? q.distanceTo(pos[i - 1]) * FPS : 0));
   let ip = 1;
   for (let i = 1; i < n; i++) if (sp[i] >= sp[ip]) ip = i;
-  const slow = F.isPlayer ? 0.8 : 0.62;
+  const slow = F.isPlayer ? 1.0 + 0.3 * ready : 0.62, ramp = Math.round(8 - 4 * ready); // (wound up already: a short, quick wind-up)
   for (let i = 0; i < n; i++) {
     let r;
-    if (i < ip - 8) r = slow;
-    else if (i < ip) r = slow + (2.3 - slow) * ((i - (ip - 8)) / 8) ** 1.5;
+    if (i < ip - ramp) r = slow;
+    else if (i < ip) r = slow + (2.3 - slow) * ((i - (ip - ramp)) / ramp) ** 1.5;
     else if (i <= ip + 1) r = clamp(8 / Math.max(sp[i], 0.5), 1.4, 2.8);
     else r = 1.3;
     frames[i].rate = r * base / 1.7;
@@ -542,11 +582,15 @@ function onLegs(strikePose, legPose) {
   q.root.y = 0.5 * (strikePose.root.y + legPose.root.y);
   return rig.fixRigid(q);
 }
-function strikeReq(F, family = null) {
+function strikeReq(F, family = null, mode = 'now') {
   return {
-    kind: 'attack', mode: 'now', interrupt: true,
+    kind: 'attack', mode, interrupt: mode === 'now',
     build(tr, a, ctx) {
       const from = ctx[3];
+      // the body as it will be when the strike starts (the request's context: now + the wait, or the end of a
+      // strike being chained from), and its hands' motion
+      const feat = poseFeat(rig.positions(ctx[2]), rig.positions(from));
+      const hNow = rig.heading(rig.positions(from));
       const opp = F.opponent;
       const A = flat(from.root);
       let yaw = opp ? Math.atan2(opp.P[0].x - A.x, opp.P[0].z - A.z) : rig.heading(rig.positions(from));
@@ -579,20 +623,28 @@ function strikeReq(F, family = null) {
       const swing = tang > 1.0 && tang > 1.2 * Math.max(radial, 0.3);
       const swingSide = lateral > 0 ? 'Right' : 'Left'; // moving left: the right side comes round
       const aimOf = k => (k.family === 'low' ? low : k.high ? head : body);
+      // the body's own motion in its frame (x left, z forward), for the clip whose own travel into the blow matches
+      const mv = new Vector3(F.vel.x, 0, F.vel.z).applyAxisAngle(UP, -hNow);
       let best = null, bc = Infinity;
       const pool = family ? strikeKeys.filter(k => k.family === family) : strikeKeys;
       for (const k of (pool.length ? pool : strikeKeys)) {
         const goal = local(aimOf(k));
         const step = clamp(goal.z - k.tip.z + 0.08, -0.2, WIND[k.kind] + (F.isPlayer ? 0.25 : 0.1)); // (aim assist: it may step further in, the player most)
         let cost = Math.abs(goal.z - k.tip.z - step) * 4 + Math.abs(goal.y - k.tip.y) * 2 + Math.abs(goal.x - k.tip.x) * 1.5;
-        cost += (k.clip === F.lastStrike ? 1.5 : 0) + (k.clip === F.lastStrike2 ? 0.7 : 0) + Math.random() * 0.8;
-        if (speedIn > 2.2 && (k.kind === 'kick' || k.kind === 'knee')) cost -= 0.8; // charging in: a kick or a knee
-        else if (speedIn > 1.2 && step > 0.3) cost -= 0.4; // coming in: a stepping blow
+        cost += (k.clip === F.lastStrike ? 1.0 : 0) + (k.clip === F.lastStrike2 ? 0.5 : 0) + Math.random() * 0.25;
+        // the pose now: the strike whose wind-up the body is already in (or near: a deeper wind-up costs a little more)
+        const dPose = Math.min(featCost(feat, k.chamber[0].feat), 0.15 + featCost(feat, k.chamber[1].feat));
+        cost += 2.5 * dPose;
+        // the momentum: the clip's own travel into the blow like the body's motion now
+        cost += 0.35 * new Vector3(mv.x - k.travel.x, 0, mv.z - k.travel.z).lengthSq() / 2;
+        if (speedIn > 2.2 && (k.kind === 'kick' || k.kind === 'knee')) cost -= 0.6; // charging in: a kick or a knee
+        else if (speedIn > 1.2 && step > 0.3) cost -= 0.3; // coming in: a stepping blow
+        if (radial < -0.8) cost += k.family === 'front' || (k.family === 'straight' && k.travel.z < 0.5) ? -0.8 : /hook|uppercut/.test(k.family) ? 0.6 : 0; // backing off: a push kick or a jab
         if (swing && /hook|round|elbow/.test(k.family)) cost += k.part.startsWith(swingSide) ? -1.2 : 0.4; // swinging round: a sweeping blow
-        if (cost < bc) { bc = cost; best = { k, step, goal }; }
+        if (cost < bc) { bc = cost; best = { k, step, goal, dPose }; }
       }
       if (!best) return planReq(F, 'move').build(tr, a, ctx);
-      const { k, step } = best;
+      const { k, step, dPose } = best;
       F.lastStrike2 = F.lastStrike; F.lastStrike = k.clip;
       const fwd = new Vector3(Math.sin(yaw), 0, Math.cos(yaw));
       const at = A.clone().addScaledVector(fwd, step);
@@ -612,16 +664,21 @@ function strikeReq(F, family = null) {
       // the one being struck sees it coming: a guard or a dodge, or it takes it
       if (opp) defend(opp, F, k);
       if (opp) targets = targets.map(t => { const r = clonePose(t); gaze(r, head); return rig.fixRigid(r); });
-      F.attack = { part: k.part, id: Math.random(), kind: k.kind, key: k, yaw, at, followed: false, landed: false, sweep: swing && /hook|round/.test(k.family) };
-      F.lastMatch = { name: k.name, kind: 'attack', cost: bc, frame: 0 };
+      // (it takes over when its motion is spliced in: until then the strike being played is the one that counts)
+      const atk = { part: k.part, id: Math.random(), kind: k.kind, key: k, yaw, at, followed: false, landed: false, sweep: swing && /hook|round/.test(k.family), t0: clock };
+      F.lastMatch = { name: k.name, kind: 'attack', cost: bc, frame: 0, dPose: +dPose.toFixed(2) };
       F.current = null;
-      const rate = RATE[k.kind];
+      // already wound up that way: out sooner (less wind-up, a little faster)
+      const ready = clamp(1 - dPose / 0.8, 0, 1);
+      const rate = RATE[k.kind] * (1 + 0.25 * ready);
+      atk.ready = ready;
       return {
         targets, tokens: [6], rate, fixEnd: true, tag: { kind: 'attack' },
         after: (tr2, a0, frames) => {
           groundFrames(frames);
-          const dur = warpStrike(F, frames, k.part, rate);
-          F.state = 'attack'; F.until = clock + dur + 0.6; if (F.attack) F.attack.spliced = true;
+          F.attack = atk; atk.spliced = true;
+          const dur = warpStrike(F, frames, k.part, rate, ready);
+          F.state = 'attack'; F.until = clock + dur + 0.6;
         },
       };
     },
@@ -1008,7 +1065,7 @@ function land(A, B, energy, dir, at, isHead) {
   B.until = clock + 3;
   B.track.request(reactReq(B, A.P[0], energy, isHead, down, dir, at));
   if (A.attack) {
-    if (A.attack.followed && !A.attack.landed && !A.attack.sweep) A.track.request(followReq(A, 'now'));
+    if (A.attack.followed && !A.attack.landed && !A.attack.sweep && !A.attack.chained) A.track.request(followReq(A, 'now'));
     A.attack.landed = true;
   }
   B.body.flash = 1;
@@ -1017,6 +1074,7 @@ function land(A, B, energy, dir, at, isHead) {
   if (energy > 30) slowUntil = performance.now() + clamp(energy * 4, 140, 420); // a big one: a moment of slow motion
   if (!B.isPlayer && (energy > 30 || down)) { crew.watchUntil = clock + 0.9; crew.swapAt = clock + 0.9; } // the others watch, then the next comes
   if (B.state === 'attack' || B.attack) B.attack = null; // a hit cancels the one hit's own strike
+  B.attackQueued = null;
   if (B.hp <= 0) B.ko = true;
   lastHit = { energy, dmg, isHead, by: A.isPlayer ? 'あなた' : '相手', t: clock };
   hudFight();
@@ -1127,15 +1185,26 @@ function floorPoint(x, y) {
   const out = new Vector3();
   return ray.ray.intersectPlane(new THREE.Plane(UP, -0.95), out) ? out : null; // the plane at hip height
 }
-canvas.addEventListener('pointerdown', e => {
+// The buttons are read from the change of e.buttons on every pointer event: a second button pressed while one is
+// held gives no pointerdown (only a pointermove), and releasing them in any order must end what each started.
+// Left: hold and move (the hips on the spring). Right: a strike (taken in the next step of the simulation).
+let buttonsPrev = 0;
+function onButtons(e) {
+  const b = e.buttons ?? 0, pressed = b & ~buttonsPrev, released = buttonsPrev & ~b;
+  buttonsPrev = b;
   if (!player) return;
-  if (e.button !== 0) return;
-  drag = { screen: { x: e.clientX, y: e.clientY }, point: null };
+  if (pressed & 1) drag = { screen: { x: e.clientX, y: e.clientY }, point: null };
+  if (released & 1) release();
+  if (pressed & 2) player.strikeInput = clock;
+}
+canvas.addEventListener('pointerdown', e => {
   try { canvas.setPointerCapture(e.pointerId); } catch { /* synthetic */ }
   e.preventDefault();
+  onButtons(e);
 });
 const flickTrail = [];
 canvas.addEventListener('pointermove', e => {
+  onButtons(e);
   if (drag) drag.screen = { x: e.clientX, y: e.clientY };
   flickTrail.push({ x: e.clientX, y: e.clientY, t: performance.now() });
   while (flickTrail.length && performance.now() - flickTrail[0].t > 150) flickTrail.shift();
@@ -1172,9 +1241,9 @@ function flickStrike() {
   P.track.request(strikeReq(P, family));
   P.state = 'attack'; P.until = clock + 1.0; P.strikeAfter = clock + 0.6;
 }
-const release = () => { drag = null; if (player) player.planTimer = 0; };
-canvas.addEventListener('pointerup', e => { if (e.button === 0) release(); });
-canvas.addEventListener('pointercancel', release);
+function release() { drag = null; if (player) player.planTimer = 0; }
+canvas.addEventListener('pointerup', onButtons);
+canvas.addEventListener('pointercancel', () => { buttonsPrev = 0; release(); });
 /**
  * A strike comes from the motion: driving at the opponent fast enough, the strike is set off so that it lands
  * where the two bodies will meet (the time to contact from the closing speed); the faster the approach, the
@@ -1214,14 +1283,26 @@ function homing(F) {
   F.shown = lerpPose(F.shown, reachLimb(F.shown, A.part, goal, 0.2), w);
 }
 function strike(F) {
-  if (!F.opponent || (F.state !== 'free' && F.state !== 'attack')) return;
-  if (F.state === 'attack' && clock < F.until - 0.2) { F.attackQueued = true; return; } // one more right after this one
-  F.track.request(strikeReq(F));
+  if (!F.opponent || (F.state !== 'free' && F.state !== 'attack' && F.state !== 'guard')) return;
+  // during a strike: kept, and the next one starts from where this one ends (a combination)
+  if (F.state === 'attack' && F.attack && !F.attack.followed) { F.attackQueued = clock; return; }
+  F.attackQueued = null;
+  if (!F.track.request(strikeReq(F))) return;
+  if (F.state !== 'attack') F.attack = null; // (an old strike's record no longer counts) // (a hit or a fall on its way: not now)
   F.state = 'attack'; F.until = clock + 1.0;
 }
 // the right button pressed while the left one is held gives no pointerdown (a chorded press): take it from
 // mousedown / contextmenu too (once per press)
 canvas.addEventListener('contextmenu', e => e.preventDefault());
+/** A right press, taken within 0.3 s when the body can strike (after a hit, getting up: dropped). */
+function takeStrikeInput() {
+  const P = player;
+  if (!P || P.strikeInput == null) return;
+  if (clock - P.strikeInput > 0.3 || P.state === 'down' || P.state === 'fall' || P.state === 'getup') { if (clock - P.strikeInput > 0.3) P.strikeInput = null; return; }
+  if (P.state === 'hit') return;
+  P.strikeInput = null;
+  strike(P);
+}
 
 // ---------------------------------------------------------------- loop
 
@@ -1230,6 +1311,7 @@ let acc = 0, last = performance.now(), clock = 0, fpsAcc = 0, fpsN = 0, fps = 0;
 const camTarget = new Vector3(0, 0.9, 0), camSide = new Vector3(1, 0, 0);
 function simulate(dt) {
   if (!db) return;
+  if (settings.trigger !== 'auto') takeStrikeInput();
   if (hitstop > 0) { hitstop -= dt; scheduler.tick(fighters.filter(f => f.state !== 'out').map(f => f.track)); return; } // a landed blow holds the picture a moment (the model keeps working)
   if (player && fighters.filter(f => !f.isPlayer && f.state !== 'out').length < settings.enemies && clock > spawnAt) { spawn(); spawnAt = clock + 1.5; }
   // the player's leash on the hips
@@ -1239,9 +1321,10 @@ function simulate(dt) {
     player.spring = { target: drag?.point && free ? drag.point.clone() : null };
     springStep(player.vel, flat(player.P[0]), player.spring.target, dt);
     if (!free) player.vel.multiplyScalar(Math.exp(-dt * 4));
+    // striking: the spring's speed follows what the body really does (no speed stored up for a lurch afterwards)
+    if (player.state === 'attack' && player.prevP) player.vel.lerp(flat(player.P[0].clone().sub(player.prevP[0])).divideScalar(dt), 1 - Math.exp(-dt * 6));
     player.want.copy(player.vel);
-    flickStrike();
-    autoStrike(player);
+    if (settings.trigger === 'auto') { flickStrike(); autoStrike(player); }
   }
   for (const F of fighters) {
     if (F.isPlayer && F.state === 'free' && clock - (F.hitAt ?? -9) > 3 && F.hp < F.maxHp) { F.hp = Math.min(F.maxHp, F.hp + settings.regen * dt); if (Math.random() < 0.05) hudFight(); }
@@ -1255,14 +1338,15 @@ function simulate(dt) {
       if (F.state === 'down') {
         if (F.ko && !F.isPlayer) { F.state = 'out'; F.outAt = clock; kos++; spawnAt = clock + 2.5; hudFight(); }
         else { F.track.request(getupReq(F)); F.state = 'getup'; F.until = clock + 5; if (F.isPlayer && F.hp <= 0) F.hp = F.maxHp; }
-      } else if (F.state === 'attack' && F.attackQueued) { F.attackQueued = false; F.state = 'free'; strike(F); }
+      } else if (F.state === 'attack' && F.attackQueued != null && clock - F.attackQueued < 0.8) { F.attackQueued = null; F.state = 'free'; strike(F); }
       else if (F.state !== 'down') { F.state = 'free'; F.guard = null; }
     }
     // a strike carries straight on into its follow-through (asked for as the top comes near)
     const paceNow = F.track.frames[Math.min(F.track.frames.length - 1, Math.floor(F.track.t))].rate;
     if (F.state === 'attack' && F.attack?.spliced && !F.attack.followed && !F.track.busy && F.track.remaining / FPS / paceNow < scheduler.latency + 0.12) {
       F.attack.followed = true;
-      F.track.request(followReq(F));
+      if (F.attackQueued != null && clock - F.attackQueued < 0.8) { F.attackQueued = null; F.attack.chained = true; F.track.request(strikeReq(F, null, 'end')); F.until = clock + 1.2; }
+      else F.track.request(followReq(F));
     }
     // plans while free
     F.planTimer -= dt;
