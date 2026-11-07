@@ -81,11 +81,52 @@ PoseDB.load(rig, new URL('../assets/fightdb', import.meta.url).href).then(d => {
       strikes.push({ i, part, lead, at: B.point(Pa[I[part]]), name: c.name });
     }
   }
+  buildKeys(d);
   const idle = d.clips.findIndex(c => /fight_idle|boxing_idle|bouncing_fight_idle|fighting_idle/.test(c.name));
   standPose = d.pose(Math.max(0, idle), 10);
   $('db-info').textContent = `${d.clips.length} クリップ / 攻撃 ${new Set(strikes.map(s => db.entClip[s.i])).size} 種`;
   start();
 }).catch(e => { $('db-info').textContent = `読み込めません: ${e.message}`; });
+// Key poses, as the original SOMA Fighter did: the moment a strike lands (four frames from the reference strike's
+// top) and the moment a hit reaction is at its strongest. Each is put facing +Z with its hips over the origin.
+const strikeKeys = [], hitKeys = [], fallKeys = [];
+function keyFrames(d, c, f, mirrored) {
+  const p0 = d.pose(c, f, mirrored);
+  const h = rig.heading(rig.positions(p0)), at = flat(p0.root);
+  return [0, 1, 2, 3].map(k => placePose(d.pose(c, f + k, mirrored), -h, at, at.clone().negate()));
+}
+function buildKeys(d) {
+  d.clips.forEach((c, k) => {
+    if (c.tag === 'attack' && c.strike) {
+      for (const mirrored of [false, true]) {
+        const part = mirrored ? swapSide(c.strike.part) : c.strike.part;
+        const frames = keyFrames(d, k, c.strike.apex, mirrored);
+        const tip = rig.positions(frames[0])[I[part]];
+        const kind = /Foot/.test(part) ? 'kick' : /Shin/.test(part) ? 'knee' : /ForeArm/.test(part) ? 'elbow' : 'punch';
+        if (tip.z < 0.25) continue; // a strike that does not reach forward (a spin, a back kick)
+        strikeKeys.push({ clip: k, name: c.name, part, kind, frames, tip, high: tip.y > 1.25 });
+      }
+    }
+    if (c.tag === 'hit' || c.tag === 'fall') {
+      // the strongest moment: where the upper body has moved farthest from how the clip began
+      const n = Math.min(c.own ?? c.frames, c.frames) - 4;
+      if (n < 6) return;
+      const P0 = rig.positions(d.pose(k, 0));
+      let best = 0, bd = -1;
+      for (let f = 2; f < (c.tag === 'fall' ? n : Math.floor(n * 0.7)); f++) {
+        const P = rig.positions(d.pose(k, f));
+        const dd = (c.tag === 'fall' ? -P[0].y : 0) + P[I.Head].clone().sub(P[0]).distanceTo(P0[I.Head].clone().sub(P0[0])) + P[0].distanceTo(P0[0]) * 0.5;
+        if (dd > bd) { bd = dd; best = f; }
+      }
+      const name = c.name.toLowerCase();
+      const where = /head|face|jaw|chin|nose/.test(name) ? 'head' : /body|stomach|rib|kidney|liver|side|gut|chest/.test(name) ? 'body' : 'any';
+      for (const mirrored of [false, true]) {
+        const key = { clip: k, name: c.name, frames: keyFrames(d, k, best, mirrored), where, strength: bd };
+        (c.tag === 'fall' ? fallKeys : hitKeys).push(key);
+      }
+    }
+  });
+}
 function swapSide(n) { return n.startsWith('Left') ? `Right${n.slice(4)}` : n.startsWith('Right') ? `Left${n.slice(5)}` : n; }
 
 // ---------------------------------------------------------------- pose helpers
@@ -358,6 +399,97 @@ function planReq(F, kind, mode = 'now') {
   };
 }
 
+// ---------------------------------------------------------------- strikes and reactions (key poses, short, fast)
+
+const RATE = { punch: 2.1, elbow: 2.0, knee: 1.8, kick: 1.7 };
+const WIND = { punch: 0.5, elbow: 0.35, knee: 0.45, kick: 0.6 }; // how far a strike may step in (m)
+/**
+ * A strike now: one of the reference strikes at the moment it lands, turned to the opponent, stepping in so its
+ * own reach is about right, its limb bent onto 8 cm through the target; generated short (6 tokens) and played
+ * fast, as the original SOMA Fighter did. Which strike: one whose reach and height suit the distance and the
+ * target, a little at random, not the same one twice running; moving in fast prefers a kick or a stepping blow.
+ */
+function strikeReq(F) {
+  return {
+    kind: 'attack', mode: 'now', interrupt: true,
+    build(tr, a, ctx) {
+      const from = ctx[3];
+      const opp = F.opponent;
+      const A = flat(from.root);
+      const yaw = opp ? Math.atan2(opp.P[0].x - A.x, opp.P[0].z - A.z) : rig.heading(rig.positions(from));
+      const c = Math.cos(-yaw), sn = Math.sin(-yaw);
+      const local = v => { const dx = v.x - A.x, dz = v.z - A.z; return new Vector3(dx * c + dz * sn, v.y, -dx * sn + dz * c); };
+      const head = opp ? opp.P[I.Head].clone().add(new Vector3(0, -0.02, 0)) : A.clone().add(new Vector3(Math.sin(yaw), 1.5, Math.cos(yaw)));
+      const body = opp ? opp.P[I.Spine2].clone() : head.clone().setY(1.1);
+      const speedIn = opp ? F.vel.dot(flat(opp.P[0].clone().sub(A)).normalize()) : 0;
+      let best = null, bc = Infinity;
+      for (const k of strikeKeys) {
+        const goal = local(k.high ? head : body);
+        const step = clamp(goal.z - k.tip.z, -0.15, WIND[k.kind]);
+        let cost = Math.abs(goal.z - k.tip.z - step) * 4 + Math.abs(goal.y - k.tip.y) * 2 + Math.abs(goal.x - k.tip.x) * 1.5;
+        cost += (k.clip === F.lastStrike ? 1.5 : 0) + (k.clip === F.lastStrike2 ? 0.7 : 0) + Math.random() * 0.8;
+        if (speedIn > 0.8 && (k.kind === 'kick' || step > 0.3)) cost -= 0.4; // coming in fast: a kick or a stepping blow
+        if (cost < bc) { bc = cost; best = { k, step, goal }; }
+      }
+      if (!best) return planReq(F, 'move').build(tr, a, ctx);
+      const { k, step } = best;
+      F.lastStrike2 = F.lastStrike; F.lastStrike = k.clip;
+      const fwd = new Vector3(Math.sin(yaw), 0, Math.cos(yaw));
+      const at = A.clone().addScaledVector(fwd, step);
+      const aim = (k.high ? head : body).clone().addScaledVector(fwd, 0.08); // swing through the point
+      let targets = k.frames.map(f => ground(placePose(f, yaw, ZERO, at)));
+      targets = targets.map((t, i) => reachLimb(t, k.part, aim.clone().addScaledVector(fwd, 0.03 * i), 0.35));
+      if (opp) targets = targets.map(t => { const r = clonePose(t); gaze(r, head); return rig.fixRigid(r); });
+      F.attack = { part: k.part, id: Math.random(), kind: k.kind };
+      F.lastMatch = { name: k.name, kind: 'attack', cost: bc, frame: 0 };
+      F.current = null;
+      const rate = RATE[k.kind];
+      return {
+        targets, tokens: [6], rate, fixEnd: true, tag: { kind: 'attack' },
+        after: (tr2, a0, frames) => { groundFrames(frames); F.state = 'attack'; F.until = clock + frames.length / FPS / rate + 0.05; },
+      };
+    },
+  };
+}
+/** Hit: the reaction at its strongest, pushed back from the attacker, generated short and played fast. */
+function reactReq(F, from, energy, isHead, down) {
+  return {
+    kind: down ? 'down' : 'hit', mode: 'now', interrupt: true,
+    build(tr, a, ctx) {
+      const A = flat(ctx[3].root);
+      const away = A.clone().sub(flat(from));
+      if (away.lengthSq() < 1e-6) away.set(1, 0, 0);
+      away.normalize();
+      const pool = down ? fallKeys : hitKeys.filter(h => h.where === (isHead ? 'head' : 'body') || h.where === 'any');
+      const list = pool.length ? pool : hitKeys;
+      // stronger blows: the bigger reactions
+      const wantStrength = clamp(0.25 + energy / 120, 0.2, 1.2);
+      let best = null, bc = Infinity;
+      for (const h of list) { const c = Math.abs(h.strength - wantStrength) + Math.random() * 0.4 + (h.clip === F.lastReact ? 0.5 : 0); if (c < bc) { bc = c; best = h; } }
+      F.lastReact = best?.clip;
+      const back = down ? 0.35 : clamp(0.1 + energy / 250, 0.1, 0.45);
+      const dest = A.clone().addScaledVector(away, back);
+      const yaw = Math.atan2(-away.x, -away.z); // reactions face the attacker
+      const targets = best.frames.map(f => ground(placePose(f, yaw, ZERO, dest)));
+      F.current = null;
+      F.lastMatch = { name: best.name, kind: down ? 'fall' : 'hit', cost: bc, frame: 0 };
+      const rate = down ? 1.45 : energy > 40 ? 1.8 : 2.1;
+      return {
+        targets, tokens: down ? [9, 10] : [6], rate, fixEnd: true, tag: { kind: down ? 'down' : 'hit' },
+        after: (tr2, a0, frames) => {
+          groundFrames(frames);
+          const left = (tr2.frames.length - 1 - tr2.t) / FPS / rate;
+          if (down) {
+            const end = tr2.frames[tr2.frames.length - 1];
+            for (let k = 0; k < FPS * 0.8; k++) tr2.frames.push({ pose: end.pose, rate: 1, tag: end.tag });
+            F.state = 'down'; F.until = clock + left + 0.8;
+          } else { F.state = 'hit'; F.until = clock + left; }
+        },
+      };
+    },
+  };
+}
+
 // ---------------------------------------------------------------- hits
 
 // striking points and the effective mass behind each (kg)
@@ -421,12 +553,15 @@ function land(A, B, energy, dir, at, isHead) {
   const down = B.hp <= 0 || energy > settings.knockdown;
   B.state = down ? 'fall' : 'hit';
   B.until = clock + 3;
-  B.track.request(planReq(B, down ? 'fall' : 'hit'));
+  B.track.request(reactReq(B, A.P[0], energy, isHead, down));
+  B.body.flash = 1;
+  hitstop = clamp(0.04 + energy / 2000, 0.04, 0.12);
+  if (B.state === 'attack' || B.attack) B.attack = null; // a hit cancels the one hit's own strike
   if (B.hp <= 0) B.ko = true;
   lastHit = { energy, dmg, isHead, by: A.isPlayer ? 'あなた' : '相手', t: clock };
   hudFight();
 }
-let lastHit = null;
+let lastHit = null, hitstop = 0;
 
 // ---------------------------------------------------------------- the player and the opponents
 
@@ -458,8 +593,8 @@ function think(E, dt) {
   const nearest = P.opponent === E;
   if (!nearest) E.want.addScaledVector(to, -0.4); // the others wait their turn a little further off
   if (nearest && d < 1.45 && clock > E.nextAttack && P.state !== 'down' && P.state !== 'fall') {
-    E.track.request(planReq(E, 'attack'));
-    E.state = 'attack'; E.until = clock + 1.5;
+    E.track.request(strikeReq(E));
+    E.state = 'attack'; E.until = clock + 1.0;
     E.nextAttack = clock + rand(2.2, 4.0);
   }
 }
@@ -475,10 +610,9 @@ function floorPoint(x, y) {
   const out = new Vector3();
   return ray.ray.intersectPlane(new THREE.Plane(UP, -0.95), out) ? out : null; // the plane at hip height
 }
-canvas.addEventListener('contextmenu', e => e.preventDefault());
 canvas.addEventListener('pointerdown', e => {
   if (!player) return;
-  if (e.button === 2) { strike(player); e.preventDefault(); return; }
+  if (e.button === 2) { rightButton(e); return; }
   if (e.button !== 0) return;
   drag = { screen: { x: e.clientX, y: e.clientY }, point: null };
   try { canvas.setPointerCapture(e.pointerId); } catch { /* synthetic */ }
@@ -490,10 +624,21 @@ canvas.addEventListener('pointerup', e => { if (e.button === 0) release(); });
 canvas.addEventListener('pointercancel', release);
 function strike(F) {
   if (!F.opponent || (F.state !== 'free' && F.state !== 'attack')) return;
-  if (F.state === 'attack' && clock < F.until - 0.35) { F.attackQueued = true; return; } // one more after this one
-  F.track.request(planReq(F, 'attack'));
-  F.state = 'attack'; F.until = clock + 1.5;
+  if (F.state === 'attack' && clock < F.until - 0.2) { F.attackQueued = true; return; } // one more right after this one
+  F.track.request(strikeReq(F));
+  F.state = 'attack'; F.until = clock + 1.0;
 }
+// the right button pressed while the left one is held gives no pointerdown (a chorded press): take it from
+// mousedown / contextmenu too (once per press)
+let lastRight = 0;
+function rightButton(e) {
+  e.preventDefault();
+  if (performance.now() - lastRight < 120 || !player) return;
+  lastRight = performance.now();
+  strike(player);
+}
+canvas.addEventListener('mousedown', e => { if (e.button === 2) rightButton(e); });
+canvas.addEventListener('contextmenu', rightButton);
 
 // ---------------------------------------------------------------- loop
 
@@ -502,6 +647,7 @@ let acc = 0, last = performance.now(), clock = 0, fpsAcc = 0, fpsN = 0, fps = 0;
 const camTarget = new Vector3(0, 0.9, 0), camSide = new Vector3(1, 0, 0);
 function simulate(dt) {
   if (!db) return;
+  if (hitstop > 0) { hitstop -= dt; return; } // a landed blow holds the picture a moment
   if (player && fighters.filter(f => !f.isPlayer && f.state !== 'out').length < settings.enemies && clock > spawnAt) { spawn(); spawnAt = clock + 1.5; }
   // the player's leash on the hips
   if (player) {
@@ -524,7 +670,7 @@ function simulate(dt) {
     if (F.state !== 'free' && F.state !== 'out' && clock > F.until && !F.track.busy) {
       if (F.state === 'down') {
         if (F.ko && !F.isPlayer) { F.state = 'out'; F.outAt = clock; kos++; spawnAt = clock + 2.5; hudFight(); }
-        else { F.track.request(planReq(F, 'getup', 'end')); F.state = 'getup'; F.until = clock + 3; if (F.isPlayer && F.hp <= 0) F.hp = F.maxHp; }
+        else { F.track.request(planReq(F, 'getup', 'end')); F.state = 'getup'; F.until = clock + 2.5; if (F.isPlayer && F.hp <= 0) F.hp = F.maxHp; }
       } else if (F.state === 'attack' && F.attackQueued) { F.attackQueued = false; F.state = 'free'; strike(F); }
       else if (F.state !== 'down') F.state = 'free';
     }
