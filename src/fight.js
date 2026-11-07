@@ -90,8 +90,8 @@ PoseDB.load(rig, new URL('../assets/fightdb', import.meta.url).href).then(d => {
 // Key poses, as the original SOMA Fighter did: the moment a strike lands (four frames from the reference strike's
 // top) and the moment a hit reaction is at its strongest. Each is put facing +Z with its hips over the origin.
 const strikeKeys = [], hitKeys = [], fallKeys = [];
-function keyFrames(d, c, f, mirrored) {
-  const p0 = d.pose(c, f, mirrored);
+function keyFrames(d, c, f, mirrored, ref = f) {
+  const p0 = d.pose(c, ref, mirrored);
   const h = rig.heading(rig.positions(p0)), at = flat(p0.root);
   return [0, 1, 2, 3].map(k => placePose(d.pose(c, f + k, mirrored), -h, at, at.clone().negate()));
 }
@@ -104,7 +104,12 @@ function buildKeys(d) {
         const tip = rig.positions(frames[0])[I[part]];
         const kind = /Foot/.test(part) ? 'kick' : /Shin/.test(part) ? 'knee' : /ForeArm/.test(part) ? 'elbow' : 'punch';
         if (tip.z < 0.25) continue; // a strike that does not reach forward (a spin, a back kick)
-        strikeKeys.push({ clip: k, name: c.name, part, kind, frames, tip, high: tip.y > 1.25 });
+        // what comes after the top, in the same frame of reference: the swing carrying on (a miss) and the limb
+        // coming back a little sooner (a blow that met something)
+        const own = (c.own ?? c.frames) - 4;
+        const miss = keyFrames(d, k, Math.min(own, c.strike.apex + 9), mirrored, c.strike.apex);
+        const hit = keyFrames(d, k, Math.min(own, c.strike.apex + 5), mirrored, c.strike.apex);
+        strikeKeys.push({ clip: k, name: c.name, part, kind, frames, tip, high: tip.y > 1.25, miss, hit });
       }
     }
     if (c.tag === 'hit' || c.tag === 'fall') {
@@ -126,6 +131,12 @@ function buildKeys(d) {
       }
     }
   });
+}
+const toLocal = p => p.rot.map((q, j) => (rig.parents[j] < 0 ? q.clone() : p.rot[rig.parents[j]].clone().invert().multiply(q)));
+function fromLocalPose(root, L) {
+  const rot = [];
+  L.forEach((q, j) => { rot.push(rig.parents[j] < 0 ? q.clone() : rot[rig.parents[j]].clone().multiply(q)); });
+  return rig.fixRigid({ root: root.clone(), rot });
 }
 function swapSide(n) { return n.startsWith('Left') ? `Right${n.slice(4)}` : n.startsWith('Right') ? `Left${n.slice(5)}` : n; }
 
@@ -401,7 +412,7 @@ function planReq(F, kind, mode = 'now') {
 
 // ---------------------------------------------------------------- strikes and reactions (key poses, short, fast)
 
-const RATE = { punch: 2.1, elbow: 2.0, knee: 1.8, kick: 1.7 };
+const RATE = { punch: 1.8, elbow: 1.8, knee: 1.6, kick: 1.5 };
 const WIND = { punch: 0.5, elbow: 0.35, knee: 0.45, kick: 0.6 }; // how far a strike may step in (m)
 /**
  * A strike now: one of the reference strikes at the moment it lands, turned to the opponent, stepping in so its
@@ -436,23 +447,98 @@ function strikeReq(F) {
       F.lastStrike2 = F.lastStrike; F.lastStrike = k.clip;
       const fwd = new Vector3(Math.sin(yaw), 0, Math.cos(yaw));
       const at = A.clone().addScaledVector(fwd, step);
-      const aim = (k.high ? head : body).clone().addScaledVector(fwd, 0.08); // swing through the point
+      const aim = (k.high ? head : body).clone().addScaledVector(fwd, 0.25); // aim through the target, not at it
       let targets = k.frames.map(f => ground(placePose(f, yaw, ZERO, at)));
       targets = targets.map((t, i) => reachLimb(t, k.part, aim.clone().addScaledVector(fwd, 0.03 * i), 0.35));
       if (opp) targets = targets.map(t => { const r = clonePose(t); gaze(r, head); return rig.fixRigid(r); });
-      F.attack = { part: k.part, id: Math.random(), kind: k.kind };
+      F.attack = { part: k.part, id: Math.random(), kind: k.kind, key: k, yaw, at, followed: false, landed: false };
       F.lastMatch = { name: k.name, kind: 'attack', cost: bc, frame: 0 };
       F.current = null;
       const rate = RATE[k.kind];
       return {
         targets, tokens: [6], rate, fixEnd: true, tag: { kind: 'attack' },
-        after: (tr2, a0, frames) => { groundFrames(frames); F.state = 'attack'; F.until = clock + frames.length / FPS / rate + 0.05; },
+        after: (tr2, a0, frames) => { groundFrames(frames); F.state = 'attack'; F.until = clock + frames.length / FPS / rate + 0.6; if (F.attack) F.attack.spliced = true; },
       };
     },
   };
 }
-/** Hit: the reaction at its strongest, pushed back from the attacker, generated short and played fast. */
-function reactReq(F, from, energy, isHead, down) {
+/**
+ * After the top of a strike, at once (no stop): a miss carries on along the reference's own swing (the follow-
+ * through, with the body's momentum); a blow that met something comes back sooner. Soft (not held to the pose):
+ * MotionBricks settles it, then normal motion carries on.
+ */
+function followReq(F) {
+  return {
+    kind: 'attack', mode: 'end',
+    build(tr, a, ctx) {
+      const A = F.attack;
+      if (!A?.key) return planReq(F, 'move', 'end').build(tr, a, ctx);
+      const frames = A.landed ? A.key.hit : A.key.miss;
+      const targets = frames.map(f => ground(placePose(f, A.yaw, ZERO, A.at)));
+      F.lastMatch = { name: `${A.key.name} → ${A.landed ? '当たって戻る' : '振り抜く'}`, kind: 'follow', cost: 0, frame: 0 };
+      const rate = A.landed ? 1.5 : 1.3;
+      return {
+        targets: targets.map((t, k) => { if (k === 0) return t; const r = clonePose(t); r.free = true; return r; }),
+        tokens: [6], rate, fixEnd: false, tag: { kind: 'move' },
+        after: (tr2, a0, gen) => { groundFrames(gen); F.until = clock + (tr2.frames.length - 1 - tr2.t) / FPS / rate - 0.15; },
+      };
+    },
+  };
+}
+/**
+ * The body where a blow puts it, built on the pose it has now: the head snaps along the blow (and turns away from
+ * a blow from the side), a blow to the body bends the trunk (folding over one to the middle, sideways from the
+ * side), the arms fly a little, the hips are pushed along the blow and, for a strong one, a foot steps back to
+ * catch it. Then MotionBricks carries the body there and back.
+ */
+function impactPose(pose, dir, energy, isHead, hitAt) {
+  const p = clonePose(pose);
+  const P = rig.positions(p);
+  const h = rig.heading(P), fwd = new Vector3(Math.sin(h), 0, Math.cos(h)), left = new Vector3(Math.cos(h), 0, -Math.sin(h));
+  const d = flat(dir).normalize();
+  const lateral = d.dot(left); // + pushed toward the body's left
+  const k = clamp(Math.sqrt(energy) / 9, 0.15, 1.1);
+  const axis = new Vector3().crossVectors(UP, d).normalize(); // tipping along the blow
+  if (isHead) {
+    rotateSubtree(rig, p, I.Neck1, new Quaternion().setFromAxisAngle(axis, 0.55 * k));
+    rotateSubtree(rig, p, I.Head, new Quaternion().setFromAxisAngle(axis, 0.35 * k));
+    rotateSubtree(rig, p, I.Neck1, new Quaternion().setFromAxisAngle(UP, -0.6 * k * lateral)); // a hook turns the face
+    rotateSubtree(rig, p, I.Spine2, new Quaternion().setFromAxisAngle(axis, 0.2 * k));
+  } else {
+    const low = hitAt ? clamp((P[I.Chest].y - hitAt.y) / 0.4, 0, 1) : 0.5; // a blow to the middle folds the body over it
+    const front = Math.max(0, -d.dot(fwd)) > 0.5 ? 1 : 0;
+    rotateSubtree(rig, p, I.Spine1, new Quaternion().setFromAxisAngle(axis, (front ? -0.35 * low : 0.25) * k));
+    rotateSubtree(rig, p, I.Spine2, new Quaternion().setFromAxisAngle(axis, (front ? -0.25 * low : 0.2) * k));
+  }
+  for (const [side, sg] of [['Left', 1], ['Right', -1]]) rotateSubtree(rig, p, I[side + 'Arm'], new Quaternion().setFromAxisAngle(fwd, sg * 0.35 * k));
+  const feet = { Left: P[I.LeftFoot].clone(), Right: P[I.RightFoot].clone() };
+  p.root.addScaledVector(d, 0.12 * k);
+  p.root.y -= 0.05 * k;
+  // the foot behind (along the blow) steps back to catch a strong one
+  if (k > 0.5) {
+    const back = feet.Left.clone().sub(P[0]).dot(d) > feet.Right.clone().sub(P[0]).dot(d) ? 'Left' : 'Right';
+    feet[back].addScaledVector(d, 0.3 * k);
+  }
+  for (const side of ['Left', 'Right']) legTo(p, side, new Vector3(feet[side].x, Math.max(feet[side].y, ANKLE), feet[side].z));
+  return rig.fixRigid(p);
+}
+/** Back to a guard where the body ended up, facing the opponent (soft; MotionBricks finds the way). */
+function recoverReq(F) {
+  return {
+    kind: 'move', mode: 'end',
+    build(tr, a, ctx) {
+      const from = ctx[3];
+      const opp = F.opponent;
+      const A = flat(from.root);
+      const yaw = opp ? Math.atan2(opp.P[0].x - A.x, opp.P[0].z - A.z) : rig.heading(rig.positions(from));
+      const stance = standPose ?? from;
+      const t = ground(placePose(stance, yaw - rig.heading(rig.positions(stance)), flat(stance.root), A.clone().sub(flat(stance.root))));
+      return { targets: [t], tokens: [6, 7], rate: 1.2, fixEnd: 'root', tag: { kind: 'idle' }, after: (tr2, a0, gen) => { groundFrames(gen); F.until = clock + 0.2; } };
+    },
+  };
+}
+/** Hit: the reaction built from the blow, mixed with a reference reaction at its strongest; then back. */
+function reactReq(F, from, energy, isHead, down, dir = null, hitAt = null) {
   return {
     kind: down ? 'down' : 'hit', mode: 'now', interrupt: true,
     build(tr, a, ctx) {
@@ -470,7 +556,16 @@ function reactReq(F, from, energy, isHead, down) {
       const back = down ? 0.35 : clamp(0.1 + energy / 250, 0.1, 0.45);
       const dest = A.clone().addScaledVector(away, back);
       const yaw = Math.atan2(-away.x, -away.z); // reactions face the attacker
-      const targets = best.frames.map(f => ground(placePose(f, yaw, ZERO, dest)));
+      let targets = best.frames.map(f => ground(placePose(f, yaw, ZERO, dest)));
+      if (!down) {
+        // the impact on the body as it is now, half way into the reference reaction
+        const imp = impactPose(ctx[3], dir ?? away, energy, isHead, hitAt);
+        const L = toLocal(imp), Lr = toLocal(targets[0]);
+        L.forEach((q, j) => { if (j > 0) q.slerp(Lr[j], 0.4); });
+        const mixed = fromLocalPose(imp.root.clone().lerp(targets[0].root, 0.3), L);
+        // the body still moving along the blow on the next frames
+        targets = [0, 1, 2, 3].map(k2 => { const t = clonePose(mixed); t.root.addScaledVector(away, 0.02 * k2); if (k2 > 0) t.free = true; return ground(rig.fixRigid(t)); });
+      }
       F.current = null;
       F.lastMatch = { name: best.name, kind: down ? 'fall' : 'hit', cost: bc, frame: 0 };
       const rate = down ? 1.45 : energy > 40 ? 1.8 : 2.1;
@@ -483,7 +578,7 @@ function reactReq(F, from, energy, isHead, down) {
             const end = tr2.frames[tr2.frames.length - 1];
             for (let k = 0; k < FPS * 0.8; k++) tr2.frames.push({ pose: end.pose, rate: 1, tag: end.tag });
             F.state = 'down'; F.until = clock + left + 0.8;
-          } else { F.state = 'hit'; F.until = clock + left; }
+          } else { F.state = 'hit'; F.until = clock + left + 0.5; tr2.request(recoverReq(F)); }
         },
       };
     },
@@ -553,7 +648,8 @@ function land(A, B, energy, dir, at, isHead) {
   const down = B.hp <= 0 || energy > settings.knockdown;
   B.state = down ? 'fall' : 'hit';
   B.until = clock + 3;
-  B.track.request(reactReq(B, A.P[0], energy, isHead, down));
+  B.track.request(reactReq(B, A.P[0], energy, isHead, down, dir, at));
+  if (A.attack) A.attack.landed = true;
   B.body.flash = 1;
   hitstop = clamp(0.04 + energy / 2000, 0.04, 0.12);
   if (B.state === 'attack' || B.attack) B.attack = null; // a hit cancels the one hit's own strike
@@ -673,6 +769,11 @@ function simulate(dt) {
         else { F.track.request(planReq(F, 'getup', 'end')); F.state = 'getup'; F.until = clock + 2.5; if (F.isPlayer && F.hp <= 0) F.hp = F.maxHp; }
       } else if (F.state === 'attack' && F.attackQueued) { F.attackQueued = false; F.state = 'free'; strike(F); }
       else if (F.state !== 'down') F.state = 'free';
+    }
+    // a strike carries straight on into its follow-through (asked for as the top comes near)
+    if (F.state === 'attack' && F.attack?.spliced && !F.attack.followed && !F.track.busy && F.track.remaining / FPS < scheduler.latency + 0.2) {
+      F.attack.followed = true;
+      F.track.request(followReq(F));
     }
     // plans while free
     F.planTimer -= dt;
