@@ -69,7 +69,7 @@ export const done = () => !!(S.res || S.err);
 export function result() {
   if (S.err) return { err: S.err };
   if (!S.res) return null;
-  const pick = /^(enemyStrikes|enemyLanded|takenPerMin|kos|playerUnable|sideShareJ|takenSideShare|blowUnmoved|flatFrac)$/;
+  const pick = /^(enemyStrikes|enemyLanded|takenPerMin|kos|playerUnable|sideShareJ|takenSideShare|blowUnmoved|flatFrac|followLag|followGain|pressToStrike|pressToContact|dodged|taken)$/;
   return {
     mean: S.res.mean, worst: S.res.worst, swing: swing(), pops: S.pops,
     starve: Object.fromEntries(Object.entries(S.by).map(([k, s]) => [k, +(s.starve / s.n).toFixed(2)])),

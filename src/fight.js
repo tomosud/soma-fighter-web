@@ -660,7 +660,7 @@ function warpStrike(F, frames, part, base, ready = 0, family = null, wound = fal
     const out = {};
     const rates = tempoRates(frames, pos, prof, {
       apex: n - 1, phases: F.isPlayer || charged || wound || ready > 0.6 ? ['accel'] : ['ant', 'accel'],
-      durationScale: F.isPlayer ? 0.65 : charged ? 0.85 : wound ? 0.7 : 1.15, peakSpeed: F.isPlayer ? 8.5 : 7.5, maxRate: 6, out,
+      durationScale: F.isPlayer ? 0.65 : charged ? 0.8 : wound ? 0.6 : 0.85, peakSpeed: F.isPlayer ? 8.5 : 7.5, maxRate: 6, out,
     });
     rates.forEach((r, i) => { frames[i].rate = r; });
     // a kick, a knee: a beat at full extension (Mixamo holds 4 frames); a punch goes straight on
@@ -736,7 +736,10 @@ function strikeReq(F, family = null, mode = 'now', kindSel = null, pressId = 0, 
       // opponent's strike aims where the player is now, so a step aside in the wind-up makes it miss
       let OP = opp?.P;
       if (opp && F.isPlayer) OP = rig.positions(opp.track.frame(opp.track.now + tLand * FPS).pose);
-      else if (opp) OP = rig.positions(opp.track.frame(opp.track.now + 0.7 * tLand * FPS).pose); // (an opponent leads the player a little: a blow thrown at a moving body still meets it)
+      else if (opp) { // (an opponent throws at where the player is going: its spring, run on to the contact)
+        const ahead = opp.isPlayer ? playerAhead(tLand).sub(flat(opp.P[0])).clampLength(0, 1.4) : flat(opp.vel).multiplyScalar(0.7 * tLand);
+        OP = opp.P.map(v => v.clone().add(ahead));
+      }
       const head = opp ? OP[I.Head].clone().add(new Vector3(0, -0.02, 0)) : A.clone().add(new Vector3(Math.sin(yaw), 1.5, Math.cos(yaw)));
       const body = opp ? OP[I.Spine2].clone() : head.clone().setY(1.1);
       const speedIn = opp ? F.vel.dot(flat(opp.P[0].clone().sub(A)).normalize()) : 0;
@@ -776,7 +779,7 @@ function strikeReq(F, family = null, mode = 'now', kindSel = null, pressId = 0, 
       if (!jump && aimPart === 'legs' && pool.some(k => k.family === 'low')) pool = pool.filter(k => k.family === 'low'); // at the legs: a low kick, a sweep
       for (const k of (pool.length ? pool : strikeKeys)) {
         const goal = local(aimOf(k));
-        const step = clamp(goal.z - k.tip.z + 0.08, -0.45, WIND[k.kind] + (jump ? 0.7 : F.isPlayer ? 0.25 : opts.lunge ? 0.5 : 0.25)); // (aim assist: it may step further in, the player most; a lunge far; a jump kick flies in)
+        const step = clamp(goal.z - k.tip.z + 0.08, -0.45, WIND[k.kind] + (jump ? 0.7 : F.isPlayer ? 0.25 : opts.lunge ? 0.7 : 0.45)); // (aim assist: it may step further in, the player most; a lunge far; a jump kick flies in)
         let cost = Math.abs(goal.z - k.tip.z - step) * 4 + Math.abs(goal.y - k.tip.y) * 2 + Math.abs(goal.x - k.tip.x) * 1.5;
         // (variety: the last four strikes thrown cost more the more recent, the same family too, and more left to chance)
         { const hi = (F.hist ?? []).indexOf(k.clip); if (hi >= 0) cost += [1.4, 1.0, 0.6, 0.35][hi]; }
@@ -827,11 +830,12 @@ function strikeReq(F, family = null, mode = 'now', kindSel = null, pressId = 0, 
       if (opp) targets = targets.map(t => { const r = clonePose(t); gaze(r, head); return rig.fixRigid(r); });
       // (it takes over when its motion is spliced in: until then the strike being played is the one that counts)
       const wound = !F.isPlayer && !!F.antic?.baked && F.antic.a === a; // (generated out of a held wind-up: it snaps out)
-      const atk = { part: k.part, id: Math.random(), kind: k.kind, key: k, yaw, at, jump: jump ? JH : 0, oppAt: opp ? flat(OP[0]) : null, followed: false, landed: false, sweep: swing && /hook|round/.test(k.family), t0: clock, pressId, aimPart, charged: !!opts.lunge };
+      const atk = { part: k.part, id: Math.random(), kind: k.kind, key: k, yaw, at, jump: jump ? JH : 0, spliceAt: 0, oppAt: opp ? flat(OP[0]) : null, followed: false, landed: false, sweep: swing && /hook|round/.test(k.family), t0: clock, pressId, aimPart, charged: !!opts.lunge };
       F.lastMatch = { name: k.name, kind: 'attack', cost: bc, frame: 0, dPose: +dPose.toFixed(2) };
       F.current = null;
       // already wound up that way: out sooner (less wind-up, a little faster)
       const ready = clamp(1 - dPose / 0.8, 0, 1);
+      if (F.isPlayer && mode === 'now') F.spec = { pose: targets[0], t0: Math.min(clock, F.windAt ?? clock), atk }; // (shown from the press on: specStrike)
       const rate = RATE[k.kind] * (1 + 0.25 * ready) * (opts.lunge ? 1.25 : 1);
       atk.ready = ready;
       return {
@@ -842,7 +846,7 @@ function strikeReq(F, family = null, mode = 'now', kindSel = null, pressId = 0, 
           F.attack = atk; atk.spliced = true;
           if (F.isPlayer) postureHit(F, 2, 'swing');
           const dur = warpStrike(F, frames, k.part, rate, ready, k.family, wound);
-          atk.contactAt = clock + dur; // (when the limb reaches the top: the blow is under way until then)
+          atk.contactAt = clock + dur; atk.spliceAt = clock; // (when the limb reaches the top: the blow is under way until then)
           if (atk.jump) F.jump = { t0: clock, up: Math.max(0.18, dur), h: atk.jump, side: k.part.startsWith('Left') ? 'Right' : 'Left' };
           F.state = 'attack'; F.until = clock + dur + 0.6;
         },
@@ -1244,7 +1248,7 @@ function checkHits(A, B, dt) {
   // a strike asked for but not yet under way (the motion still the one before): nothing it touches counts; an
   // opponent's blow does not land in its first 0.3 s (the wind-up is always there to see)
   if (A.state === 'attack' && !A.attack) { A.contacts.delete(B); return; }
-  if (!A.isPlayer && A.attack && clock - A.attack.t0 < 0.35) { A.contacts.delete(B); return; }
+  if (!A.isPlayer && A.attack && clock - A.attack.t0 < 0.22) { A.contacts.delete(B); return; }
   if (B.dodge && clock < B.dodge.iframes) {
     if (A.attack && !A.attack.dodgedBy) { A.attack.dodgedBy = B.id; postureHit(A, 10, 'dodged'); if (A.brain) A.brain.combo = 0; A.attackQueued = null; // (a dodged blow has no second half)
       plog?.note('dodged', { by: A.id }); if (B.isPlayer) { dust(B.P[0], 0x9fe0ff); slowUntil = performance.now() + 120; } }
@@ -1669,7 +1673,7 @@ function think(E, dt) {
     if (turn && d >= 1.3 && d < 2.0 && clock > B.lungeUntil + 0.5 && !E.charge) { B.lungeUntil = clock + 0.3; goal = pp.clone().addScaledVector(to, -0.95); E.mode = 'lunge'; }
     // the tell: a quick step back, then in with the blow
     if (B.tellAt) {
-      goal = pp.clone().addScaledVector(to, -Math.max(d + 0.2, 1.1)); E.mode = 'evade'; // (out to just beyond reach: the wind-up and the blow have room to show, and the blow still reaches)
+      { const ah = playerAhead(0.35); goal = ah.clone().addScaledVector(flat(ah.clone().sub(E.P[0])).normalize(), -0.9); E.mode = 'lunge'; } // (in to where the player is going, just short of it: the blow lands there)
       if (clock >= B.tellAt || E.state !== 'free') {
         const k = B.tellKind; B.tellAt = null;
         if (E.state === 'free' && strike(E, k) === 'started') {
@@ -1683,7 +1687,8 @@ function think(E, dt) {
         } else { B.nextAttack = clock + 0.2; B.burst = false; if (E.antic?.big && !E.antic.baked) E.antic.until ??= clock; }
       }
     }
-    if (turn && d < 1.3 && !B.tellAt) {
+    const dAhead = flat(playerAhead(0.4)).distanceTo(flat(E.P[0]));
+    if (turn && (d < 1.3 || dAhead < 1.4) && !B.tellAt) {
       {
         const kind = d > 1.1 ? (Math.random() < 0.65 ? 'kick' : 'punch') : Math.random() < 0.55 ? 'punch' : 'kick';
         const u = Math.random(), part = kind === 'kick' && u < 0.3 ? 'legs' : u < 0.6 ? 'head' : 'body';
@@ -1694,7 +1699,7 @@ function think(E, dt) {
         else if (!inView(P, E) && !B.announced) {
           // out of the player's sight: it announces itself first (a warning at the player's feet), then strikes
           B.announced = true; E.warnUntil = clock + 0.45; B.nextAttack = clock + 0.45;
-        } else { B.tellAt = clock + 0.36; B.tellKind = kind; crew.lastStrikeAt = clock; crew.lastStriker = E; E.antic = { t0: clock, side: Math.random() < 0.5 ? 1 : -1, big: true, kind }; } // (the tell first: a chamber held)
+        } else { B.tellAt = clock + 0.16; B.tellKind = kind; crew.lastStrikeAt = clock; crew.lastStriker = E; E.antic = { t0: clock, side: Math.random() < 0.5 ? 1 : -1, big: true, kind }; } // (the tell first: a chamber held)
       }
     }
     // the rest of a combination: kept while the blow is out (it is chained from the top)
@@ -1841,6 +1846,51 @@ function autoStrike(F) {
  * The jump kick: the body leaves the floor as the kick goes out (up to 30 cm at its top), the other leg tucked, comes
  * down after it, and the knees take the landing (the hips dip). Shown over the generated kick.
  */
+/**
+ * The player's body leads its motion (speculative, then handed over): the hips go where the spring says from the
+ * first frame - the difference between the spring's velocity and what the generated motion actually moves is slid
+ * into the motion itself (at most 1.4 m/s, half of it caught up in 0.07 s), so a pull starts the body at once and a
+ * stop stops it, and once MotionBricks' own motion is going that way there is nothing left to slide. (The debt leaks
+ * away over 0.4 s: a generated pace that stays slower is not skated after forever. The planted feet hold - see
+ * footLock - so a short slide bends the legs rather than skating them.)
+ */
+function leadOn(F, dt, r0) {
+  F.debt ??= new Vector3();
+  if (F.state !== 'free' || F.ragOn || (F.dash && clock < F.dash.until) || !F.spring?.target) { F.debt.multiplyScalar(Math.exp(-dt / 0.08)); return; }
+  const r1 = F.track.display.root;
+  F.debt.x += F.vel.x * dt - (r1.x - r0.x); F.debt.z += F.vel.z * dt - (r1.z - r0.z);
+  F.debt.multiplyScalar(Math.exp(-dt / 0.4)).clampLength(0, 0.45);
+  const take = F.debt.clone().multiplyScalar(1 - Math.exp(-dt / 0.1)).clampLength(0, 1.4 * dt);
+  if (take.lengthSq() < 1e-10) return;
+  F.track.shift(take.x, take.z); F.debt.sub(take);
+}
+/**
+ * The player's blow starts with the press (speculative, then handed over): from 0.06 s after the press (the wind-up
+ * shown first) the body is drawn toward the strike's top pose, accelerating, reaching it 0.22 s later; when the
+ * generated strike arrives, the layer gives way to it as fast as the generated limb gets there itself (the shown
+ * progress is the larger of the two: it never goes back to the generated wind-up).
+ */
+function specStrike(F) {
+  const S = F.spec;
+  if (!S) return;
+  const A = S.atk, t = clock - S.t0;
+  const pg = A.spliced && A.contactAt > A.spliceAt ? clamp((clock - A.spliceAt) / (A.contactAt - A.spliceAt), 0, 1) : 0;
+  if (F.state !== 'attack' || (F.attack && F.attack !== A && F.attack.spliced) || pg >= 0.98 || t > 0.9 || ((A.landed || A.followed) && clock - (S.endAt ??= clock) > 0.15)) { F.spec = null; return; }
+  const u = clamp((t - 0.06) / 0.22, 0, 1), ps = u * u;
+  let w = ps > pg ? (ps - pg) / (1 - pg) : 0;
+  if (A.landed || A.followed) w = (S.wEnd ??= w) * (1 - (clock - S.endAt) / 0.15); else S.wEnd = null;
+  if (w <= 0.001) return;
+  F.shown = lerpPose(F.shown, S.pose, 0.9 * w);
+}
+/**
+ * Where the player will be `T` seconds on: its hips run on their spring toward the cursor (as its own strikes are
+ * placed), so an opponent throws at where the player is going, not where its motion has got to.
+ */
+function playerAhead(T) {
+  const P = player, v = P.vel.clone(), p = flat(P.P[0]);
+  for (let t = 0; t < T; t += 1 / 30) { springStep(v, p, P.spring?.target ?? null, 1 / 30, feelOf(P)); p.addScaledVector(v, 1 / 30); }
+  return p;
+}
 function jumpLayer(F) {
   const J = F.jump;
   if (!J) return;
@@ -1896,9 +1946,9 @@ function settleLayer(F) {
 function trackIn(F, dt) {
   const A = F.attack;
   if (F.isPlayer || F.state !== 'attack' || !A?.spliced || !A.oppAt || A.landed || A.followed || !A.contactAt || !player) return;
-  if (player.dodge && clock < player.dodge.until + 0.1) { A.oppAt = null; return; } // (dodged: it goes where it was going)
-  if (clock > A.contactAt - 0.14 || ['down', 'fall', 'getup'].includes(player.state)) return;
-  const want = flat(player.P[0]).sub(A.oppAt), step = want.clampLength(0, 2.2 * dt);
+  if (player.dodge?.flick && clock < player.dodge.until + 0.1) { A.oppAt = null; return; } // (dodged: it goes where it was going)
+  if (clock > A.contactAt - 0.12 || ['down', 'fall', 'getup'].includes(player.state)) return;
+  const want = playerAhead(clamp(A.contactAt - clock, 0, 0.35)).sub(A.oppAt), step = want.clampLength(0, 4.0 * dt);
   if (step.lengthSq() < 1e-8) return;
   F.track.shift(step.x, step.z); A.oppAt.add(step);
 }
@@ -2208,10 +2258,10 @@ function homing(F) {
   const k = A.key;
   const goal = F.aim && F.aim.part !== 'legs' ? o.P[F.aim.joint].clone().add(F.aim.off) : k.family === 'low' ? o.P[I.LeftShin].clone().lerp(o.P[I.RightShin], 0.5) : k.high ? o.P[I.Head].clone() : o.P[I.Spine2].clone();
   // the player's limb homes in more; an opponent's a little, and not on a player stepping out of it
-  if (!F.isPlayer && o.dodge && clock < o.dodge.until + 0.1) return;
-  const w = clamp((0.7 - tip.distanceTo(goal)) / 0.45, 0, 1) * 0.7;
+  if (!F.isPlayer && o.dodge?.flick && clock < o.dodge.until + 0.1) return;
+  const w = clamp(((F.isPlayer ? 0.7 : 0.85) - tip.distanceTo(goal)) / 0.45, 0, 1) * 0.7;
   if (w <= 0) return;
-  F.shown = lerpPose(F.shown, reachLimb(F.shown, A.part, goal, F.isPlayer ? 0.2 : 0.26), w);
+  F.shown = lerpPose(F.shown, reachLimb(F.shown, A.part, goal, F.isPlayer ? 0.2 : 0.32), w);
 }
 function startCharge(E, kind, feint = false) {
   // (a hit or a fall already on its way outranks the load: then no charge - not a fighter marked as charging that never loads)
@@ -2648,7 +2698,23 @@ function simulate(dt) {
         player.setOffArmed = false; player.setOff = { t0: clock, dir: pull.normalize() }; if (!player.track.busy) player.planTimer = 0;
       }
     }
-    springStep(player.vel, flat(player.P[0]), player.spring.target, dt, feelOf(player));
+    // the spring stiffens with the mouse's speed (gain scheduling of a second-order system: natural frequency
+    // w = sqrt(k), damping ratio z = c / 2w, settling in about 4 / (z w)). Slow: the soft pendulum as before (w 3.7,
+    // z 0.35: it swings back); fast: stiff and nearly critically damped (w up to 8.6, z 0.7: it settles in about
+    // 0.7 s instead of 3, a little overshoot left). The speed is taken at once and let go over 0.3 s.
+    {
+      const sNow = clamp(((player.cVel ? flat(player.cVel).length() : 0) - 0.5) / 2.5, 0, 1);
+      player.stiff = (player.stiff ?? 0) + (sNow - (player.stiff ?? 0)) * (1 - Math.exp(-dt / (sNow > (player.stiff ?? 0) ? 0.04 : 0.3)));
+    }
+    const w0 = Math.sqrt(settings.spring.k), z0 = settings.spring.c / (2 * w0), wS = w0 * (1 + 1.3 * player.stiff), zS = z0 + (0.7 - z0) * player.stiff;
+    const fl = feelOf(player) ?? {}, sched = { k: (fl.k ?? 1) * (wS * wS) / settings.spring.k, c: (fl.c ?? 1) * (2 * zS * wS) / settings.spring.c, vmax: fl.vmax ?? 1 };
+    springStep(player.vel, flat(player.P[0]), player.spring.target, dt, sched);
+    // the cursor's own speed fed straight in (half of it, within 0.08 s) while it moves on ahead of the hips: the body
+    // moves the moment the mouse does, linearly, and the spring does the rest (its swing back when the mouse stops)
+    if (player.state === 'free' && player.spring.target && player.cVel && !(player.dash && clock < player.dash.until)) {
+      const cv = flat(player.cVel).clampLength(0, settings.vmax), ahead = flat(player.spring.target.clone().sub(player.P[0]));
+      if (cv.length() > 0.4 && cv.dot(ahead) > 0 && ahead.length() > 0.25) player.vel.lerp(cv, (1 - Math.exp(-dt / 0.08)) * 0.5);
+    }
     if (!free) player.vel.multiplyScalar(Math.exp(-dt * 4));
     // striking: the spring's speed follows what the body really does (no speed stored up for a lurch afterwards)
     if (player.state === 'attack' && player.prevP) player.vel.lerp(flat(player.P[0].clone().sub(player.prevP[0])).divideScalar(dt), 1 - Math.exp(-dt * 6));
@@ -2737,7 +2803,9 @@ function simulate(dt) {
       else if (!active && F.track.remaining / FPS < scheduler.latency + 0.25) F.track.request(planReq(F, 'move', 'end'));
     }
     slideOn(F); shoveOn(F); trackIn(F, dt);
+    const r0 = F.isPlayer ? F.track.display.root.clone() : null;
     F.track.advance(dt);
+    if (F.isPlayer) leadOn(F, dt, r0);
   }
   { const t = performance.now(); scheduler.tick(fighters.filter(f => f.state !== 'out').map(f => f.track)); const ms = performance.now() - t; perf.req += ms; perf.reqMax = Math.max(perf.reqMax, ms); }
   for (const F of fighters) {
@@ -2750,6 +2818,7 @@ function simulate(dt) {
     breathe(F);
     footLock(F);
     anticipate(F);
+    specStrike(F);
     jumpLayer(F);
     settleLayer(F);
     setOffLean(F);
