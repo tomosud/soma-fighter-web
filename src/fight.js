@@ -567,24 +567,26 @@ function planReq(F, kind, mode = 'now') {
         if (biasBuf?.length !== db.n) biasBuf = new Float32Array(db.n);
         if (recentClip?.length !== db.clips.length) recentClip = new Uint8Array(db.clips.length);
         recentClip.fill(0); for (const c of recentSet) recentClip[c] = 1;
+        // standing still with an opponent close: a fighting stance, not a plain stand or a leftover run (the
+        // guard comes from the reference clip, so the generation itself holds it - no procedural arms)
+        const still = F.isPlayer ? !F.spring?.target && F.vel.length() < 0.6 : passive;
+        const opp2 = F.opponent, inFight = still && kind === 'move' && opp2 && opp2.state !== 'out' && flat(opp2.P[0].clone().sub(F.P[0])).length() < 3;
         {
           const mask = maskOf(kind), eC = db.entClip, eF = db.entFrame, cc = cont ? F.current.clip : -1, cf = cont ? cont.frame : 0, stance = T.stance;
-          // standing still with an opponent close: a fighting stance, not a plain stand (the guard comes from the
-          // reference clip, so the generation itself holds it - no procedural arms)
-          const opp = F.opponent, inFight = passive && kind === 'move' && opp && opp.state !== 'out' && flat(opp.P[0].clone().sub(F.P[0])).length() < 3;
           for (let i = 0; i < db.n; i++) {
             if (!mask[i]) { biasBuf[i] = Infinity; continue; }
             let b = calm * change[i];
             if (movingOn && entTag[i] === stance) b += 1.5; // pulled along: not a clip that stays put
-            if (inFight && entTag[i] !== stance) b += 1.2;
+            if (inFight && entTag[i] !== stance) b += 2.2;
             const c = eC[i];
             if (c === cc) { if (eF[i] < cf && eF[i] > cf - 40) b += 4; }
             else if (recentClip[c]) b += 2;
             biasBuf[i] = b;
           }
         }
-        // (the clip playing on wins unless something is clearly better: that is the search's bound)
-        const cc = cont ? costOf(cont.i, q, w) + calm * change[cont.i] : Infinity, stayK = movingOn ? 1 : settings.stay;
+        // (the clip playing on wins unless something is clearly better: that is the search's bound; squared up, a
+        // non-stance clip it is sitting in pays the same stance penalty, or it would never let go of a run)
+        const cc = cont ? costOf(cont.i, q, w) + calm * change[cont.i] + (inFight && entTag[cont.i] !== T.stance ? 2.2 : 0) : Infinity, stayK = movingOn ? 1 : settings.stay;
         // (an opponent carrying on the way it was going, its clip still fitting: no search this time - at most every
         // 0.5 s; the player always searches)
         const carryOn = cont && kind === 'move' && mode === 'now' && !F.isPlayer && F.searchedAt != null && clock - F.searchedAt < 0.5 && F.want.distanceTo(F.searchWant) < 0.3;
@@ -1359,7 +1361,7 @@ function groundHit(A, B, energy, dir, at, isHead) {
   // sends it, its limbs flop, and the motion is moved along to where it ended up; see ragStep)
   B.groundJolt = clock;
   // (a kick into a lying body: it jolts and shifts it a little - limbs flop, the body does not shoot across the floor)
-  jolt(B, at, n.clone().addScaledVector(UP, 0.25).multiplyScalar(Math.min(13, Math.sqrt(2 * energy * 2))), 0.12, 1.0, true);
+  jolt(B, at, n.clone().addScaledVector(UP, 0.3).multiplyScalar(Math.min(19, Math.sqrt(2 * energy * 3.6))), 0.1, 1.1, true);
   // the player is never kept down by kicks: it hurts, the body is pushed, the getting-up goes on
   if (B.state === 'getup' && !B.isPlayer) { B.state = 'down'; B.until = clock + 2; B.getupKey = null; B.track.request(stirReq(B, 1, 0)); }
   else if (B.state === 'down' && !B.isPlayer) B.until += clamp(energy / 150, 0.1, 0.5);
@@ -1923,10 +1925,13 @@ function specStrike(F) {
   const u = clamp((t - 0.06) / 0.22, 0, 1), ps = u * u;
   let w = ps > pg ? (ps - pg) / (1 - pg) : 0;
   if (A.landed || A.followed) w = (S.wEnd ??= w) * (1 - (clock - S.endAt) / 0.15); else S.wEnd = null;
+  // the weight eased, never stepped: pg jumps as the generated strike lands in, and a stepped weight was a visible tick
+  const dtl = clamp(clock - (S.lastT ?? clock), 0, 0.1); S.lastT = clock;
+  w = S.wS = (S.wS ?? 0) + (w - (S.wS ?? 0)) * (1 - Math.exp(-dtl / 0.045));
   if (w <= 0.001 || !TUNE.spec) return;
   S.joints ??= rig.subtree(I.Spine1); // (the upper body only: a kicking leg turned while its foot is still down slid it along the floor)
   const p = clonePose(F.shown);
-  for (const j of S.joints) p.rot[j].slerp(S.pose.rot[j], 0.9 * w);
+  for (const j of S.joints) p.rot[j].slerp(S.pose.rot[j], 0.8 * w);
   F.shown = rig.fixRigid(p);
 }
 /**
@@ -2054,7 +2059,7 @@ function aliveLayer(F, dt) {
   F.aliveBase = [I.Head, I.LeftHand, I.RightHand, I.Spine2].map(j => D[j].clone());
   if (!prev) return;
   let sp = 0; F.aliveBase.forEach((v, i) => { sp += v.distanceTo(prev[i]); }); sp /= 4 * Math.max(dt, 1e-3);
-  const want = clamp(1 - (sp - 0.15) / 0.5, 0, 1);
+  const want = clamp(1 - (sp - 0.22) / 0.5, 0, 1);
   F.aliveW = (F.aliveW ?? 0) + (want - (F.aliveW ?? 0)) * (1 - Math.exp(-dt / (want > (F.aliveW ?? 0) ? 0.25 : 0.08)));
   const w = F.aliveW;
   if (w < 0.02) return;
@@ -2063,11 +2068,11 @@ function aliveLayer(F, dt) {
   const p = clonePose(F.shown);
   const feet = ['Left', 'Right'].map(sd => P[I[sd + 'Foot']].clone());
   const breath = Math.sin(t * 2 * Math.PI * 0.45), sway = Math.sin(t * 2 * Math.PI * 0.31 + 1.3), jit = Math.sin(t * 2 * Math.PI * 1.7 + 0.4);
-  rotateSubtree(rig, p, I.Spine1, new Quaternion().setFromAxisAngle(lat, 0.035 * breath * w));
-  rotateSubtree(rig, p, I.Spine1, new Quaternion().setFromAxisAngle(UP, 0.04 * sway * w));
-  rotateSubtree(rig, p, I.Neck1, new Quaternion().setFromAxisAngle(fwd, 0.04 * jit * w));
-  for (const [sd, k] of [['Left', 0.7], ['Right', -0.9]]) rotateSubtree(rig, p, I[sd + 'Arm'], new Quaternion().setFromAxisAngle(lat, 0.05 * Math.sin(t * 2 * Math.PI * 0.6 + k) * w));
-  p.root.addScaledVector(lat, 0.02 * sway * w); p.root.y += 0.012 * breath * w;
+  rotateSubtree(rig, p, I.Spine1, new Quaternion().setFromAxisAngle(lat, 0.055 * breath * w));
+  rotateSubtree(rig, p, I.Spine1, new Quaternion().setFromAxisAngle(UP, 0.06 * sway * w));
+  rotateSubtree(rig, p, I.Neck1, new Quaternion().setFromAxisAngle(fwd, 0.05 * jit * w));
+  for (const [sd, k] of [['Left', 0.7], ['Right', -0.9]]) rotateSubtree(rig, p, I[sd + 'Arm'], new Quaternion().setFromAxisAngle(lat, 0.08 * Math.sin(t * 2 * Math.PI * 0.6 + k) * w));
+  p.root.addScaledVector(lat, 0.03 * sway * w); p.root.y += 0.018 * breath * w;
   ['Left', 'Right'].forEach((sd, i) => legTo(p, sd, feet[i]));
   F.shown = rig.fixRigid(p);
 }
@@ -2617,7 +2622,7 @@ function ragStep(F, dt) {
   F.ragT += dt;
   const down = F.state === 'fall';
   const kicked = lying && clock - (F.groundJolt ?? -9) < 1.0;
-  R.gravity = lying || down; R.friction = lying ? (kicked ? 0.45 : 0.2) : 0;
+  R.gravity = lying || down; R.friction = lying ? (kicked ? 0.35 : 0.2) : 0;
   // muscles firm up again (not while going down: the body stays loose until it lies)
   const u = down ? 0 : clamp(F.ragT / F.ragRecover, 0, 1);
   // firming muscles also damp: the body swallows the jolt and settles instead of ringing against the motion
@@ -2636,7 +2641,7 @@ function ragStep(F, dt) {
   if (kicked) { const d = flat(R.x[0].clone().sub(F.shown.root)).multiplyScalar(1 - Math.exp(-dt / 0.2)); F.track.shift(d.x, d.z); }
   // back to the motion once firm again; on the floor (lying, stirring) the motion's own; drifting off: at once
   if (F.ragFade) F.ragW = Math.max(0, F.ragW - dt / 0.12);
-  else if (kicked) F.ragW = clock - F.groundJolt < 0.5 ? 1 : Math.max(0.55, F.ragW - dt / 0.5); // (all ragdoll while the blow plays out)
+  else if (kicked) F.ragW = clock - F.groundJolt < 0.75 ? 1 : Math.max(0.55, F.ragW - dt / 0.5); // (all ragdoll while the blow plays out)
   else if (F.state === 'down') F.ragW = Math.max(0.55, F.ragW - dt / 0.4); // (lying: gravity settles the limbs the fall clip leaves in the air)
   else if (F.state === 'getup') F.ragW = Math.max(0, F.ragW - dt / 0.4);
   else if (!down && u >= 1) F.ragW = Math.max(0, F.ragW - dt / 0.2);
@@ -2909,6 +2914,21 @@ function simulate(dt) {
     if (L.setOff) setOffLean(F); pr?.('setOff');
     if (L.alive) aliveLayer(F, dt); pr?.('alive');
     if (L.homing) homing(F); pr?.('homing');
+    // no pop: a root stepping farther than a body moves in one frame (a splice landing a carried offset, a ragdoll
+    // fade) keeps only a frame's worth now; the excess is held and eased out over a tenth of a second
+    {
+      if (F.prevRootRaw) {
+        const ex = F.shown.root.clone().sub(F.prevRootRaw); ex.y = 0;
+        const L2 = ex.length(), cap = 0.22;
+        if (L2 > cap) (F.popOff ??= new Vector3()).addScaledVector(ex, -(L2 - cap) / L2);
+      }
+      F.prevRootRaw = F.shown.root.clone();
+      if (F.popOff) {
+        F.popOff.multiplyScalar(Math.exp(-dt / 0.1));
+        if (F.popOff.lengthSq() < 1e-6) F.popOff = null;
+        else { F.shown.root.x += F.popOff.x; F.shown.root.z += F.popOff.z; }
+      }
+    }
     F.P = rig.positions(F.shown);
     // (the play log: how far the struck part moved 0.2 s after a blow)
     if (F.dispProbe && clock - F.dispProbe.t0 >= 0.2) { const D = F.dispProbe; plog?.note('partDisp', { who: F.isPlayer ? 'P' : F.id, part: D.part, disp: +F.P[D.joint].distanceTo(D.p0).toFixed(3), energy: +D.energy.toFixed(1) }); F.dispProbe = null; }
