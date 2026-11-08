@@ -315,6 +315,7 @@ export function score(sum, tally, sec, kind = 'skilled') {
 /** A series: each kind of player x each seed, from a fresh fight each time; mean and worst (overall and per kind). */
 export async function series(brawl, { secs = 90, seeds = [1, 2, 3], kinds = ['novice', 'skilled'], onRun } = {}) {
   const runs = [];
+  brawl.start?.(); // (the page waits for its start button)
   for (const kind of kinds) for (const seed of seeds) {
     brawl.reset();
     await sleep(2500); // (the fight forms again)

@@ -26,6 +26,7 @@ const TEMPO = await fetch(new URL('../assets/tempo_profiles.json', import.meta.u
 const TEMPO_OF = { straight: 'straight', hook: 'hook', uppercut: 'uppercut', elbow: 'elbow', knee: 'knee', front: 'kick_front', round: 'kick_round', low: 'kick_low' };
 const tempoProfile = fam => (TEMPO && !params.has('notempo') ? TEMPO.families[TEMPO_OF[fam] ?? fam] ?? null : null);
 let plog = null; // the play log (src/playlog.js)
+let started = false; // (nothing is simulated, generated or logged until the start button is pressed)
 
 const MB_REV = '54fc563aeaaf819a753d72cc9fdc6713989cdd43';
 const MODELS = {
@@ -2666,7 +2667,7 @@ function frame(now) {
   const real = Math.min(0.1, (now - last) / 1000);
   if (hitstop > 0) hitstop -= real;
   hurt = Math.max(0, hurt - real / 0.35);
-  const dt = real * (hitstop > 0 ? 0.15 : now < slowUntil ? 0.35 : 1);
+  const dt = started ? real * (hitstop > 0 ? 0.15 : now < slowUntil ? 0.35 : 1) : 0;
   last = now;
   acc += dt;
   while (acc >= STEP) { simulate(STEP); acc -= STEP; }
@@ -2805,7 +2806,11 @@ worker.onmessage = ({ data }) => {
     warmup(-1);
   } else if (data.type === 'result') {
     if (data.id === -1) warmup(0);
-    else if (data.id === 0) { scheduler.latency = Math.max(0.05, data.ms / 1000); scheduler.ready = true; $('overlay').classList.add('hidden'); }
+    else if (data.id === 0) {
+      scheduler.latency = Math.max(0.05, data.ms / 1000); scheduler.ready = true;
+      if (started) $('overlay').classList.add('hidden');
+      else { label.textContent = `${scheduler.backend} で準備完了`; $('go').hidden = false; $('go').focus(); }
+    }
     else scheduler.onResult(data);
   } else if (data.type === 'error') {
     if (data.id) scheduler.onFail(data.id);
@@ -2821,6 +2826,15 @@ function loadModel() {
   worker.postMessage({ type: 'load', url, ep: params.get('ep') ?? 'webgpu', batch: BATCH });
 }
 $('start').addEventListener('click', loadModel);
+// the fight starts on the button (the model loads and warms up before; nothing runs or is logged until then)
+function begin() {
+  if (started) return;
+  started = true; last = performance.now(); acc = 0;
+  if (scheduler.ready) $('overlay').classList.add('hidden');
+  plog = createPlayLog({ get player() { return player; }, get fighters() { return fighters; }, get clock() { return clock; }, mouse, get lastHit() { return lastHit; }, crew, cursorFloor, settings, I });
+  if ($('play-log-info')) $('play-log-info').textContent = plog.local ? `記録中（20 秒ごとに eval_out/play_${plog.sid}_* へ）` : '記録中（ボタンで保存）';
+}
+$('go').addEventListener('click', begin);
 loadModel();
 // the "how many opponents" links keep the other settings of the address (the model, the trigger)
 for (const el of document.querySelectorAll('a[href^="?enemies="]')) {
@@ -2835,9 +2849,7 @@ for (const el of document.querySelectorAll('input[name=trigger]')) {
 }
 
 // the play is recorded all along (saved to eval_out/ when served locally; the button downloads it)
-plog = createPlayLog({ get player() { return player; }, get fighters() { return fighters; }, get clock() { return clock; }, mouse, get lastHit() { return lastHit; }, crew, cursorFloor, settings, I });
-$('play-log')?.addEventListener('click', async () => { if (plog.local) { await plog.save(); $('play-log-info').textContent = `保存した：eval_out/play_${plog.sid}_*`; } else await plog.download(); });
-if ($('play-log-info')) $('play-log-info').textContent = plog.local ? `記録中（20 秒ごとに eval_out/play_${plog.sid}_* へ）` : '記録中（ボタンで保存）';
+$('play-log')?.addEventListener('click', async () => { if (!plog) return; if (plog.local) { await plog.save(); $('play-log-info').textContent = `保存した：eval_out/play_${plog.sid}_*`; } else await plog.download(); });
 requestAnimationFrame(loop);
 if (params.has('debug')) {
   if ($('stats-foot')) $('stats-foot').hidden = false;
@@ -2853,6 +2865,7 @@ if (params.has('debug')) {
     unscript() { scripted = null; },
     aim(a) { aimOverride = a; },
     draw: () => frame(performance.now()),
+    start: begin,
     onStep: null,
   };
 }
