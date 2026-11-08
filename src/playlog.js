@@ -112,6 +112,21 @@ export function createPlayLog(ctx) {
       playerStill: n ? +(F.filter(fr => fr.ps >= 3 && (fr.pl ?? fr.hv) < 0.08).length / n).toFixed(2) : null, // (unable to act and the body not moving: limbs and head)
       downStill: downEnds.length ? +mean(downEnds.map(e => e.still)).toFixed(2) : null,
       downMotion: downEnds.length ? +mean(downEnds.map(e => e.motion)).toFixed(2) : null,
+      // the dogfight: where blows land from, vital points, balance broken, blows turned aside head-on
+      ...(() => {
+        const gl = given.filter(e => !e.touch && !e.blocked), gJ = gl.reduce((a, e) => a + e.energy, 0) || 1;
+        const tk = taken.filter(e => !e.touch && !e.blocked);
+        const per = x => +(x / Math.max(sec, 1e-3) * 60).toFixed(1);
+        return {
+          sideShareJ: +(gl.filter(e => e.aspect && e.aspect !== 'front').reduce((a, e) => a + e.energy, 0) / gJ).toFixed(2),
+          vitalShare: gl.length ? +(gl.filter(e => e.vital).length / gl.length).toFixed(2) : null,
+          takenSideShare: tk.length ? +(tk.filter(e => e.aspect && e.aspect !== 'front').length / tk.length).toFixed(2) : null,
+          breaksPerMin: per(E.filter(e => e.type === 'postureBreak' && e.who !== 'P').length),
+          playerBreaksPerMin: per(E.filter(e => e.type === 'postureBreak' && e.who === 'P').length),
+          autoGuardsPerMin: per(E.filter(e => e.type === 'guardAuto').length),
+          playerGuardedInto: given.filter(e => e.autoGuard).length, feints: E.filter(e => e.type === 'feint').length,
+        };
+      })(),
       meanDist: n ? +(F.reduce((a, fr) => a + fr.d, 0) / n).toFixed(2) : null,
       cursorSpeed: n ? Math.round(F.reduce((a, fr) => a + fr.ms, 0) / n) : 0,
     };
@@ -150,7 +165,7 @@ export function createPlayLog(ctx) {
     if (lh && lh !== lastHit) {
       lastHit = lh;
       const w0 = lh.by !== 'あなた' ? lastWind.get(lh.striker) : null;
-      const e = ev(lh.by === 'あなた' ? 'hit' : 'taken', { angle: w0?.angle ?? null, warned: !!w0?.warned, wind: w0 ? +(clock - w0.t).toFixed(2) : null, energy: +lh.energy.toFixed(1), tier: lh.tier, counter: !!lh.counter, touch: !!lh.touch, slam: !!lh.slam, blocked: !!lh.blocked, head: !!lh.isHead, victim: lh.victim, pressId: lh.pressId || null });
+      const e = ev(lh.by === 'あなた' ? 'hit' : 'taken', { angle: w0?.angle ?? null, warned: !!w0?.warned, wind: w0 ? +(clock - w0.t).toFixed(2) : null, energy: +lh.energy.toFixed(1), tier: lh.tier, counter: !!lh.counter, touch: !!lh.touch, slam: !!lh.slam, blocked: !!lh.blocked, head: !!lh.isHead, victim: lh.victim, pressId: lh.pressId || null, aspect: lh.aspect ?? null, vital: lh.vital ?? null, autoGuard: !!lh.autoGuard });
       const pr = lh.pressId && pressById.get(lh.pressId);
       if (pr && lh.by === 'あなた' && pr.tContact == null) { pr.tContact = +(clock - pr.t).toFixed(2); pr.energy = e.energy; pr.tier = lh.tier; }
       const V = ctx.fighters.find(f => f.id === lh.victim);

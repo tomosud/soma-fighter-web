@@ -30,22 +30,16 @@
   <canvas id="view"></canvas>
   <div class="hpbar" id="hpb-player"><div id="hp-player" style="width:100%"></div></div>
   <div class="hpbar" id="hpb-enemy"><div id="hp-enemy" style="width:0%"></div></div>
-  <div class="fight-info">倒した数 <b id="kos">0</b><span id="last-hit"></span></div>
-  <div class="fight-info" style="font-size:11px;opacity:.8"><button id="play-log" type="button" style="font-size:11px;padding:1px 6px;width:auto;min-width:0;height:auto;margin:0;display:inline-block">プレイ記録を保存</button> <span id="play-log-info"></span></div>
+  <div class="fight-info"><span id="kos-pips" style="color:#ffcf70;letter-spacing:2px"></span><b id="kos" hidden>0</b><span id="last-hit" hidden></span></div>
+  <button id="play-log" type="button" title="プレイ記録を保存" style="position:fixed;right:8px;bottom:8px;z-index:7;font-size:12px;line-height:1;padding:3px 6px;width:auto;min-width:0;height:auto;margin:0;opacity:.55;background:none;border:1px solid #844;color:#e66;border-radius:10px">●</button><span id="play-log-info" hidden></span>
 
-  <div class="fight-guide">
-    <div><b>動く</b>：マウスを動かすだけ（ボタンは要らない）。腰がばねでカーソルの下へ引かれ、勢いがつく。体はカーソルの方を向き、目から薄い線が出る。相手の上では打撃の間合いで止まり、素早く振り抜けば体当たり</div>
-    <div><b>打つ</b>：左クリックでパンチ、右クリックでキック。カーソルの指す所（頭・胴・脚）を狙う。その瞬間の構えと勢いに合う技が出る。打っている間に押すと次の技へつなぐ</div>
-    <div>同時の相手：<a href="?enemies=1">1</a> · <a href="?enemies=2">2</a> · <a href="?enemies=3">3</a></div>
-    <div id="db-info">参考ポーズを読み込み中…</div>
-  </div>
+  <div class="fight-guide" hidden><div id="db-info"></div></div>
 
-  <footer class="help"><span id="stats"></span></footer>
+  <footer class="help" id="stats-foot" hidden><span id="stats"></span></footer>
 
   <section id="overlay">
     <div class="card">
       <h1>SOMA Brawl</h1>
-      <p>マウスで動き、左クリックでパンチ、右クリックでキックです。相手は 3 人。交代で攻め役になり、残りは回り込んで隙をうかがいます。倒すと次が来ます。動きはすべて、Mixamo のアニメーションから作った参考ポーズの中からモーションマッチングで選び、そこまでを NVIDIA の MotionBricks（SOMA）がブラウザの中で生成します。当たりの強さは、当たった手足の速さから計算した運動エネルギーで決まります。</p>
       <fieldset>
         <legend>モデル</legend>
         <label><input type="radio" name="model" value="fp16" checked> Mixed FP16（380 MB、おすすめ）</label>

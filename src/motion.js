@@ -5,7 +5,7 @@ import { FPS, clonePose, lerpPose, placePose, emptyBatch, encodeRequest, decodeR
 const LOCK = new Set(['attack', 'hit', 'down']);
 const PRIORITY = { idle: 0, move: 1, attack: 2, hit: 3, down: 4 };
 const ZERO = new Vector3();
-export const BATCH = 2; // the model session is built for this fixed batch size
+export const BATCH = Number(globalThis.location ? new URLSearchParams(location.search).get('batch') : 0) || 2; // the model session is built for this fixed batch size (?batch=4: more fighters' requests in one GPU pass)
 
 export class Track {
   constructor(rig, book) {
@@ -84,10 +84,19 @@ export class Track {
   /** Absolute frame where the new motion will start: far enough ahead to cover the inference time. */
   anchor(req, latSec) {
     if (req.mode === 'end') return this.end;
-    const rate = this.frames[Math.min(this.frames.length - 1, Math.floor(this.t))].rate;
-    let a = Math.ceil(this.now + latSec * FPS * rate) + 1;
+    // (frames play at their own rates - a strike's whip goes by fast, its wind-up slowly: walk the time ahead)
+    let a = Math.floor(this.now), left = latSec - (1 - (this.t % 1)) / (FPS * this.frames[Math.min(this.frames.length - 1, Math.floor(this.t))].rate);
+    while (left > 0 && a < this.end) { a++; left -= 1 / (FPS * this.frame(a).rate); }
+    a += 1;
     if (!req.interrupt) while (a < this.end && LOCK.has(this.frame(a).tag.kind)) a++;
     return Math.min(a, this.end);
+  }
+
+  /** Seconds of motion left to play (each frame at its own rate). */
+  timeLeft() {
+    let s = 0;
+    for (let i = Math.floor(this.t); i < this.frames.length - 1; i++) s += 1 / (FPS * this.frames[i].rate);
+    return s - (this.t % 1) / (FPS * this.frames[Math.min(this.frames.length - 1, Math.floor(this.t))].rate);
   }
 
   context(a) { return [a - 3, a - 2, a - 1, a].map(i => this.frame(i).pose); }
