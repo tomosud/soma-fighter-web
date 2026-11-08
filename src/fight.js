@@ -1330,7 +1330,7 @@ function land(A, B, energy, dir, at, isHead, onArm = false) {
   const aware = asp === 'front' && (B.state === 'free' || B.state === 'hit' || (B.state === 'guard' && B.guard?.kind !== 'dodge')) && clock > (B.stun ?? 0) && (B.posture ?? 1) > 0.25 && !broken && covered;
   const vital = vitalOf(part, asp, inWind);
   let balance = ASPECT[asp].posture * (vital ? vital[2] : 1) * (inWind ? 2 : 1);
-  const mult = ASPECT[asp].dmg * (vital ? vital[1] : 1) * (broken && !B.isPlayer ? 2 : 1); // (a player off balance is slowed and open, not flattened)
+  const mult = (B.isPlayer ? { front: 0.7, flank: 1.25, rear: 1.8 }[asp] : ASPECT[asp].dmg) * (vital ? vital[1] : 1) * (broken && !B.isPlayer ? 2 : 1); // (a player off balance is slowed and open, not flattened)
   const e00 = energy; // (all the multipliers together are capped below)
   energy *= B.isPlayer ? 1 + (mult - 1) * 0.5 : mult; // (the player is spared half the extra: it is warned, not ambushed)
   // a fighter turning a blow aside answers harder for a moment
@@ -1444,6 +1444,7 @@ function land(A, B, energy, dir, at, isHead, onArm = false) {
     hitstop = Math.max(hitstop, clamp(0.06 + energy / 1300, 0.06, 0.12));
     camKick.addScaledVector(flat(dir).normalize(), clamp(energy / 400, 0.04, 0.14));
     B.stun = clock + clamp(0.2 + energy / 200, 0.2, 0.3); // (never more than 0.3 s out of the player's hands)
+    if (asp !== 'front') { hurt = 1; shake = Math.max(shake, 0.2); camKick.addScaledVector(flat(dir).normalize(), 0.12); spark(at, energy * 1.5, 0xff2010); }
   }
   damageNumber(at, counter ? `カウンター -${Math.round(dmg)}` : `-${Math.round(dmg)}`, B.isPlayer ? '#ff5050' : counter ? '#ffd040' : '#ffffff', (B.isPlayer ? 20 : 15) + Math.min(16, energy / 5));
   if (counter) { spark(at, energy * 1.3, 0xffc030); spark(at, energy * 0.6, 0xffffff); hitstop = Math.max(hitstop, 0.1); slowUntil = Math.max(slowUntil, performance.now() + 250); camKick.addScaledVector(flat(dir).normalize(), 0.08); }
@@ -1505,7 +1506,7 @@ function think(E, dt) {
   const B = E.brain ??= { range: rand(1.1, 1.4), bob: Math.random() * 6, circle: Math.random() < 0.5 ? 1 : -1, nextAttack: clock + rand(0.4, 1.0), combo: 0, lungeUntil: 0, evadeUntil: 0, evDir: 1 };
   // who fights: the two nearest that are on their feet
   const up = enemies().filter(e => FIGHT.includes(e.state)).sort((a, b) => flat(a.P[0]).distanceTo(pp) - flat(b.P[0]).distanceTo(pp));
-  const fighting = up.indexOf(E) < 2;
+  const fighting = up.indexOf(E) < 3;
   crew.attacker = up[0] ?? null;
   // keep off each other
   const apart = new Vector3();
@@ -1538,7 +1539,7 @@ function think(E, dt) {
     const r = B.range + 0.3 * Math.sin(clock * 3.6 + B.bob);
     goal = pp.clone().addScaledVector(to, -r).addScaledVector(side, 0.7 * B.circle);
     if (role === 'angle') {
-      B.wantRear ??= Math.random() < 0.35;
+      B.wantRear ??= Math.random() < 0.7;
       const facing = rig.heading(P.P), sideOf = Math.sign(wrap(Math.atan2(ep.x - pp.x, ep.z - pp.z) - facing)) || 1;
       const ang = facing + sideOf * (B.wantRear ? 2.6 : 1.4);
       goal = pp.clone().add(new Vector3(Math.sin(ang), 0, Math.cos(ang)).multiplyScalar(B.range + 0.1));
@@ -1573,7 +1574,7 @@ function think(E, dt) {
     else if (E.charge && E.attack?.charged && !E.attack.followed) { goal = pp.clone().addScaledVector(to, 0.3); E.mode = 'lunge'; }
     // quick blows: from the side or behind, or when the player is committed (head-on otherwise: only a jab now and then)
     const facingP = aspect(E, P) === 'front';
-    const turn = E.state === 'free' && facingP && clock > B.nextAttack && clock > B.evadeUntil && (fromSide || committed || clock > (B.nextJab ??= clock + rand(0.9, 1.4)));
+    const turn = E.state === 'free' && facingP && clock > B.nextAttack && clock > B.evadeUntil && (fromSide || committed || clock > (B.nextJab ??= clock + rand(0.6, 1.0)));
     // its turn but a little out of reach (1.3-2 m): it drives in first, so the blow begins within reach and lands
     if (turn && d >= 1.3 && d < 2.0 && clock > B.lungeUntil + 0.5 && !E.charge) { B.lungeUntil = clock + 0.3; goal = pp.clone().addScaledVector(to, 0.3); E.mode = 'lunge'; }
     // the tell: a quick step back, then in with the blow
@@ -1586,8 +1587,8 @@ function think(E, dt) {
           crew.lastStrikeAt = clock; crew.lastStriker = E;
           E.antic = { t0: clock, side: Math.random() < 0.5 ? 1 : -1 };
           B.combo = Math.random() < 0.4 ? (Math.random() < 0.4 ? 2 : 1) : 0;
-          B.nextAttack = clock + rand(0.25, 0.6);
-          if (!fromSide && !committed) B.nextJab = clock + rand(0.9, 1.4);
+          B.nextAttack = clock + rand(0.2, 0.45);
+          if (!fromSide && !committed) B.nextJab = clock + rand(0.6, 1.0);
         } else B.nextAttack = clock + 0.2;
       }
     }
@@ -1598,10 +1599,10 @@ function think(E, dt) {
         E.aim = { enemy: P, part, joint: part === 'head' ? I.Head : part === 'body' ? I.Spine2 : I.LeftShin, off: new Vector3() };
         // one at a time: the other waits a moment after one starts (a one-two from two sides, never together)
         // (one after the other: the second starts 0.35 s after the first, so the two glows and blows come apart)
-        if (clock - (crew.lastStrikeAt ?? -9) < 0.35 && crew.lastStriker !== E) B.nextAttack = clock + rand(0.12, 0.25);
+        if (clock - (crew.lastStrikeAt ?? -9) < 0.12 && crew.lastStriker !== E) B.nextAttack = clock + rand(0.08, 0.15);
         else if (!inView(P, E) && !B.announced) {
           // out of the player's sight: it announces itself first (a warning at the player's feet), then strikes
-          B.announced = true; E.warnUntil = clock + 0.6; B.nextAttack = clock + 0.6;
+          B.announced = true; E.warnUntil = clock + 0.45; B.nextAttack = clock + 0.45;
         } else { B.tellAt = clock + 0.22; B.tellKind = kind; crew.lastStrikeAt = clock; crew.lastStriker = E; } // (the tell first)
       }
     }
@@ -2072,7 +2073,9 @@ function drawWarnings() {
   for (const E of fighters) {
     if (E.isPlayer) continue;
     let m = warnArcs.get(E);
-    const on = player && (clock < (E.warnUntil ?? 0) || (E.state === 'attack' && E.attack && !E.attack.followed && !inView(player, E))) && E.state !== 'out';
+    const hot = player && (clock < (E.warnUntil ?? 0) || (E.state === 'attack' && E.attack && !E.attack.followed && !inView(player, E))) && E.state !== 'out';
+    const lurk = player && !hot && ['free', 'attack', 'guard'].includes(E.state) && !inView(player, E) && flat(E.P[0]).distanceTo(flat(player.P[0])) < 2.6;
+    const on = hot || lurk;
     if (!m && on) {
       m = new THREE.Mesh(new THREE.RingGeometry(0.55, 0.75, 24, 1, -0.5, 1.0), new THREE.MeshBasicMaterial({ color: 0xff3020, transparent: true, opacity: 0.8, side: THREE.DoubleSide, depthTest: false }));
       m.rotation.x = -Math.PI / 2; m.renderOrder = 16; scene.add(m); warnArcs.set(E, m);
@@ -2080,6 +2083,7 @@ function drawWarnings() {
     if (!m) continue;
     m.visible = !!on;
     if (!on) continue;
+    m.material.opacity = hot ? 0.85 : 0.3;
     const to = flat(E.P[0].clone().sub(player.P[0]));
     m.position.set(player.P[0].x, 0.03, player.P[0].z);
     m.rotation.z = Math.atan2(to.x, to.z) - Math.PI / 2; // (the arc's middle toward the opponent)
@@ -2193,6 +2197,7 @@ function takeStrikeInput() {
 const STEP = 1 / 60;
 let acc = 0, last = performance.now(), clock = 0, fpsAcc = 0, fpsN = 0, fps = 0;
 const camTarget = new Vector3(0, 0.9, 0), camSide = new Vector3(1, 0, 0), camLean = new Vector3();
+let camDist = 4.6;
 function simulate(dt) {
   if (!db) return;
   if (settings.trigger !== 'auto') takeStrikeInput();
@@ -2416,21 +2421,31 @@ function frame(now) {
     // (the camera's opponent is the one the player is locked on - it does not swing to whoever is nearest while circling)
     const o = player.lockOn && player.lockOn.state !== 'out' && clock < (player.lockUntil ?? 0) ? player.lockOn : player.opponent;
     // everyone close in (within 3.5 m) framed, the one striking a little toward the middle
-    const close = fighters.filter(f => !f.isPlayer && f.state !== 'out' && flat(f.P[0]).distanceTo(flat(player.P[0])) < 3.5);
+    // (each one eases into the framing as it comes near - over about a second - and out as it goes away or is
+    // knocked out: a new opponent never jumps the view)
+    let wsum = 1;
     const mid = player.P[0].clone();
-    for (const f of close) mid.add(f.P[0]);
-    mid.divideScalar(1 + close.length);
+    for (const f of fighters) {
+      if (f.isPlayer) continue;
+      const dd = flat(f.P[0]).distanceTo(flat(player.P[0]));
+      const want = f.state === 'out' ? 0 : clamp((4.5 - dd) / 1.5, 0, 1);
+      f.camW = (f.camW ?? 0) + (want - (f.camW ?? 0)) * (1 - Math.exp(-dt / 0.9));
+      if (f.camW > 1e-3) { mid.addScaledVector(f.P[0], f.camW); wsum += f.camW; }
+    }
+    mid.divideScalar(wsum);
+    const close = fighters.filter(f => !f.isPlayer && (f.camW ?? 0) > 0.05);
     const striking = close.find(f => f.state === 'attack');
     camLean.lerp(striking ? flat(striking.P[0].clone().sub(mid)).multiplyScalar(0.2) : new Vector3(), 1 - Math.exp(-dt / 0.4));
     mid.add(camLean);
-    let radius = 0; for (const f of [player, ...close]) radius = Math.max(radius, flat(f.P[0]).distanceTo(flat(mid)));
+    let radius = flat(player.P[0]).distanceTo(flat(mid)); for (const f of close) radius = Math.max(radius, f.camW * flat(f.P[0]).distanceTo(flat(mid)));
     const line = o ? flat(o.P[0].clone().sub(player.P[0])) : new Vector3(0, 0, 1);
     const side = line.lengthSq() > 1e-4 ? new Vector3(line.z, 0, -line.x).normalize() : camSide.clone();
     if (side.dot(camSide) < 0) side.negate(); // keep the camera on its side
     // the camera turns slowly, and never faster than about 50 degrees a second (circling the opponent does not spin the view)
-    { const a0 = Math.atan2(camSide.x, camSide.z), da = clamp(wrap(Math.atan2(side.x, side.z) - a0) * (1 - Math.exp(-dt * 0.4)), -0.9 * dt, 0.9 * dt); camSide.set(Math.sin(a0 + da), 0, Math.cos(a0 + da)); }
-    const dist = clamp(3.4 + 1.3 * radius, 4.0, 6.8);
-    camTarget.lerp(new Vector3(mid.x, 0.75, mid.z), 1 - Math.exp(-dt * 3));
+    { const a0 = Math.atan2(camSide.x, camSide.z), da = clamp(wrap(Math.atan2(side.x, side.z) - a0) * (1 - Math.exp(-dt * 0.4)), -0.6 * dt, 0.6 * dt); camSide.set(Math.sin(a0 + da), 0, Math.cos(a0 + da)); }
+    camDist += (clamp(3.4 + 1.3 * radius, 4.0, 6.8) - camDist) * (1 - Math.exp(-dt / 1.2));
+    const dist = camDist;
+    camTarget.lerp(new Vector3(mid.x, 0.75, mid.z), 1 - Math.exp(-dt * 2));
     // from a little above (about 22 degrees down): more from the side, still enough to read who is on whose flank
     camera.position.copy(camTarget).addScaledVector(camSide, dist + 0.6).add(new Vector3(0, clamp(0.4 * (dist + 0.6), 1.9, 3.0), 0));
     camera.lookAt(camTarget);
