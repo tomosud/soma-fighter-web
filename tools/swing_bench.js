@@ -8,12 +8,21 @@
 //     from the strike's start to its top: a body gliding into its blow rather than planting)
 //   - pops: frames where a hand jumps more than 0.25 m relative to the hips from one drawn frame to the next
 //   - starve: the share of time each fighter's motion has run out (waiting for the model)
-const S = { sw: new Map(), by: {}, pops: { n: 0, big: 0 }, prev: new Map(), errs: [], res: null, err: null, tk: null };
+const S = { sw: new Map(), by: {}, pops: { n: 0, big: 0 }, prev: new Map(), feet: new Map(), skate: { P: { d: 0, t: 0, fast: 0 }, E: { d: 0, t: 0, fast: 0 } }, errs: [], res: null, err: null, tk: null, lastClock: null };
 const PARTS = ['LeftHand', 'RightHand', 'LeftFoot', 'RightFoot', 'LeftForeArm', 'RightForeArm', 'LeftShin', 'RightShin'];
 
 function tick() {
   const brawl = window.brawl, I = brawl.rig.index;
   try { brawl.draw(performance.now()); } catch (e) { if (S.errs.length < 5) S.errs.push(String(e.stack).slice(0, 300)); }
+  // foot skating: a foot on the floor (within 3 cm of its standing height) on two ticks running, how fast it slides
+  const dtc = S.lastClock == null ? 0 : brawl.clock - S.lastClock; S.lastClock = brawl.clock;
+  const y0 = brawl.rig.restPos[I.LeftFoot].y + 0.03;
+  for (const F of brawl.fighters) {
+    if (['out', 'fall', 'down', 'getup'].includes(F.state)) { S.feet.delete(F); continue; }
+    const now = ['LeftFoot', 'RightFoot'].map(n => F.P[I[n]].clone()), pv = S.feet.get(F), key = (F.isPlayer ? 'P' : 'E') + (F.state === 'free' ? '' : '_' + F.state), k = S.skate[key] ??= { d: 0, t: 0, fast: 0 };
+    if (pv && dtc > 0.004 && dtc < 0.1) now.forEach((f, i) => { if (f.y < y0 && pv[i].y < y0) { const d = Math.hypot(f.x - pv[i].x, f.z - pv[i].z); k.d += d; k.t += dtc; if (d / dtc > 0.3) k.fast += dtc; } });
+    S.feet.set(F, now);
+  }
   for (const F of brawl.fighters) {
     if (F.state === 'out') continue;
     if (F.windAt != null) { const key = F.id + ':' + F.windAt; if (!S.sw.has(key)) S.sw.set(key, { who: F.isPlayer ? 'P' : 'E', kind: F.windKind, t0: brawl.clock, F, pts: [] }); }
@@ -51,6 +60,8 @@ export function swing() {
   return { P: sum(out.P), Pp: sum(out.P.filter(x => x.kind === 'punch')), Pk: sum(out.P.filter(x => x.kind === 'kick')), E: sum(out.E), Ep: sum(out.E.filter(x => x.kind === 'punch')), Ek: sum(out.E.filter(x => x.kind === 'kick')) };
 }
 
+/** Foot skating so far: mean slide speed of a planted foot (m/s) and the share of planted time it slides over 0.3 m/s. */
+export function skate() { return Object.fromEntries(Object.entries(S.skate).map(([k, v]) => [k, { speed: +(v.d / Math.max(1e-6, v.t)).toFixed(3), fast: +(v.fast / Math.max(1e-6, v.t)).toFixed(3) }])); }
 /** Start: waits for the model, then plays the series (default: skilled, novice, person, 60 s each). */
 export async function start(opts = { secs: 60, seeds: [1], kinds: ['skilled', 'novice', 'person'] }) {
   for (let i = 0; i < 60 && !window.brawl?.scheduler?.ready; i++) await new Promise(r => setTimeout(r, 1000));
@@ -59,7 +70,7 @@ export async function start(opts = { secs: 60, seeds: [1], kinds: ['skilled', 'n
   S.tk = new Worker(URL.createObjectURL(new Blob(['setInterval(()=>postMessage(0),16)'])));
   S.tk.onmessage = tick;
   await new Promise(r => setTimeout(r, 2000));
-  S.sw.clear(); S.by = {}; S.pops = { n: 0, big: 0 }; S.res = null; S.err = null;
+  S.sw.clear(); S.by = {}; S.pops = { n: 0, big: 0 }; S.res = null; S.err = null; S.feet.clear(); S.skate = { P: { d: 0, t: 0, fast: 0 }, E: { d: 0, t: 0, fast: 0 } }; S.lastClock = null;
   ap.series(window.brawl, opts).then(r => { S.res = r; }).catch(e => { S.err = String(e.stack); });
   return { ready: window.brawl.scheduler.ready };
 }
@@ -71,7 +82,7 @@ export function result() {
   if (!S.res) return null;
   const pick = /^(enemyStrikes|enemyLanded|takenPerMin|kos|playerUnable|sideShareJ|takenSideShare|blowUnmoved|flatFrac|followLag|followGain|pressToStrike|pressToContact|dodged|taken)$/;
   return {
-    mean: S.res.mean, worst: S.res.worst, swing: swing(), pops: S.pops,
+    mean: S.res.mean, worst: S.res.worst, swing: swing(), pops: S.pops, skate: skate(),
     starve: Object.fromEntries(Object.entries(S.by).map(([k, s]) => [k, +(s.starve / s.n).toFixed(2)])),
     runs: S.res.runs.map(r => ({ kind: r.kind, total: r.total, bad: Object.fromEntries(Object.entries(r.parts ?? {}).filter(([, v]) => v > 0)), s: Object.fromEntries(Object.entries(r.sum).filter(([k]) => pick.test(k))) })),
     errs: S.errs,

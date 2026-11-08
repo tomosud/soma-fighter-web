@@ -49,6 +49,8 @@ export class Ragdoll {
     this.x = rest; this.p = rest.map(v => v.clone()); this.v = rest.map(() => new Vector3());
     this.rootK = 3000; this.footK = 30000; this.pullK = 500; this.pullMax = 400; this.damp = 5; this.substeps = 8;
     this.gravity = false;
+    this.dampScale = 1; // (a limp body: low, its momentum carries it)
+    this.friction = 0; // (0: the floor is slippery for all but planted feet; up to 1: what touches it sticks)
     this.last = null;
     this.contactAt = this.names.map(() => false);
   }
@@ -98,7 +100,7 @@ export class Ragdoll {
       for (let i = 0; i < x.length; i++) {
         // gravity is carried by the muscles (a living body holds its own weight); what is felt is inertia
         if (this.gravity) v[i].addScaledVector(G, h);
-        v[i].lerp(Tv[i], 1 - Math.exp(-this.dampOf[i] * h)); // muscles also carry the motion's own velocity (light parts closely)
+        v[i].lerp(Tv[i], 1 - Math.exp(-this.dampOf[i] * this.dampScale * h)); // muscles also carry the motion's own velocity (light parts closely)
         p[i].copy(x[i]);
         x[i].addScaledVector(v[i], h);
       }
@@ -152,6 +154,10 @@ export class Ragdoll {
           if (this.isFoot[i] && planted[this.sideOf[i]]) {
             x[i].x = p[i].x + (x[i].x - p[i].x) * 0.5;
             x[i].z = p[i].z + (x[i].z - p[i].z) * 0.5;
+          } else if (this.friction) {
+            // (a body lying on the floor: everything touching it rubs - it slides a little and stops)
+            x[i].x = p[i].x + (x[i].x - p[i].x) * (1 - this.friction);
+            x[i].z = p[i].z + (x[i].z - p[i].z) * (1 - this.friction);
           }
         }
       }

@@ -1349,9 +1349,10 @@ function groundHit(A, B, energy, dir, at, isHead) {
   B.hp = Math.max(0, B.hp - dmg);
   spark(at, energy * 0.6);
   const n = flat(dir).normalize();
-  jolt(B, at, n.clone().multiplyScalar(Math.sqrt(2 * energy * 6) * 1.2), 0.25, 0.6, true);
-  // the body slides along the floor with the blow: over 0.3 s (an instant shift reads as a jump, not a push)
-  if (energy >= 12) B.slide = { dir: n, dist: clamp(energy / 220, 0.14, 0.5), t0: clock, dur: 0.3, done: 0 };
+  // (a body on the floor kicked: its ragdoll takes the blow loose and free - it rolls and slides as far as the blow
+  // sends it, its limbs flop, and the motion is moved along to where it ended up; see ragStep)
+  B.groundJolt = clock;
+  jolt(B, at, n.clone().addScaledVector(UP, 0.25).multiplyScalar(Math.sqrt(2 * energy * 6) * 1.15), 0.12, 1.0, true);
   // the player is never kept down by kicks: it hurts, the body is pushed, the getting-up goes on
   if (B.state === 'getup' && !B.isPlayer) { B.state = 'down'; B.until = clock + 2; B.getupKey = null; B.track.request(stirReq(B, 1, 0)); }
   else if (B.state === 'down' && !B.isPlayer) B.until += clamp(energy / 150, 0.1, 0.5);
@@ -1847,22 +1848,37 @@ function autoStrike(F) {
  * down after it, and the knees take the landing (the hips dip). Shown over the generated kick.
  */
 /**
- * The player's body leads its motion (speculative, then handed over): the hips go where the spring says from the
- * first frame - the difference between the spring's velocity and what the generated motion actually moves is slid
- * into the motion itself (at most 1.4 m/s, half of it caught up in 0.07 s), so a pull starts the body at once and a
- * stop stops it, and once MotionBricks' own motion is going that way there is nothing left to slide. (The debt leaks
- * away over 0.4 s: a generated pace that stays slower is not skated after forever. The planted feet hold - see
- * footLock - so a short slide bends the legs rather than skating them.)
+ * The player's body leads its motion without sliding its feet (speculative, then handed over): what the spring wants
+ * and what the generated motion has actually moved apart (the "debt", leaking away over 0.35 s) is shown as the hips
+ * and the trunk going first - the feet stay where they are on the floor and the legs take the angle, the trunk leans
+ * into it (as a body falls into its first step before the foot moves). Up to 10 cm, gone again as MotionBricks'
+ * own steps catch up. Nothing is slid: the generated footwork is untouched.
  */
+const TUNE = { lead: true, spec: true, track: true };
 function leadOn(F, dt, r0) {
   F.debt ??= new Vector3();
-  if (F.state !== 'free' || F.ragOn || (F.dash && clock < F.dash.until) || !F.spring?.target) { F.debt.multiplyScalar(Math.exp(-dt / 0.08)); return; }
+  if (!TUNE.lead || F.state !== 'free' || F.ragOn || (F.dash && clock < F.dash.until) || !F.spring?.target) { F.debt.multiplyScalar(Math.exp(-dt / 0.08)); return; }
   const r1 = F.track.display.root;
   F.debt.x += F.vel.x * dt - (r1.x - r0.x); F.debt.z += F.vel.z * dt - (r1.z - r0.z);
-  F.debt.multiplyScalar(Math.exp(-dt / 0.4)).clampLength(0, 0.45);
-  const take = F.debt.clone().multiplyScalar(1 - Math.exp(-dt / 0.1)).clampLength(0, 1.4 * dt);
-  if (take.lengthSq() < 1e-10) return;
-  F.track.shift(take.x, take.z); F.debt.sub(take);
+  F.debt.multiplyScalar(Math.exp(-dt / 0.35)).clampLength(0, 0.4);
+}
+function leadLayer(F) {
+  F.leadOff = null;
+  if (!F.debt || F.state !== 'free' || F.ragOn) { F.leadShown = 0; return; }
+  // (eased in and out: the offset never jumps)
+  const want = Math.min(0.1, F.debt.length() * 0.6);
+  F.leadShown = (F.leadShown ?? 0) + (want - (F.leadShown ?? 0)) * 0.25;
+  if (F.leadShown < 0.005) return;
+  const dir = flat(F.debt).normalize(), off = dir.clone().multiplyScalar(F.leadShown);
+  F.leadOff = off;
+  const p = clonePose(F.shown), P0 = rig.positions(p);
+  const feet = ['Left', 'Right'].map(sd => P0[I[sd + 'Foot']].clone());
+  p.root.x += off.x; p.root.z += off.z; p.root.y -= 0.35 * F.leadShown * F.leadShown / 0.1; // (the hips a little lower: the legs reach)
+  const axis = new Vector3().crossVectors(UP, dir).normalize();
+  if (F.leanSign == null) { const q = clonePose(p); rotateSubtree(rig, q, I.Spine1, new Quaternion().setFromAxisAngle(axis, 0.2)); F.leanSign = rig.positions(q)[I.Head].dot(dir) > rig.positions(p)[I.Head].dot(dir) ? 1 : -1; }
+  rotateSubtree(rig, p, I.Spine1, new Quaternion().setFromAxisAngle(axis, F.leanSign * 1.4 * F.leadShown));
+  ['Left', 'Right'].forEach((sd, i) => legTo(p, sd, feet[i]));
+  F.shown = rig.fixRigid(p);
 }
 /**
  * The player's blow starts with the press (speculative, then handed over): from 0.06 s after the press (the wind-up
@@ -1879,8 +1895,11 @@ function specStrike(F) {
   const u = clamp((t - 0.06) / 0.22, 0, 1), ps = u * u;
   let w = ps > pg ? (ps - pg) / (1 - pg) : 0;
   if (A.landed || A.followed) w = (S.wEnd ??= w) * (1 - (clock - S.endAt) / 0.15); else S.wEnd = null;
-  if (w <= 0.001) return;
-  F.shown = lerpPose(F.shown, S.pose, 0.9 * w);
+  if (w <= 0.001 || !TUNE.spec) return;
+  S.joints ??= rig.subtree(I.Spine1); // (the upper body only: a kicking leg turned while its foot is still down slid it along the floor)
+  const p = clonePose(F.shown);
+  for (const j of S.joints) p.rot[j].slerp(S.pose.rot[j], 0.9 * w);
+  F.shown = rig.fixRigid(p);
 }
 /**
  * Where the player will be `T` seconds on: its hips run on their spring toward the cursor (as its own strikes are
@@ -1948,9 +1967,11 @@ function trackIn(F, dt) {
   if (F.isPlayer || F.state !== 'attack' || !A?.spliced || !A.oppAt || A.landed || A.followed || !A.contactAt || !player) return;
   if (player.dodge?.flick && clock < player.dodge.until + 0.1) { A.oppAt = null; return; } // (dodged: it goes where it was going)
   if (clock > A.contactAt - 0.12 || ['down', 'fall', 'getup'].includes(player.state)) return;
-  const want = playerAhead(clamp(A.contactAt - clock, 0, 0.35)).sub(A.oppAt), step = want.clampLength(0, 4.0 * dt);
+  if (!TUNE.track || clock > A.spliceAt + 0.6 * (A.contactAt - A.spliceAt)) return;
+  A.tracked ??= 0;
+  const want = playerAhead(clamp(A.contactAt - clock, 0, 0.35)).sub(A.oppAt), step = want.clampLength(0, Math.min(1.5 * dt, Math.max(0, 0.3 - A.tracked)));
   if (step.lengthSq() < 1e-8) return;
-  F.track.shift(step.x, step.z); A.oppAt.add(step);
+  F.track.shift(step.x, step.z); A.oppAt.add(step); A.tracked += step.length();
 }
 function anticipate(F) {
   const A = F.antic;
@@ -2540,24 +2561,49 @@ function jolt(F, at, J, loose, recover, feetFree = false) {
   for (const [d, i] of order) R.v[i].addScaledVector(J, (1 / (d + 0.05)) / wsum / R.mass[i]);
 }
 function ragStep(F, dt) {
-  if (!F.ragOn) return;
   const R = F.rag;
+  const dead = !!F.ko && !F.isPlayer, lying = F.state === 'down' || F.state === 'out';
+  // knocked out: from the blow on, the ragdoll alone - the strings cut (muscles from 12 % down to 5 % over 0.6 s),
+  // under gravity, the hips free, the blow's momentum carried (little damping) - it buckles, falls, rolls and slides
+  // until the floor's rub stops it (mean speed under 6 cm/s for half a second, after at least 0.8 s); then it lies
+  // as it came to rest
+  if (dead) {
+    if (F.restPose && (F.groundJolt ?? -9) > F.restAt) { F.restPose = null; F.restAt = null; F.stillFor = 0; } // (kicked again: it moves again)
+    if (F.restPose) { F.shown = clonePose(F.restPose); return; }
+    if (!F.ragOn || !F.limp) { if (!F.ragOn) { R.reset(F.shown); R.last = null; } F.ragOn = true; F.limp = clock; F.ragW = 1; F.ragFade = false; }
+    const tl = clock - F.limp;
+    R.gravity = true; R.friction = 0.35; R.dampScale = 0.25; R.k = F.ragK.map(k => k * (0.12 - 0.07 * clamp(tl / 0.6, 0, 1))); R.rootK = 0;
+    R.last = null; // (no motion velocity to carry: the parts only slow down - air, the floor's rub)
+    const anim = clonePose(F.shown); anim.root.copy(R.x[0]); // (the lying shape, carried with the body: only a faint pull toward it)
+    R.step(dt, anim, [0, 0, 0, 0], null);
+    F.shown = R.pose(anim);
+    const sp = R.v.reduce((a, v) => a + v.length(), 0) / R.v.length;
+    F.stillFor = sp < 0.06 ? (F.stillFor ?? 0) + dt : 0;
+    if (F.stillFor > 0.5 && tl > 0.8) { F.restPose = clonePose(F.shown); F.restAt = clock; }
+    return;
+  }
+  if (!F.ragOn) return;
   F.ragT += dt;
   const down = F.state === 'fall';
+  const kicked = lying && clock - (F.groundJolt ?? -9) < 1.0;
+  R.gravity = lying || down; R.friction = lying ? 0.2 : 0; R.dampScale = 1;
   // muscles firm up again (not while going down: the body stays loose until it lies)
   const u = down ? 0 : clamp(F.ragT / F.ragRecover, 0, 1);
   const loose = F.ragLoose + (1 - F.ragLoose) * u * u;
   R.k = F.ragK.map(k => k * (down ? Math.max(F.ragLoose, 0.25) : loose));
-  R.rootK = down || F.state === 'down' || F.state === 'getup' ? 2500 : 600 + 2400 * u;
+  R.rootK = kicked ? 60 + 2440 * ((clock - F.groundJolt) / 1.0) ** 2 : down || F.state === 'down' || F.state === 'getup' ? 2500 : 600 + 2400 * u;
   const contact = F.ragFeetFree || down ? [0, 0, 0, 0] : null;
   // (the ragdoll keeps its own state: a reset, should it drift far from the motion, is not shown as a jump)
   const before = R.x[0].clone();
   R.step(dt, F.shown, contact, null);
   const ragged = R.pose(F.shown);
   const drift = ragged.root.distanceTo(F.shown.root);
-  if (R.x[0].distanceTo(before) > 0.3 || drift > 0.45) F.ragFade = true;
+  if (R.x[0].distanceTo(before) > 0.3 || drift > (kicked ? 0.9 : 0.45)) F.ragFade = true;
+  // (kicked on the floor: the motion is moved along to where the body has gone - no pull back to where it lay)
+  if (kicked) { const d = flat(R.x[0].clone().sub(F.shown.root)).multiplyScalar(1 - Math.exp(-dt / 0.2)); F.track.shift(d.x, d.z); }
   // back to the motion once firm again; on the floor (lying, stirring) the motion's own; drifting off: at once
   if (F.ragFade) F.ragW = Math.max(0, F.ragW - dt / 0.12);
+  else if (kicked) F.ragW = clock - F.groundJolt < 0.5 ? 1 : Math.max(0.35, F.ragW - dt / 0.5); // (all ragdoll while the blow plays out)
   else if (F.state === 'down') F.ragW = Math.max(0.35, F.ragW - dt / 0.4);
   else if (F.state === 'getup') F.ragW = Math.max(0, F.ragW - dt / 0.4);
   else if (!down && u >= 1) F.ragW = Math.max(0, F.ragW - dt / 0.2);
@@ -2708,12 +2754,13 @@ function simulate(dt) {
     }
     const w0 = Math.sqrt(settings.spring.k), z0 = settings.spring.c / (2 * w0), wS = w0 * (1 + 1.3 * player.stiff), zS = z0 + (0.7 - z0) * player.stiff;
     const fl = feelOf(player) ?? {}, sched = { k: (fl.k ?? 1) * (wS * wS) / settings.spring.k, c: (fl.c ?? 1) * (2 * zS * wS) / settings.spring.c, vmax: fl.vmax ?? 1 };
-    springStep(player.vel, flat(player.P[0]), player.spring.target, dt, sched);
+    // (the spring measured from the hips the generated motion has, not the lead shown on top: no loop through the lead)
+    springStep(player.vel, flat(player.P[0]).sub(player.leadOff ?? ZERO), player.spring.target, dt, sched);
     // the cursor's own speed fed straight in (half of it, within 0.08 s) while it moves on ahead of the hips: the body
     // moves the moment the mouse does, linearly, and the spring does the rest (its swing back when the mouse stops)
     if (player.state === 'free' && player.spring.target && player.cVel && !(player.dash && clock < player.dash.until)) {
       const cv = flat(player.cVel).clampLength(0, settings.vmax), ahead = flat(player.spring.target.clone().sub(player.P[0]));
-      if (cv.length() > 0.4 && cv.dot(ahead) > 0 && ahead.length() > 0.25) player.vel.lerp(cv, (1 - Math.exp(-dt / 0.08)) * 0.5);
+      if (cv.length() > 0.4 && cv.dot(ahead) > 0 && ahead.length() > 0.25) player.vel.lerp(cv, (1 - Math.exp(-dt / 0.08)) * 0.35);
     }
     if (!free) player.vel.multiplyScalar(Math.exp(-dt * 4));
     // striking: the spring's speed follows what the body really does (no speed stored up for a lurch afterwards)
@@ -2817,6 +2864,7 @@ function simulate(dt) {
     hitPush(F);
     breathe(F);
     footLock(F);
+    leadLayer(F);
     anticipate(F);
     specStrike(F);
     jumpLayer(F);
@@ -2851,7 +2899,7 @@ function simulate(dt) {
   // hits both ways
   for (const A of live) for (const B of live) if (A !== B && A.isPlayer !== B.isPlayer) checkHits(A, B, dt);
   // knocked-out opponents go away after a while
-  for (let k = fighters.length - 1; k >= 0; k--) { const F = fighters[k]; if (F.state === 'out' && clock - F.outAt > 2) { F.remove(); fighters.splice(k, 1); } }
+  for (let k = fighters.length - 1; k >= 0; k--) { const F = fighters[k]; if (F.state === 'out' && ((F.restAt != null && clock - Math.max(F.restAt, F.outAt) > 1.5) || clock - F.outAt > 6)) { F.remove(); fighters.splice(k, 1); } }
   clock += dt;
   plog?.step(dt);
   window.brawl?.onStep?.(dt);
@@ -3080,6 +3128,7 @@ if (params.has('debug')) {
     unscript() { scripted = null; },
     aim(a) { aimOverride = a; },
     draw: () => frame(performance.now()),
+    tune: TUNE,
     get perf() { return perf.last; },
     start: begin,
     onStep: null,
