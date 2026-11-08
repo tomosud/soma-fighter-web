@@ -1308,7 +1308,7 @@ function spawn() {
   const h = rig.heading(player.P) + (others ? (others % 2 ? 0.9 : -0.9) : 0), d = 4.0;
   const pos = flat(player.P[0]).add(new Vector3(Math.sin(h), 0, Math.cos(h)).multiplyScalar(d));
   const e = new Fighter(false, [0x7f97c9, 0x5fae98, 0x9a7fc9][(Fighter.seq ?? 0) % 3], pos, h + Math.PI);
-  e.hp = e.maxHp = 150 + 15 * Math.min(kos, 6);
+  e.hp = e.maxHp = 200 + 15 * Math.min(kos, 6);
   fighters.push(e);
   hudFight();
 }
@@ -1383,9 +1383,8 @@ function think(E, dt) {
         const u = Math.random(), part = kind === 'kick' && u < 0.3 ? 'legs' : u < 0.6 ? 'head' : 'body';
         E.aim = { enemy: P, part, joint: part === 'head' ? I.Head : part === 'body' ? I.Spine2 : I.LeftShin, off: new Vector3() };
         // one at a time: the other waits a moment after one starts (a one-two from two sides, never together)
-        const first = crew.lastStriker;
-        if (first && first !== E && first.state === 'attack' && !(first.attack?.followed) && P.state !== 'attack') B.nextAttack = clock + rand(0.15, 0.3);
-        else if (first && first !== E && clock - (first.attack?.followSpliced ?? -9) < 0.25) B.nextAttack = clock + 0.15;
+        // (one after the other: the second starts 0.35 s after the first, so the two glows and blows come apart)
+        if (clock - (crew.lastStrikeAt ?? -9) < 0.35 && crew.lastStriker !== E) B.nextAttack = clock + rand(0.12, 0.25);
         else if (!inView(P, E) && !B.announced) {
           // out of the player's sight: it announces itself first (a warning at the player's feet), then strikes
           B.announced = true; E.warnUntil = clock + 0.4; B.nextAttack = clock + 0.4;
@@ -1394,7 +1393,7 @@ function think(E, dt) {
           crew.lastStrikeAt = clock; crew.lastStriker = E;
           E.antic = { t0: clock, side: Math.random() < 0.5 ? 1 : -1 }; // the wind-up shows
           B.combo = Math.random() < 0.65 ? (Math.random() < 0.4 ? 2 : 1) : 0;
-          B.nextAttack = clock + rand(0.3, 0.7);
+          B.nextAttack = clock + rand(0.25, 0.6);
         } else B.nextAttack = clock + 0.2;
       }
     }

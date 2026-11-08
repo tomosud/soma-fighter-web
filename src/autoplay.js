@@ -100,6 +100,7 @@ export function score(sum, tally, sec, kind = 'skilled') {
     playerStill: band(sum.playerStill, 0, 0.03, 0.02),
     unseen: band(sum.hitsUnseen ?? 0, 0, 0.2, 0.1),
     lull: band(sum.longestApart, 0, 4, 2),
+    ko: band(per(sum.kos ?? 0), 1.5, 4, 1), // (a knock-out every 15-40 s: long enough to be a fight)
   };
   return { parts, total: +Object.values(parts).reduce((a, b) => a + b, 0).toFixed(2) };
 }
