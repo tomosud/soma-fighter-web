@@ -69,6 +69,7 @@ const T = Object.fromEntries(TAGS.map((t, k) => [t, k]));
 let db = null, entTag = null, change = null, sunk = null, strikes = [], entryAt = new Map(), standPose = null;
 PoseDB.load(rig, new URL('../assets/fightdb', import.meta.url).href).then(d => {
   db = d;
+  d.search(new Float32Array(64), new Float32Array(64)); // (the search's float features and boxes built now, while loading - not in the first fight frame)
   entTag = new Uint8Array(d.n);
   change = new Float32Array(d.n);
   // entries whose motion takes the hips low before its target (a fall, a trip, a slide, a crouch, lying down):
@@ -490,6 +491,16 @@ function predict(F, pose, heading) {
 
 const qbuf = new Float32Array(DIM);
 const ALLOW = { move: [T.move, T.stance, T.block], hit: [T.hit], fall: [T.fall], getup: [T.getup] };
+// (the entries each kind of plan may use, worked out once: the search's bias is a typed array filled in a tight loop,
+// not a closure called 37 000 times - that alone took 5 ms a plan, and four plans can fall in one frame)
+const allowMask = {};
+function maskOf(kind) {
+  if (allowMask[kind]?.length === db.n) return allowMask[kind];
+  const m = new Uint8Array(db.n), al = ALLOW[kind === 'attack' ? 'move' : kind];
+  for (let i = 0; i < db.n; i++) m[i] = al.includes(entTag[i]) && !(kind === 'move' && sunk[i]) ? 1 : 0;
+  return (allowMask[kind] = m);
+}
+let biasBuf = null, recentClip = null;
 function costOf(i, q, w) {
   const F = db.feat, s = db.scale, k = 1 / db.q;
   let c = 0;
@@ -551,20 +562,30 @@ function planReq(F, kind, mode = 'now') {
         const passive = F.vel.length() < 0.05 && F.want.length() < 0.05;
         const movingOn = kind === 'move' && F.isPlayer && !!F.spring?.target && F.vel.length() > 0.5;
         const calm = kind === 'move' ? (passive ? 2 : 0.4) : 0;
-        const bias = i => {
-          if (!allow.includes(entTag[i]) || (kind === 'move' && sunk[i])) return Infinity;
-          let b = calm * change[i];
-          if (movingOn && entTag[i] === T.stance) b += 1.5; // pulled along: not a clip that stays put
-          if (cont && db.entClip[i] === F.current.clip && db.entFrame[i] < cont.frame && db.entFrame[i] > cont.frame - 40) b += 4;
-          if (recentSet.has(db.entClip[i]) && !(cont && db.entClip[i] === F.current.clip)) b += 2;
-          return b;
-        };
-        best = db.search(q, w, bias);
-        if (best.i < 0) best = db.search(q, w, i => (ALLOW.move.includes(entTag[i]) && !sunk[i] ? 0 : Infinity)); // nothing of that kind
-        if (cont) {
-          const c = costOf(cont.i, q, w) + calm * change[cont.i];
-          if (best.cost > (movingOn ? 1 : settings.stay) * c) best = { i: cont.i, cost: c, clip: F.current.clip, frame: cont.frame, mirrored: F.current.mirror, stayed: true };
+        if (biasBuf?.length !== db.n) biasBuf = new Float32Array(db.n);
+        if (recentClip?.length !== db.clips.length) recentClip = new Uint8Array(db.clips.length);
+        recentClip.fill(0); for (const c of recentSet) recentClip[c] = 1;
+        {
+          const mask = maskOf(kind), eC = db.entClip, eF = db.entFrame, cc = cont ? F.current.clip : -1, cf = cont ? cont.frame : 0, stance = T.stance;
+          for (let i = 0; i < db.n; i++) {
+            if (!mask[i]) { biasBuf[i] = Infinity; continue; }
+            let b = calm * change[i];
+            if (movingOn && entTag[i] === stance) b += 1.5; // pulled along: not a clip that stays put
+            const c = eC[i];
+            if (c === cc) { if (eF[i] < cf && eF[i] > cf - 40) b += 4; }
+            else if (recentClip[c]) b += 2;
+            biasBuf[i] = b;
+          }
         }
+        // (the clip playing on wins unless something is clearly better: that is the search's bound)
+        const cc = cont ? costOf(cont.i, q, w) + calm * change[cont.i] : Infinity, stayK = movingOn ? 1 : settings.stay;
+        // (an opponent carrying on the way it was going, its clip still fitting: no search this time - at most every
+        // 0.5 s; the player always searches)
+        const carryOn = cont && kind === 'move' && mode === 'now' && !F.isPlayer && F.searchedAt != null && clock - F.searchedAt < 0.5 && F.want.distanceTo(F.searchWant) < 0.3;
+        if (carryOn) best = { i: -1 };
+        else { best = db.search(q, w, biasBuf, cont ? stayK * cc : Infinity); F.searchedAt = clock; F.searchWant = F.want.clone(); }
+        if (cont && best.i < 0) best = { i: cont.i, cost: cc, clip: F.current.clip, frame: cont.frame, mirrored: F.current.mirror, stayed: true };
+        if (best.i < 0) best = db.search(q, w, Float32Array.from(maskOf('move'), v => (v ? 0 : Infinity))); // nothing of that kind
       }
       if (!F.current || F.current.clip !== best.clip) { F.recent.push({ clip: F.current?.clip ?? best.clip, t: clock }); if (F.recent.length > 20) F.recent.shift(); }
       F.current = { clip: best.clip, mirror: best.mirrored, frame: best.frame + (kind === 'attack' ? lead - AHEAD : 0), anchor: a };
@@ -747,17 +768,21 @@ function strikeReq(F, family = null, mode = 'now', kindSel = null, pressId = 0, 
       let best = null, bc = Infinity;
       const byKind = k => !kindSel || (kindSel === 'punch' ? k.kind === 'punch' || k.kind === 'elbow' : k.kind === 'kick' || k.kind === 'knee');
       const byPart = k => !aimPart || (aimPart === 'legs' ? k.family === 'low' || !k.high : aimPart === 'head' ? k.high || k.kind === 'punch' : k.family !== 'low');
-      let pool = strikeKeys.filter(k => byKind(k) && (!family || k.family === family));
-      if (pool.some(byPart)) pool = pool.filter(byPart);
-      if (aimPart === 'legs' && pool.some(k => k.family === 'low')) pool = pool.filter(k => k.family === 'low'); // at the legs: a low kick, a sweep
+      // (running in hard and a kick pressed: a jump kick - a front, side or round kick, the body off the floor)
+      const jump = F.isPlayer && kindSel === 'kick' && !!F.runIn && clock - F.runIn.t < 0.6 && F.runIn.speed > 1.6;
+      if (F.runIn) F.runIn = null;
+      let pool = strikeKeys.filter(k => byKind(k) && (!family || k.family === family) && (!jump || (k.kind === 'kick' && k.family !== 'low')));
+      if (!jump && pool.some(byPart)) pool = pool.filter(byPart);
+      if (!jump && aimPart === 'legs' && pool.some(k => k.family === 'low')) pool = pool.filter(k => k.family === 'low'); // at the legs: a low kick, a sweep
       for (const k of (pool.length ? pool : strikeKeys)) {
         const goal = local(aimOf(k));
-        const step = clamp(goal.z - k.tip.z + 0.08, -0.45, WIND[k.kind] + (F.isPlayer ? 0.25 : opts.lunge ? 0.5 : 0.25)); // (aim assist: it may step further in, the player most; a lunge far)
+        const step = clamp(goal.z - k.tip.z + 0.08, -0.45, WIND[k.kind] + (jump ? 0.7 : F.isPlayer ? 0.25 : opts.lunge ? 0.5 : 0.25)); // (aim assist: it may step further in, the player most; a lunge far; a jump kick flies in)
         let cost = Math.abs(goal.z - k.tip.z - step) * 4 + Math.abs(goal.y - k.tip.y) * 2 + Math.abs(goal.x - k.tip.x) * 1.5;
-        cost += (k.clip === F.lastStrike ? 1.0 : 0) + (k.clip === F.lastStrike2 ? 0.5 : 0) + Math.random() * 0.25;
+        // (variety: the last four strikes thrown cost more the more recent, the same family too, and more left to chance)
+        { const hi = (F.hist ?? []).indexOf(k.clip); if (hi >= 0) cost += [1.4, 1.0, 0.6, 0.35][hi]; }
+        cost += (k.family === F.lastFamily ? 0.7 : 0) + (k.family === F.lastFamily2 ? 0.35 : 0) + Math.random() * 0.7;
         cost -= (F.isPlayer ? 1.3 : 1.4) * k.size; // (a wide swing reads; a short poke does not)
         if (F.isPlayer && k.kind === 'elbow' && kindSel === 'punch') cost += 0.6; // (a press for a punch: a punch, the short elbow only when nothing else fits)
-        if (!F.isPlayer) cost += (k.family === F.lastFamily ? 0.8 : 0) + (k.family === F.lastFamily2 ? 0.4 : 0);
         // wound up: the hand drawn back is the one that throws (a cross, a hook - not the lead hand's short jab)
         const cocked = F.antic?.big && F.antic.signs?.rear;
         if (cocked && (k.kind === 'punch' || k.kind === 'elbow') && !k.part.startsWith(cocked)) cost += 1.5;
@@ -775,9 +800,11 @@ function strikeReq(F, family = null, mode = 'now', kindSel = null, pressId = 0, 
       if (!best) return planReq(F, 'move').build(tr, a, ctx);
       const { k, step, dPose } = best;
       F.lastStrike2 = F.lastStrike; F.lastStrike = k.clip; F.lastFamily2 = F.lastFamily; F.lastFamily = k.family;
+      (F.hist ??= []).unshift(k.clip); F.hist.length = Math.min(F.hist.length, 4);
       const fwd = new Vector3(Math.sin(yaw), 0, Math.cos(yaw));
       const at = A.clone().addScaledVector(fwd, step);
       const aim = aimOf(k).clone();
+      const JH = 0.3; if (jump) aim.y -= 0.8 * JH; // (the body is lifted that much at the top: the foot is placed for it)
       let targets = k.frames.map(f => ground(placePose(f, yaw, ZERO, at)));
       // hand strikes: the legs keep walking (from normal motion at this moment), the arms strike
       if (k.kind === 'punch' || k.kind === 'elbow') {
@@ -800,7 +827,7 @@ function strikeReq(F, family = null, mode = 'now', kindSel = null, pressId = 0, 
       if (opp) targets = targets.map(t => { const r = clonePose(t); gaze(r, head); return rig.fixRigid(r); });
       // (it takes over when its motion is spliced in: until then the strike being played is the one that counts)
       const wound = !F.isPlayer && !!F.antic?.baked && F.antic.a === a; // (generated out of a held wind-up: it snaps out)
-      const atk = { part: k.part, id: Math.random(), kind: k.kind, key: k, yaw, at, followed: false, landed: false, sweep: swing && /hook|round/.test(k.family), t0: clock, pressId, aimPart, charged: !!opts.lunge };
+      const atk = { part: k.part, id: Math.random(), kind: k.kind, key: k, yaw, at, jump: jump ? JH : 0, oppAt: opp ? flat(OP[0]) : null, followed: false, landed: false, sweep: swing && /hook|round/.test(k.family), t0: clock, pressId, aimPart, charged: !!opts.lunge };
       F.lastMatch = { name: k.name, kind: 'attack', cost: bc, frame: 0, dPose: +dPose.toFixed(2) };
       F.current = null;
       // already wound up that way: out sooner (less wind-up, a little faster)
@@ -816,6 +843,7 @@ function strikeReq(F, family = null, mode = 'now', kindSel = null, pressId = 0, 
           if (F.isPlayer) postureHit(F, 2, 'swing');
           const dur = warpStrike(F, frames, k.part, rate, ready, k.family, wound);
           atk.contactAt = clock + dur; // (when the limb reaches the top: the blow is under way until then)
+          if (atk.jump) F.jump = { t0: clock, up: Math.max(0.18, dur), h: atk.jump, side: k.part.startsWith('Left') ? 'Right' : 'Left' };
           F.state = 'attack'; F.until = clock + dur + 0.6;
         },
       };
@@ -1523,6 +1551,8 @@ const jumps = [];
 // ---------------------------------------------------------------- the player and the opponents
 
 let player = null, kos = 0, spawnAt = 0;
+// (the start: one opponent alone - a tutorial in all but name; knocked out, three come at once)
+let tutorial = true, arrivals = 0;
 function start() {
   player = new Fighter(true, 0xd9b26a, new Vector3(0, 0, 0), 0);
   fighters.push(player);
@@ -1534,7 +1564,7 @@ function spawn() {
   const h = rig.heading(player.P) + (others ? (others % 2 ? 1.3 : -1.3) : 0.4), d = 3.0;
   const pos = flat(player.P[0]).add(new Vector3(Math.sin(h), 0, Math.cos(h)).multiplyScalar(d));
   const e = new Fighter(false, [0x7f97c9, 0x5fae98, 0x9a7fc9][(Fighter.seq ?? 0) % 3], pos, h + Math.PI);
-  e.hp = e.maxHp = 400 + 20 * Math.min(kos, 6); // (a knock-out every 20-45 s: one opponent is a fight, not a pushover)
+  e.hp = e.maxHp = tutorial ? 260 : 400 + 20 * Math.min(kos, 6); // (a knock-out every 20-45 s: one opponent is a fight, not a pushover; the first one sooner)
   fighters.push(e);
   plog?.note('spawn', { id: e.id });
   hudFight();
@@ -1807,6 +1837,71 @@ function autoStrike(F) {
  * loads up - the trunk turns away from the side that will strike (toward the rear hand), the shoulders draw back a
  * little and the hips sink - over 0.12 s, and lets go as the strike's motion takes over.
  */
+/**
+ * The jump kick: the body leaves the floor as the kick goes out (up to 30 cm at its top), the other leg tucked, comes
+ * down after it, and the knees take the landing (the hips dip). Shown over the generated kick.
+ */
+function jumpLayer(F) {
+  const J = F.jump;
+  if (!J) return;
+  const t = clock - J.t0, FALL = 0.26, LAND = 0.22;
+  if (t > J.up + FALL + LAND || ['hit', 'fall', 'down', 'getup', 'out'].includes(F.state)) { F.jump = null; return; }
+  const y = t < J.up ? J.h * Math.sin((Math.PI / 2) * (t / J.up)) : t < J.up + FALL ? J.h * Math.cos((Math.PI / 2) * ((t - J.up) / FALL)) : -0.08 * Math.sin(Math.PI * ((t - J.up - FALL) / LAND));
+  const p = clonePose(F.shown), P0 = rig.positions(p);
+  const feet = ['Left', 'Right'].map(sd => P0[I[sd + 'Foot']].clone());
+  p.root.y += y;
+  if (y > 0) {
+    // airborne: the support leg drawn up under the body
+    const i = J.side === 'Left' ? 0 : 1, f = feet[i].clone(); f.y += y + 0.18 * (y / J.h);
+    legTo(p, J.side, f);
+  } else ['Left', 'Right'].forEach((sd, i) => legTo(p, sd, feet[i])); // (landing: the knees bend, the feet stay down)
+  F.shown = rig.fixRigid(p);
+}
+/**
+ * The weight of a blow, after its top: the trunk carries on past the pose and swings back (a damped swing, about
+ * 2 Hz), the hips sink into the knees and come up, the turn of the shoulders overshoots - a body with mass, not a
+ * pose set down. A blow that met something recoils (the trunk back) rather than carrying through; a kick lands
+ * heavier.
+ */
+function settleLayer(F) {
+  const A = F.attack;
+  if (A?.contactAt && !A.settled && clock >= A.contactAt && F.state === 'attack') {
+    A.settled = true;
+    F.settle = { t0: clock, kind: A.kind, landed: !!A.landed, side: A.part?.startsWith('Left') ? 1 : -1, jump: !!A.jump };
+  }
+  const S = F.settle;
+  if (!S) return;
+  const t = clock - S.t0;
+  if (t > 0.7 || ['hit', 'fall', 'down', 'getup', 'out'].includes(F.state)) { F.settle = null; return; }
+  const kick = S.kind === 'kick' || S.kind === 'knee', amp = F.isPlayer ? 1 : 0.8;
+  const swing = Math.exp(-t / 0.2) * Math.sin(2 * Math.PI * 2.1 * t);
+  const lean = amp * (S.landed ? -0.09 : kick ? 0.07 : 0.13) * swing;
+  const twist = amp * (S.landed ? 0.05 : 0.12) * swing * S.side;
+  const dip = S.jump ? 0 : amp * (kick ? 0.055 : 0.04) * Math.sin(Math.PI * Math.min(1, t / 0.4)) * Math.exp(-t / 0.35);
+  const p = clonePose(F.shown), P0 = rig.positions(p), h = rig.heading(P0), fwd = new Vector3(Math.sin(h), 0, Math.cos(h)), lat = new Vector3().crossVectors(UP, fwd).normalize();
+  const feet = ['Left', 'Right'].map(sd => P0[I[sd + 'Foot']].clone());
+  if (S.fwdSign == null) { const q = clonePose(p); rotateSubtree(rig, q, I.Spine1, new Quaternion().setFromAxisAngle(lat, 0.2)); S.fwdSign = rig.positions(q)[I.Head].dot(fwd) > P0[I.Head].dot(fwd) ? 1 : -1; }
+  rotateSubtree(rig, p, I.Spine1, new Quaternion().setFromAxisAngle(lat, S.fwdSign * lean));
+  rotateSubtree(rig, p, I.Spine2, new Quaternion().setFromAxisAngle(UP, twist));
+  p.root.y -= dip;
+  // (the feet stay down; a kicking foot still in the air the first moment is left free)
+  ['Left', 'Right'].forEach((sd, i) => { if (!(kick && t < 0.15 && (sd === 'Left') === (S.side === 1))) legTo(p, sd, feet[i]); });
+  F.shown = rig.fixRigid(p);
+}
+/**
+ * An opponent's blow follows the player until it commits: from the moment its motion plays until 0.14 s before the
+ * contact, the whole body slides after how far the player has gone since it was aimed (up to 2.2 m/s) - walking off
+ * does not take you out of it; a dodge (the flick), or stepping away in the last instant, does.
+ */
+function trackIn(F, dt) {
+  const A = F.attack;
+  if (F.isPlayer || F.state !== 'attack' || !A?.spliced || !A.oppAt || A.landed || A.followed || !A.contactAt || !player) return;
+  if (player.dodge && clock < player.dodge.until + 0.1) { A.oppAt = null; return; } // (dodged: it goes where it was going)
+  if (clock > A.contactAt - 0.14 || ['down', 'fall', 'getup'].includes(player.state)) return;
+  const want = flat(player.P[0]).sub(A.oppAt), step = want.clampLength(0, 2.2 * dt);
+  if (step.lengthSq() < 1e-8) return;
+  F.track.shift(step.x, step.z); A.oppAt.add(step);
+}
 function anticipate(F) {
   const A = F.antic;
   if (!A) return;
@@ -2176,7 +2271,14 @@ function strike(F, kind = null, pressId = 0) {
     F.antic = { t0: clock, side: Math.sign(to.dot(left) || 1), big: true, fast: true, kind: kind ?? 'punch' };
   }
   // (out of a run the plant takes most of the momentum; out of a dodge the step carries into the counter)
-  if (F.isPlayer) { if (!(F.dodge && clock - F.dodge.at < 0.6)) F.vel.multiplyScalar(F.dash && clock < F.dash.until + 0.2 ? 0.45 : 0.7); F.dash = null; F.setOff = null; }
+  if (F.isPlayer) {
+    // (the run-in read at the press, before the plant takes the momentum: a kick out of a hard run is a jump kick, which keeps most of it)
+    const to = flat((F.aim?.enemy ?? F.opponent).P[0].clone().sub(F.P[0])), dist = to.length();
+    F.runIn = { t: clock, speed: dist > 1e-3 ? F.vel.dot(to.normalize()) : 0 };
+    const jumping = kind === 'kick' && F.runIn.speed > 1.6;
+    if (!(F.dodge && clock - F.dodge.at < 0.6)) F.vel.multiplyScalar(jumping ? 0.85 : F.dash && clock < F.dash.until + 0.2 ? 0.45 : 0.7);
+    F.dash = null; F.setOff = null;
+  }
   F.state = 'attack'; F.until = clock + 1.0;
   return 'started';
 }
@@ -2431,6 +2533,27 @@ function takeStrikeInput() {
 
 const STEP = 1 / 60;
 let acc = 0, last = performance.now(), clock = 0, fpsAcc = 0, fpsN = 0, fps = 0;
+/**
+ * Where the time goes, per second of real time (to the play log as 'perf', and to the debug footer): frames drawn,
+ * simulation steps, generation runs and their GPU time, the main thread's milliseconds in the simulation, in
+ * drawing, in turning results into motion and in packing requests, and the frame intervals (the longest, the 95th
+ * percentile, how many over 25 ms) - so a stutter can be told from the slow motion that is meant.
+ */
+const perf = { t0: 0, frames: 0, steps: 0, gen: 0, genMs: 0, sim: 0, simMax: 0, draw: 0, drawMax: 0, res: 0, resMax: 0, req: 0, reqMax: 0, gaps: [], slow: 0, last: null };
+function perfFlush(now) {
+  const sec = (now - perf.t0) / 1000;
+  if (!perf.t0 || sec < 1) { if (!perf.t0) perf.t0 = now; return; }
+  const g = perf.gaps.sort((a, b) => a - b), n = Math.max(1, perf.frames), r1 = x => +x.toFixed(1);
+  perf.last = {
+    fps: r1(perf.frames / sec), simHz: r1(perf.steps / sec), genHz: r1(perf.gen / sec), genMs: Math.round(perf.genMs / Math.max(1, perf.gen)),
+    sim: r1(perf.sim / n), simMax: r1(perf.simMax), draw: r1(perf.draw / n), drawMax: r1(perf.drawMax),
+    res: r1(perf.res / sec), resMax: r1(perf.resMax), req: r1(perf.req / sec), reqMax: r1(perf.reqMax),
+    gap95: r1(g[Math.floor(g.length * 0.95)] ?? 0), gapMax: r1(g[g.length - 1] ?? 0), long: g.filter(x => x > 25).length,
+    slow: +(perf.slow / sec).toFixed(2), fighters: fighters.filter(f => f.state !== 'out').length,
+  };
+  if (started && document.visibilityState === 'visible') plog?.note('perf', perf.last);
+  Object.assign(perf, { t0: now, frames: 0, steps: 0, gen: 0, genMs: 0, sim: 0, simMax: 0, draw: 0, drawMax: 0, res: 0, resMax: 0, req: 0, reqMax: 0, gaps: [], slow: 0 });
+}
 const camTarget = new Vector3(0, 0.9, 0), camSide = new Vector3(1, 0, 0), camLean = new Vector3();
 let camDist = 4.6, camRaise = 0;
 function simulate(dt) {
@@ -2441,8 +2564,9 @@ function simulate(dt) {
   // the next ones come before the last is gone: down to one standing, another within a second; below the full
   // number, one more every 4-6 s (two or three at a time, not always three)
   const standing = fighters.filter(f => !f.isPlayer && f.state !== 'out' && !f.ko).length;
-  if (player && standing <= 1) spawnAt = Math.min(spawnAt, clock + 1.0);
-  if (player && alive < settings.enemies && clock > spawnAt) { spawn(); spawnAt = clock + (standing + 1 <= 1 ? 1.0 : rand(4, 6)); }
+  if (tutorial && kos >= 1) { tutorial = false; spawnAt = clock + 0.9; arrivals = settings.enemies - 1; }
+  if (player && standing <= 1 && !tutorial) spawnAt = Math.min(spawnAt, clock + 1.0);
+  if (player && alive < (tutorial ? 1 : settings.enemies) && clock > spawnAt) { spawn(); spawnAt = clock + (arrivals > 0 ? (arrivals--, 0.35) : standing + 1 <= 1 ? 1.0 : rand(4, 6)); }
   // the player's leash on the hips
   if (player) {
     const free = player.state === 'free' || player.state === 'attack';
@@ -2612,10 +2736,10 @@ function simulate(dt) {
       if (active && (F.planTimer <= 0 || changed)) { F.track.request(planReq(F, 'move')); F.planTimer = settings.replan * (F.isPlayer ? 1 : F.mode === 'wait' || F.mode === 'hold' ? 2 : 1.5); F.lastWant.copy(F.want); }
       else if (!active && F.track.remaining / FPS < scheduler.latency + 0.25) F.track.request(planReq(F, 'move', 'end'));
     }
-    slideOn(F); shoveOn(F);
+    slideOn(F); shoveOn(F); trackIn(F, dt);
     F.track.advance(dt);
   }
-  scheduler.tick(fighters.filter(f => f.state !== 'out').map(f => f.track));
+  { const t = performance.now(); scheduler.tick(fighters.filter(f => f.state !== 'out').map(f => f.track)); const ms = performance.now() - t; perf.req += ms; perf.reqMax = Math.max(perf.reqMax, ms); }
   for (const F of fighters) {
     F.prevP = F.P;
     F.shown = clonePose(F.track.display);
@@ -2626,6 +2750,8 @@ function simulate(dt) {
     breathe(F);
     footLock(F);
     anticipate(F);
+    jumpLayer(F);
+    settleLayer(F);
     setOffLean(F);
     aliveLayer(F, dt);
     homing(F);
@@ -2665,13 +2791,21 @@ function simulate(dt) {
 function frame(now) {
   if (now - last > 150 && now - last < 10000 && player && document.visibilityState === 'visible') plog?.note('hitch', { ms: Math.round(now - last), fighters: fighters.length });
   const real = Math.min(0.1, (now - last) / 1000);
+  if (started) { perf.frames++; perf.gaps.push(now - last); if (hitstop > 0 || now < slowUntil) perf.slow += real; }
   if (hitstop > 0) hitstop -= real;
   hurt = Math.max(0, hurt - real / 0.35);
   const dt = started ? real * (hitstop > 0 ? 0.15 : now < slowUntil ? 0.35 : 1) : 0;
   last = now;
   acc += dt;
-  while (acc >= STEP) { simulate(STEP); acc -= STEP; }
-  for (const F of fighters) F.body.update(F.P, rig.extraPositions(F.shown, F.P), dt);
+  const tS = performance.now();
+  while (acc >= STEP) { simulate(STEP); acc -= STEP; perf.steps++; }
+  const tD = performance.now(); perf.sim += tD - tS; perf.simMax = Math.max(perf.simMax, tD - tS);
+  // (drawn where the bodies are between the last two steps: the steps run at 60 Hz whatever the screen does)
+  const alpha = clamp(acc / STEP, 0, 1);
+  for (const F of fighters) {
+    F.R = F.prevP && F.prevP.length === F.P.length ? F.P.map((v, j) => F.prevP[j].clone().lerp(v, alpha)) : F.P;
+    F.body.update(F.R, rig.extraPositions(F.shown, F.R), dt);
+  }
   drawLook();
   for (let k = dusts.length - 1; k >= 0; k--) { const D = dusts[k]; D.t += dt; D.m.scale.setScalar(1 + D.t * 9); D.m.material.opacity = Math.max(0, 0.8 - D.t * 3.2); if (D.t > 0.25) { scene.remove(D.m); D.m.geometry.dispose(); D.m.material.dispose(); dusts.splice(k, 1); } }
   for (let k = sparks.length - 1; k >= 0; k--) { const s = sparks[k]; s.t += dt; s.m.quaternion.copy(camera.quaternion); s.m.scale.setScalar(s.s * (1 + 6 * s.t)); s.m.material.opacity = Math.max(0, 0.9 - 3 * s.t); if (s.t > 0.3) { scene.remove(s.m); s.m.material.dispose(); sparks.splice(k, 1); } }
@@ -2683,13 +2817,13 @@ function frame(now) {
     // (each one eases into the framing as it comes near - over about a second - and out as it goes away or is
     // knocked out: a new opponent never jumps the view)
     let wsum = 1;
-    const mid = player.P[0].clone();
+    const mid = player.R[0].clone();
     for (const f of fighters) {
       if (f.isPlayer) continue;
-      const dd = flat(f.P[0]).distanceTo(flat(player.P[0]));
+      const dd = flat(f.R[0]).distanceTo(flat(player.R[0]));
       const want = f.state === 'out' ? 0 : clamp((4.5 - dd) / 1.5, 0, 1);
       f.camW = (f.camW ?? 0) + (want - (f.camW ?? 0)) * (1 - Math.exp(-dt / 0.9));
-      if (f.camW > 1e-3) { mid.addScaledVector(f.P[0], f.camW); wsum += f.camW; }
+      if (f.camW > 1e-3) { mid.addScaledVector(f.R[0], f.camW); wsum += f.camW; }
     }
     mid.divideScalar(wsum);
     const close = fighters.filter(f => !f.isPlayer && (f.camW ?? 0) > 0.05);
@@ -2723,7 +2857,9 @@ function frame(now) {
   drawBones();
   drawLanes();
   stage.render();
-  fpsAcc += dt; fpsN++;
+  { const ms = performance.now() - tD; perf.draw += ms; perf.drawMax = Math.max(perf.drawMax, ms); }
+  perfFlush(now);
+  fpsAcc += real; fpsN++;
   if (fpsAcc > 0.5) { fps = fpsN / fpsAcc; fpsAcc = 0; fpsN = 0; hudStats(); }
 }
 function loop(now) { frame(now); requestAnimationFrame(loop); }
@@ -2752,23 +2888,33 @@ function drawBones() {
   for (const F of fighters) {
     if (F.state === 'out' || !F.track.asked) continue;
     const m = boneMesh(F), pos = m.geometry.attributes.position.array, col = m.geometry.attributes.color.array;
-    const A = F.track.asked, base = new THREE.Color(F.isPlayer ? 0xffd860 : 0x60e0ff);
-    const sets = [[A.from, new THREE.Color(0x9a9a9a)], ...A.targets.slice(0, 4).map((t, i) => [t, base.clone().multiplyScalar(i === 0 ? 1 : 0.55)])];
+    // a blow or a reaction (kept 1.2 s): the pose asked for at its top, bright, the pose it starts from (the wind-up)
+    // grey, and a line from the limb now to where it is sent; otherwise only the last target of the move (faint):
+    // the four targets of a move are a 30th of a second apart and lie on the body, so they told nothing
+    const K = F.track.askedKey && performance.now() - F.track.askedKey.at < 1200 ? F.track.askedKey : null;
+    const base = new THREE.Color(F.isPlayer ? 0xffd860 : 0x60e0ff);
+    const sets = K ? [[K.from, new THREE.Color(0x8a8a8a)], [K.targets[0], base]] : [[F.track.asked.targets.at(-1), base.clone().multiplyScalar(0.45)]];
     let k = 0;
     for (const [pose, c] of sets) {
       const P = rig.positions(pose);
       rig.parents.forEach((p, j) => { if (p < 0) return; pos.set([P[p].x, P[p].y, P[p].z, P[j].x, P[j].y, P[j].z], k * 6); col.set([c.r, c.g, c.b, c.r, c.g, c.b], k * 6); k++; });
+    }
+    const part = K?.kind === 'attack' ? F.attack?.part : null;
+    if (part && I[part] != null) {
+      const a = (F.R ?? F.P)[I[part]], b = rig.positions(K.targets[0])[I[part]];
+      pos.set([a.x, a.y, a.z, b.x, b.y, b.z], k * 6); col.set([1, 1, 1, 1, 1, 1], k * 6); k++;
     }
     m.geometry.setDrawRange(0, k * 2);
     m.geometry.attributes.position.needsUpdate = true; m.geometry.attributes.color.needsUpdate = true;
     m.visible = true;
   }
 }
-addEventListener('keydown', e => { if ((e.key === 'b' || e.key === 'B') && !e.repeat) { boneView = !boneView; drawBones(); } });
+addEventListener('keydown', e => { if ((e.key === 'b' || e.key === 'B') && !e.repeat) { boneView = !boneView; drawBones(); if ($('help-bones')) $('help-bones').textContent = boneView ? 'B: target poses ON - bright: the pose asked of the model, grey: where it starts, white: where the limb is sent' : 'B: show target poses'; } });
 
 function hudStats() {
   if (!scheduler.ready) return;
-  $('stats').textContent = `${scheduler.backend} · 生成 ${scheduler.lastMs.toFixed(0)} ms · 描画 ${fps.toFixed(0)} fps${player?.lastMatch ? ` · ${player.lastMatch.name.slice(0, 28)}` : ''}`;
+  const p = perf.last;
+  $('stats').textContent = `${scheduler.backend} · draw ${fps.toFixed(0)} fps` + (p ? ` · sim ${p.simHz} Hz ${p.sim}/${p.simMax} ms · render ${p.draw}/${p.drawMax} ms · gen ${p.genHz}/s ${p.genMs} ms · results ${p.res} ms/s · gap95 ${p.gap95} max ${p.gapMax} ms` : '');
   hudFight();
 }
 function hudFight() {
@@ -2811,7 +2957,7 @@ worker.onmessage = ({ data }) => {
       if (started) $('overlay').classList.add('hidden');
       else { label.textContent = `${scheduler.backend} で準備完了`; $('go').hidden = false; $('go').focus(); }
     }
-    else scheduler.onResult(data);
+    else { const t = performance.now(); scheduler.onResult(data); const ms = performance.now() - t; perf.res += ms; perf.resMax = Math.max(perf.resMax, ms); perf.gen++; perf.genMs += data.ms ?? 0; }
   } else if (data.type === 'error') {
     if (data.id) scheduler.onFail(data.id);
     label.textContent = `エラー: ${data.message}`;
@@ -2857,7 +3003,7 @@ if (params.has('debug')) {
     rig, scheduler, settings, fighters, simulate, strike, land, crew, camera, get plog() { return plog; }, keys: { fallKeys, getupKeys, guardKeys },
     reset() {
       for (const f of fighters) if (!f.isPlayer) { f.state = 'out'; f.outAt = -9; }
-      kos = 0; spawnAt = clock; crew.watchUntil = 0;
+      kos = 0; spawnAt = clock; crew.watchUntil = 0; tutorial = false; arrivals = 0;
       if (player) { player.hp = player.maxHp; player.stun = 0; }
     },
     get player() { return player; }, jumps, get db() { return db; }, get clock() { return clock; }, get kos() { return kos; }, get lastHit() { return lastHit; },
@@ -2865,6 +3011,7 @@ if (params.has('debug')) {
     unscript() { scripted = null; },
     aim(a) { aimOverride = a; },
     draw: () => frame(performance.now()),
+    get perf() { return perf.last; },
     start: begin,
     onStep: null,
   };

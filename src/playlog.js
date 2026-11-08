@@ -99,6 +99,8 @@ export function createPlayLog(ctx) {
       pressLost: lost, pressQueued: out('queued') + out('chained'),
       pressToStrike: med(P.map(p => p.tStrike)), pressToContact: med(P.map(p => p.tContact)),
       strikes: E.filter(e => e.type === 'strike').length,
+      // (the machine: frames drawn and simulation steps per second, main-thread ms, frame intervals; see fight.js perf)
+      perf: (() => { const pf = E.filter(e => e.type === 'perf'); if (!pf.length) return null; const av = k => +mean(pf.map(e => e[k] ?? 0)).toFixed(1), mx = k => Math.max(...pf.map(e => e[k] ?? 0)); return { fps: av('fps'), fpsMin: Math.min(...pf.map(e => e.fps)), simHz: av('simHz'), genHz: av('genHz'), genMs: av('genMs'), sim: av('sim'), simMax: mx('simMax'), draw: av('draw'), drawMax: mx('drawMax'), res: av('res'), resMax: mx('resMax'), req: av('req'), reqMax: mx('reqMax'), gap95: av('gap95'), gapMax: mx('gapMax'), long: pf.reduce((a, e) => a + e.long, 0) }; })(),
       // the fight
       hits: given.filter(e => !e.touch && !e.blocked).length, touches: given.filter(e => e.touch).length, blocked: given.filter(e => e.blocked).length,
       slams: given.filter(e => e.slam).length, givenJ: Math.round(given.reduce((a, e) => a + e.energy, 0)),

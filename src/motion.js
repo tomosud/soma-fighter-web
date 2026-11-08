@@ -130,6 +130,7 @@ export class Scheduler {
     this.nextId = 1;
     this.jobs = new Map();
     this.onError = null;
+    this.cost = {};
   }
 
   tick(tracks) {
@@ -137,30 +138,49 @@ export class Scheduler {
     // (the one about to run out of motion goes first, the player a little ahead: in fighters' order the last
     // ones starved and stood frozen when everyone asked at once)
     const ready = tracks.filter(t => t.pending);
-    if (!ready.length) return;
+    if (!ready.length && !this.stage) return;
     if (ready.length > BATCH) {
       const urgency = t => (t.pending.interrupt ? 0 : t.timeLeft()) - (t.priority ?? 0) - 0.5 * Math.min(1, (performance.now() - (t.pendingSince ?? performance.now())) / 1000);
       ready.sort((a, b) => urgency(a) - urgency(b));
     }
+    // (built a few at a time: the plans' searches cost milliseconds each, and four in one frame dropped frames - each
+    // frame builds while it has under 3 ms spent, at least one, and the batch goes out once full or nothing waits;
+    // the latency is measured from the first build, so the anchors allow for the staging)
     const lat = this.latency * 1.15 + 0.02;
-    const batch = emptyBatch(BATCH);
-    const metas = ready.slice(0, BATCH).map((track, b) => {
+    const st = this.stage ??= { batch: emptyBatch(BATCH), metas: [], t0: performance.now() };
+    const tStart = performance.now();
+    for (const track of ready) {
+      if (st.metas.length >= BATCH) break;
+      if (st.metas.length && performance.now() - tStart > 3) break;
+      if (st.metas.some(m => m.track === track)) continue; // (asked again while staged: it goes in the next batch)
+      const b = st.metas.length;
       const req = track.pending;
       track.pending = null;
       track.inflight = req;
       const a = track.anchor(req, lat);
       // a request may start from something other than the recorded motion (e.g. the pose physics pushed it into)
+      const t0 = performance.now();
       const ctx = req.context ? req.context(track, a) : track.context(a);
+      const t1 = performance.now();
       const spec = req.build(track, a, ctx);
-      const align = encodeRequest(this.rig, batch, b, ctx, spec.targets, spec.tokens);
+      const t2 = performance.now();
+      const align = encodeRequest(this.rig, st.batch, b, ctx, spec.targets, spec.tokens);
+      // (what each kind of request costs the main thread: context, build, encode - for the perf log)
+      const c = this.cost[req.kind ?? '?'] ??= { n: 0, ctx: 0, build: 0, enc: 0, max: 0 }, t3 = performance.now();
+      c.n++; c.ctx += t1 - t0; c.build += t2 - t1; c.enc += t3 - t2; c.max = Math.max(c.max, t3 - t0); if (t3 - t0 > 5) c.over5 = (c.over5 ?? 0) + 1;
       const origin = req.context ? track.frame(a).pose.root.clone() : null;
       // (kept for the bone view: what the model was asked for - the target poses and the pose it starts from)
       track.asked = { targets: spec.targets.map(clonePose), from: clonePose(ctx[3]), kind: req.kind };
-      return { track, req, serial: track.serial, a, ctx, spec, align, origin };
-    });
+      if (req.kind === 'attack' || req.kind === 'hit') track.askedKey = { ...track.asked, at: performance.now() }; // (a blow or a reaction: kept on show a moment)
+      st.metas.push({ track, req, serial: track.serial, a, ctx, spec, align, origin });
+    }
+    if (st.metas.length < BATCH && tracks.some(t => t.pending && !st.metas.some(m => m.track === t))) return; // (more to build next frame)
+    this.stage = null;
+    if (!st.metas.length) return;
+    const { metas, batch } = st;
     for (let b = metas.length; b < BATCH; b++) encodeRequest(this.rig, batch, b, metas[0].ctx, metas[0].spec.targets, metas[0].spec.tokens); // padding
     const id = this.nextId++;
-    this.jobs.set(id, { metas, t0: performance.now() });
+    this.jobs.set(id, { metas, t0: st.t0 });
     this.busy = true;
     const { n, ...inputs } = batch;
     this.worker.postMessage({ type: 'run', id, n, inputs }, Object.values(inputs).map(a => a.buffer));

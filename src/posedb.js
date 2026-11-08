@@ -178,15 +178,40 @@ export class PoseDB {
    * Best entry for a query: weighted squared distance over the standardised features, plus `bias(i)` (a cost
    * added per entry, e.g. to stay on the current clip). Brute force (a few ms for tens of thousands of entries).
    */
-  search(q, weights, bias = null) {
-    const n = this.n, F = this.feat, s = this.scale, k = 1 / this.q;
-    const qs = new Float32Array(DIM), w = new Float32Array(DIM);
-    for (let d = 0; d < DIM; d++) { qs[d] = q[d] / s[d]; w[d] = weights[d]; }
-    let best = -1, bc = Infinity;
-    for (let i = 0; i < n; i++) {
-      let c = bias ? bias(i) : 0, o = i * DIM;
-      for (let d = 0; d < DIM && c < bc; d++) { const wd = w[d]; if (wd === 0) continue; const e = F[o + d] * k - qs[d]; c += wd * e * e; }
-      if (c < bc) { bc = c; best = i; }
+  search(q, weights, bias = null, bound = Infinity) {
+    // (the features as floats, standardised once; the dims compared heaviest first - with the trajectory, which tells
+    // entries apart soonest, ahead of equals - so the running sum passes the best so far early and the rest is skipped;
+    // `bound`: a cost no answer may reach (e.g. the clip already playing, which wins otherwise) - nothing below it, -1)
+    // Boxes: runs of 16 neighbouring entries (mostly one clip's consecutive frames) with each feature's min and max;
+    // the query's distance to a box is a lower bound for every entry in it (the bias is never negative), so a box
+    // already worse than the best so far is passed over whole - the same answer as the full scan, a few times faster.
+    const n = this.n, k = 1 / this.q, BS = 16;
+    if (!this.featF) {
+      const F = this.feat, out = new Float32Array(F.length); for (let i = 0; i < F.length; i++) out[i] = F[i] * k; this.featF = out;
+      const nb = Math.ceil(n / BS), lo = new Float32Array(nb * DIM).fill(Infinity), hi = new Float32Array(nb * DIM).fill(-Infinity);
+      for (let i = 0; i < n; i++) { const b = ((i / BS) | 0) * DIM, o = i * DIM; for (let d = 0; d < DIM; d++) { const v = out[o + d]; if (v < lo[b + d]) lo[b + d] = v; if (v > hi[b + d]) hi[b + d] = v; } }
+      this.boxLo = lo; this.boxHi = hi;
+    }
+    const F = this.featF, s = this.scale, lo = this.boxLo, hi = this.boxHi;
+    const dims = []; for (let d = 0; d < DIM; d++) if (weights[d] !== 0) dims.push(d);
+    dims.sort((a, b) => weights[b] - weights[a] || b - a);
+    const m = dims.length, dd = new Int32Array(dims), qs = new Float32Array(m), w = new Float32Array(m);
+    for (let j = 0; j < m; j++) { qs[j] = q[dd[j]] / s[dd[j]]; w[j] = weights[dd[j]]; }
+    const fn = typeof bias === 'function';
+    let best = -1, bc = bound;
+    for (let i0 = 0; i0 < n; i0 += BS) {
+      const bo = (i0 / BS) * DIM;
+      let lb = 0;
+      for (let j = 0; j < m && lb < bc; j++) { const d = dd[j], v = qs[j], l = lo[bo + d], h = hi[bo + d], e = v < l ? l - v : v > h ? v - h : 0; lb += w[j] * e * e; }
+      if (lb >= bc) continue;
+      const i1 = Math.min(n, i0 + BS);
+      for (let i = i0; i < i1; i++) {
+        let c = bias ? (fn ? bias(i) : bias[i]) : 0; // (bias: a function, or a Float32Array per entry - much faster)
+        if (c >= bc) continue;
+        const o = i * DIM;
+        for (let j = 0; j < m && c < bc; j++) { const e = F[o + dd[j]] - qs[j]; c += w[j] * e * e; }
+        if (c < bc) { bc = c; best = i; }
+      }
     }
     return { i: best, cost: bc, clip: this.entClip[best], frame: this.entFrame[best], mirrored: !!this.entMirror[best] };
   }
