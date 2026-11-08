@@ -1533,7 +1533,7 @@ function land(A, B, energy, dir, at, isHead, onArm = false) {
   }
   // the body is carried off at once (until the generated reaction takes over)
   // (every damaging blow: even one taken through a blow of its own sways the body back a little)
-  if (energy >= 12) B.knockFx = { t0: clock, dir: flat(dir).normalize(), v0: clamp(Math.sqrt(2 * energy / 55) * (down ? 1.7 : 0.8), 0.7, 4.3) * (armored ? 0.8 : 1), until: null, fade: 0.15 }; // (the carry grows with the joules all the way up: a heavy blow reads heavier, not the same)
+  if (energy >= 12) B.knockFx = { t0: clock, dir: flat(dir).normalize(), v0: clamp(Math.sqrt(2 * energy / 55) * (down ? 1.7 : 0.8), 0.7, 4.3) * (armored ? 0.8 : 1), heavy: down, until: null, fade: 0.15 }; // (the carry grows with the joules all the way up: a heavy blow reads heavier, not the same)
   if (A.attack) {
     if (A.attack.followed && !A.attack.landed && !A.attack.sweep && !A.attack.chained) A.track.request(followReq(A, 'now'));
     A.attack.landed = true;
@@ -1927,7 +1927,7 @@ function specStrike(F) {
   const A = S.atk, t = clock - S.t0;
   const pg = A.spliced && A.contactAt > A.spliceAt ? clamp((clock - A.spliceAt) / (A.contactAt - A.spliceAt), 0, 1) : 0;
   if (F.state !== 'attack' || (F.attack && F.attack !== A && F.attack.spliced) || pg >= 0.98 || t > 0.9 || ((A.landed || A.followed) && clock - (S.endAt ??= clock) > 0.15)) { F.spec = null; return; }
-  const u = clamp((t - 0.06) / 0.22, 0, 1), ps = u * u;
+  const u = clamp((t - 0.06) / 0.3, 0, 1), ps = u * u; // (to the top in 0.3 s: reaching it before the generated swing was a blow in two bursts)
   let w = ps > pg ? (ps - pg) / (1 - pg) : 0;
   if (A.landed || A.followed) w = (S.wEnd ??= w) * (1 - (clock - S.endAt) / 0.15); else S.wEnd = null;
   // the weight eased, never stepped: pg jumps as the generated strike lands in, and a stepped weight was a visible tick
@@ -2301,22 +2301,31 @@ function bakeKnock(F, frames, a0) {
 function knockOn(F) {
   const K = F.knockFx;
   if (!K) return;
+  // the carry is ballistic: a burst at the contact easing into a glide, never a dead stop mid-flight (the carry
+  // used to end sharp while the generated fall was still on its way - a flight in two pieces)
+  const glide = K.heavy ? 0.5 : 0.38;
+  const dFor = tt => K.v0 * (0.099 * (1 - Math.exp(-tt / 0.09)) + glide * (1 - Math.exp(-tt / glide)));
   if (K.baked) {
-    const w = F.track.now < K.baked.from ? 1 : F.track.blend ? F.track.blend.w ** 2 : 0;
-    if (w <= 0) { F.knockFx = null; return; }
-    F.shown.root.x += K.baked.o.x * w; F.shown.root.z += K.baked.o.z * w;
+    // the reaction's frames carry d0 of the flight from `from` on; until the playhead gets there the body KEEPS
+    // GLIDING (it used to hang mid-air on a frozen offset over the old, standing frames), and whatever it glided
+    // beyond d0 eases out once the reaction is the motion playing
+    const d = dFor(clock - K.t0);
+    const d0 = K.baked.d0 ??= Math.hypot(K.baked.o.x, K.baked.o.z);
+    let add;
+    if (F.track.now < K.baked.from) add = d;
+    else { K.overT ??= clock; const over = Math.max(0, d - d0) * Math.max(0, 1 - (clock - K.overT) / 0.28); if (over <= 0.002) { F.knockFx = null; return; } add = over; }
+    F.shown.root.x += K.dir.x * add; F.shown.root.z += K.dir.z * add;
     return;
   }
   // the carry holds until the blow's own reaction takes it over (bakeKnock, from the reaction's frames); a blow
   // that gets no reaction of its own (a sway through a strike, a body freed to move, a body already reeling from the
   // last blow) eases back after half a second
   // (not from the motion's tag: a body struck while still in the last blow's reaction must still be carried off)
-  if (!K.until && clock - K.t0 > 0.45 && !(F.track.busy && ['hit', 'fall'].includes(F.state) && clock - K.t0 < 1.4)) { const d0 = K.v0 * 0.42; F.track.shift(K.dir.x * d0, K.dir.z * d0); F.knockFx = null; return; }
+  if (!K.until && clock - K.t0 > 0.45 && !(F.track.busy && ['hit', 'fall'].includes(F.state) && clock - K.t0 < 1.4)) { const d0 = dFor(clock - K.t0); F.track.shift(K.dir.x * d0, K.dir.z * d0); F.knockFx = null; return; }
   const t = (K.until ?? clock) - K.t0;
   const w = K.until ? Math.max(0, 1 - Math.max(0, clock - K.until) / (K.fade ?? 0.15)) : 1;
   if ((K.until && w <= 0) || clock - K.t0 > 1.5) { F.knockFx = null; return; }
-  // front-loaded: the body is fastest the instant it is struck (a burst on top of the carry), not a beat later
-  const d = (K.v0 * Math.min(t, 0.32) + K.v0 * 1.1 * Math.min(t, 0.1)) * w;
+  const d = dFor(t) * w;
   K.d = d;
   F.shown.root.x += K.dir.x * d; F.shown.root.z += K.dir.z * d;
 }

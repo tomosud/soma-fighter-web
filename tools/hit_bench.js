@@ -52,6 +52,23 @@ function tick() {
     if (h.d20 == null && t >= 0.2) { h.d20 = +dp.toFixed(3); h.rootD20 = +dr.toFixed(3); }
     if (t >= 0.6) {
       h.done = true;
+      // does the reaction CONNECT? the carried speed along the blow, step to step: a body that stalls (speed
+      // near zero, then moving again) is a reaction in two pieces - and that holds for every blow, not only knockdowns
+      if (h.curve.length > 6) {
+        let peak = 0, stall = 0, run = 0;
+        const v = [];
+        for (let i = 1; i < h.curve.length; i++) { const dv = (h.curve[i].dr - h.curve[i - 1].dr) / Math.max(1e-3, h.curve[i].t - h.curve[i - 1].t); v.push(dv); peak = Math.max(peak, dv); }
+        for (let i = 0; i < v.length; i++) {
+          const t2 = h.curve[i + 1].t;
+          if (t2 > 0.45) break;
+          if (v[i] < Math.max(0.25, peak * 0.15)) { run += (h.curve[i + 1].t - h.curve[i].t); stall = Math.max(stall, run); } else run = 0;
+        }
+        // a stall only counts after the body really got going, and if it MOVES AGAIN after the lull (settling to
+        // rest is the natural end of a light blow, not a seam)
+        let movedAfter = false;
+        { let lull = false; for (let i = 0; i < v.length && h.curve[i + 1].t <= 0.55; i++) { if (v[i] < Math.max(0.25, peak * 0.15)) lull = true; else if (lull && v[i] > Math.max(0.5, peak * 0.4)) movedAfter = true; } }
+        if (peak > 0.8 && (movedAfter || h.down)) { h.stallMs = Math.round(stall * 1000); h.vPeak = +peak.toFixed(2); }
+      }
       const { F, ...keep } = h;
       S.hits.push(keep);
       // the biggest blows save their film strip
@@ -158,6 +175,8 @@ export function result() {
       d20: mean(hs.map(h => h.d20).filter(v => v != null)),
       latRootMs: med(hs.map(h => h.latRootMs).filter(v => v != null)),
       rootD20: mean(hs.map(h => h.rootD20).filter(v => v != null)),
+      stallMs: med(hs.map(h => h.stallMs).filter(v => v != null)),
+      stallBad: hs.filter(h => (h.stallMs ?? 0) > 80).length, // flights in two pieces
     };
   }
   // does the effect fit the energy? displacement by energy band, and the rank correlation (1 = strictly: more J,
@@ -175,6 +194,27 @@ export function result() {
     let num = 0, da = 0, db2 = 0;
     for (let i = 0; i < n; i++) { num += (ra[i] - ma) * (rb[i] - ma); da += (ra[i] - ma) ** 2; db2 += (rb[i] - ma) ** 2; }
     out.energyEffectCorr = n > 5 ? +(num / Math.sqrt(da * db2)).toFixed(2) : null;
+  }
+  // the strike curves: one burst is a blow, two bursts split by a lull is a seam (the speculative swing and the
+  // generated one not handing over cleanly)
+  {
+    const sts = S.strikes.filter(st => st.pts.length > 12);
+    let dbl = 0, n = 0;
+    for (const st of sts) {
+      const M = Math.max(...st.pts.map(p => p.v));
+      if (M < 3) continue;
+      n++;
+      // a second burst only counts after a real LULL (a fast return right after the top is how a punch moves;
+      // a dead pause and then a second swing is a seam)
+      let regions = 0, inR = false, lull = 0, valley = true;
+      for (let i = 1; i < st.pts.length; i++) {
+        const p = st.pts[i], dt2 = p.t - st.pts[i - 1].t;
+        if (p.v > 0.55 * M) { if (!inR && valley) { regions++; valley = false; } inR = true; lull = 0; }
+        else { inR = false; if (p.v < 0.25 * M) { lull += dt2; if (lull > 0.12) valley = true; } }
+      }
+      if (regions >= 2) dbl++;
+    }
+    out.strikes = { n, doubleBurst: dbl, doubleShare: n ? +(dbl / n).toFixed(2) : null };
   }
   return { done: done(), ...out, sheets: S.sheets };
 }
