@@ -28,7 +28,7 @@ function makeTicker() {
 }
 
 export const KINDS = {
-  novice: { react: [0.3, 0.45], dodge: 0.3, pressGap: 0.8, jitter: 8, flank: 0.15 },
+  novice: { react: [0.3, 0.45], dodge: 0.3, pressGap: 0.8, jitter: 8, flank: 0 },
   // (flank: how often, facing an opponent that is ready, it works round to the side before striking - the dogfight)
   skilled: { react: [0.2, 0.35], dodge: 0.6, pressGap: 0.55, jitter: 2, flank: 0.7 },
   // (the numbers from the person's play log: see the head of this file)

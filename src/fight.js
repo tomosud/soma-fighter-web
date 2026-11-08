@@ -784,7 +784,7 @@ function strikeReq(F, family = null, mode = 'now', kindSel = null, pressId = 0, 
           groundFrames(frames);
           if (!F.isPlayer && F.broken && clock < F.broken) return; // (off balance: no blow)
           F.attack = atk; atk.spliced = true;
-          if (F.isPlayer) postureHit(F, 4, 'swing');
+          if (F.isPlayer) postureHit(F, 2, 'swing');
           const dur = warpStrike(F, frames, k.part, rate, ready, k.family);
           atk.contactAt = clock + dur; // (when the limb reaches the top: the blow is under way until then)
           F.state = 'attack'; F.until = clock + dur + 0.6;
@@ -823,7 +823,7 @@ function followReq(F, mode = 'end') {
           const dur = gen.reduce((s2, f) => s2 + 1 / (FPS * f.rate), 0);
           F.until = clock + dur - 0.15;
           if (!F.isPlayer && !A.landed) { const open = A.charged ? 0.6 : 0.3; F.exposed = clock + dur + open; F.until += open; } // a whiff: open for a counter
-          if (!A.landed && !A.dodgedBy) postureHit(F, A.charged ? 12 : 8, 'whiff'); // (a dodged one has cost it already)
+          if (!A.landed && !A.dodgedBy) postureHit(F, F.isPlayer ? 4 : A.charged ? 12 : 8, 'whiff'); // (a dodged one has cost it already)
           F.charge = null;
         },
       };
@@ -1101,7 +1101,7 @@ function reactReq(F, from, energy, isHead, down, dir = null, hitAt = null) {
       const dest = A.clone().addScaledVector(away, back);
       // reactions face the attacker - but a body struck from the side or behind turns only part way round (it is
       // still caught side-on: the one who got round keeps the advantage)
-      const h0 = rig.heading(rig.positions(ctx[3])), yaw = h0 + clamp(wrap(Math.atan2(-away.x, -away.z) - h0), -0.4, 0.4);
+      const h0 = rig.heading(rig.positions(ctx[3])), sq = (F.recentHits?.filter(t => clock - t < 1.2).length ?? 0) >= 2 ? 1.3 : 0.4, yaw = h0 + clamp(wrap(Math.atan2(-away.x, -away.z) - h0), -sq, sq); // (the second blow in a row: it squares up)
       let targets = best.frames.map(f => ground(placePose(f, yaw, ZERO, dest)));
       if (!down) {
         // the body knocked by the blow (the unseen ragdoll), and, if its centre of mass is heading off its feet,
@@ -1167,9 +1167,10 @@ function checkHits(A, B, dt) {
   // a strike asked for but not yet under way (the motion still the one before): nothing it touches counts; an
   // opponent's blow does not land in its first 0.3 s (the wind-up is always there to see)
   if (A.state === 'attack' && !A.attack) { A.contacts.delete(B); return; }
-  if (!A.isPlayer && A.attack && clock - A.attack.t0 < 0.3) { A.contacts.delete(B); return; }
+  if (!A.isPlayer && A.attack && clock - A.attack.t0 < 0.35) { A.contacts.delete(B); return; }
   if (B.dodge && clock < B.dodge.iframes) {
-    if (A.attack && !A.attack.dodgedBy) { A.attack.dodgedBy = B.id; postureHit(A, 10, 'dodged'); plog?.note('dodged', { by: A.id }); if (B.isPlayer) { dust(B.P[0], 0x9fe0ff); slowUntil = performance.now() + 120; } }
+    if (A.attack && !A.attack.dodgedBy) { A.attack.dodgedBy = B.id; postureHit(A, 10, 'dodged'); if (A.brain) A.brain.combo = 0; A.attackQueued = null; // (a dodged blow has no second half)
+      plog?.note('dodged', { by: A.id }); if (B.isPlayer) { dust(B.P[0], 0x9fe0ff); slowUntil = performance.now() + 120; } }
     A.contacts.delete(B); return;
   }
   const striking = A.state === 'attack' || settings.trigger === 'ram';
@@ -1260,7 +1261,7 @@ function damageNumber(at, text, color, size) {
 }
 /** A blow on a body lying (or getting up): it hurts less, jolts and pushes the body along the floor; a body getting up goes back down. */
 function groundHit(A, B, energy, dir, at, isHead) {
-  const dmg = energy * 0.4 * (A.isPlayer ? settings.damage.player : settings.damage.enemy); // (a body on the floor: kicked, but it is the standing fight that decides)
+  const dmg = energy * 0.25 * (A.isPlayer ? settings.damage.player : settings.damage.enemy); // (a body on the floor: kicked, but it is the standing fight that decides)
   pushPart(B, at, dir, energy);
   B.hp = Math.max(0, B.hp - dmg);
   spark(at, energy * 0.6);
@@ -1364,6 +1365,7 @@ function land(A, B, energy, dir, at, isHead, onArm = false) {
   if (A.isPlayer && asp === 'front' && !vital && !counter) energy = Math.min(energy, 45);
   // a player off balance takes more (it is open), but is not flattened for it
   if (B.isPlayer && broken) energy *= 1.4;
+  if (B.isPlayer) energy = Math.min(energy, 150); // (no blow throws the player across the floor)
   // a touch (a glancing contact, little in it): a small mark, a small sway of the body; no stop, no shake, no
   // reaction motion - the striker carries on through
   if (energy < 12 && B.hp - energy * (A.isPlayer ? settings.damage.player : settings.damage.enemy) > 0) {
@@ -1599,7 +1601,7 @@ function think(E, dt) {
         else if (!inView(P, E) && !B.announced) {
           // out of the player's sight: it announces itself first (a warning at the player's feet), then strikes
           B.announced = true; E.warnUntil = clock + 0.6; B.nextAttack = clock + 0.6;
-        } else { B.tellAt = clock + 0.16; B.tellKind = kind; crew.lastStrikeAt = clock; crew.lastStriker = E; } // (the tell first)
+        } else { B.tellAt = clock + 0.22; B.tellKind = kind; crew.lastStrikeAt = clock; crew.lastStriker = E; } // (the tell first)
       }
     }
     // the rest of a combination: kept while the blow is out (it is chained from the top)
