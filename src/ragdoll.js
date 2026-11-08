@@ -41,6 +41,17 @@ export class Ragdoll {
     this.links = [];
     this.parent.forEach((p, i) => { if (p >= 0) this.links.push([i, p, rest[i].distanceTo(rest[p])]); });
     for (const [a, b] of SHAPE) this.links.push([this.index[a], this.index[b], rest[this.index[a]].distanceTo(rest[this.index[b]])]);
+    // joint limits, as one-sided distance floors (a loose body folds, but never through itself: without these a
+    // knocked-out ragdoll wrapped its wrists onto its shoulders and jackknifed flat - a heap, not a body)
+    this.limits = [];
+    for (const s of ['Left', 'Right']) {
+      const arm = rest[this.index[`${s}Arm`]].distanceTo(rest[this.index[`${s}ForeArm`]]) + rest[this.index[`${s}ForeArm`]].distanceTo(rest[this.index[`${s}Hand`]]);
+      this.limits.push([this.index[`${s}Arm`], this.index[`${s}Hand`], arm * 0.42]); // the elbow folds to ~150 degrees, no further
+      const leg = rest[this.index[`${s}Leg`]].distanceTo(rest[this.index[`${s}Shin`]]) + rest[this.index[`${s}Shin`]].distanceTo(rest[this.index[`${s}Foot`]]);
+      this.limits.push([this.index[`${s}Leg`], this.index[`${s}Foot`], leg * 0.38]);
+    }
+    this.limits.push([this.index.Head, this.index.Chest, rest[this.index.Head].distanceTo(rest[this.index.Chest]) * 0.72]); // the head never folds onto the chest
+    this.limits.push([this.index.Neck1, this.index.Hips, rest[this.index.Neck1].distanceTo(rest[this.index.Hips]) * 0.6]); // the trunk crunches, it does not jackknife flat
     this.restY = rest.map(v => v.y);
     this.feet = { Left: FEET.Left.map(n => this.index[n]), Right: FEET.Right.map(n => this.index[n]) };
     this.isFoot = this.names.map(n => FEET.Left.includes(n) || FEET.Right.includes(n));
@@ -141,6 +152,14 @@ export class Ragdoll {
           const l = e.length();
           if (l < 1e-9) continue;
           const c = (l - len) / l / (w[i] + w[j]);
+          x[i].addScaledVector(e, -c * w[i]);
+          x[j].addScaledVector(e, c * w[j]);
+        }
+        for (const [i, j, min] of this.limits) {
+          e.copy(x[i]).sub(x[j]);
+          const l = e.length();
+          if (l >= min || l < 1e-9) continue;
+          const c = (l - min) / l / (w[i] + w[j]);
           x[i].addScaledVector(e, -c * w[i]);
           x[j].addScaledVector(e, c * w[j]);
         }

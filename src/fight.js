@@ -178,7 +178,7 @@ function buildKeys(d) {
         });
         const travel = flat(chamber[0].pose.root).negate().divideScalar(6 / FPS); // (m/s, in the top's frame: +z forward)
         const arc = rig.positions(chamber[1].pose)[I[part]].distanceTo(tip) + 0.5 * Math.max(0, tip.y - 1.0);
-        strikeKeys.push({ clip: k, name: c.name, part, kind, family: familyOf(c.name, kind), frames, tip, high: tip.y > 1.25, miss, hit, chamber, travel, size: clamp((arc - 0.35) / 0.6, 0, 1) });
+        strikeKeys.push({ clip: k, mirrored, apex: c.strike.apex, name: c.name, part, kind, family: familyOf(c.name, kind), frames, tip, high: tip.y > 1.25, miss, hit, chamber, travel, size: clamp((arc - 0.35) / 0.6, 0, 1) });
       }
     }
     if (c.tag === 'block' && !/restrain|transition/.test(c.name)) {
@@ -1930,8 +1930,20 @@ function specStrike(F) {
   w = S.wS = (S.wS ?? 0) + (w - (S.wS ?? 0)) * (1 - Math.exp(-dtl / 0.045));
   if (w <= 0.001 || !TUNE.spec) return;
   S.joints ??= rig.subtree(I.Spine1); // (the upper body only: a kicking leg turned while its foot is still down slid it along the floor)
+  // the body is drawn ALONG THE STRIKE CLIP'S OWN FRAMES (wind-up to top), not straight at the frozen top pose:
+  // a slerp toward one static pose took the joints through orientations no arm passes - the puppet look
+  const k = A.key;
+  let target = S.pose;
+  if (k && db) {
+    const f = Math.max(0, Math.round(k.apex - 10 + 10 * ps));
+    const raw = db.pose(k.clip, f, k.mirrored);
+    // placed as the targets were: the clip turned from its own heading at the top to the strike's yaw
+    S.qy ??= new Quaternion().setFromAxisAngle(UP, A.yaw - rig.heading(rig.positions(db.pose(k.clip, k.apex, k.mirrored))));
+    target = S.tgt ??= { rot: raw.rot.map(q => q.clone()) };
+    for (let j = 0; j < raw.rot.length; j++) target.rot[j].copy(S.qy).multiply(raw.rot[j]);
+  }
   const p = clonePose(F.shown);
-  for (const j of S.joints) p.rot[j].slerp(S.pose.rot[j], 0.8 * w);
+  for (const j of S.joints) p.rot[j].slerp(target.rot[j], 0.8 * w);
   F.shown = rig.fixRigid(p);
 }
 /**
@@ -2230,7 +2242,8 @@ function balanceLayer(F, dtNow = 1 / 30) {
     }
   }
   const w = broken ? 1 : clamp((0.7 - (F.posture ?? 1)) / 0.7, 0, 1);
-  if (w <= 0.01 || ['down', 'fall', 'getup', 'out'].includes(F.state)) return;
+  // (not during one's own strike: the slump dropped the striking arm and muddied the blow's pose)
+  if (w <= 0.01 || ['down', 'fall', 'getup', 'out'].includes(F.state) || (F.state === 'attack' && !broken)) return;
   const p = clonePose(F.shown), h = rig.heading(rig.positions(p)), fwd = new Vector3(Math.sin(h), 0, Math.cos(h));
   const axis = new Vector3().crossVectors(UP, fwd).normalize(), sway = Math.sin(clock * (broken ? 4.5 : 3)) * (broken ? 0.1 : 0.015) * w;
   rotateSubtree(rig, p, I.Spine2, new Quaternion().setFromAxisAngle(axis, (broken ? 0.35 : 0.06) * w));
@@ -2609,7 +2622,7 @@ function ragStep(F, dt) {
     if (F.restPose) { F.shown = clonePose(F.restPose); return; }
     if (!F.ragOn || !F.limp) { if (!F.ragOn) { R.reset(F.shown); R.last = null; } F.ragOn = true; F.limp = clock; F.ragW = 1; F.ragFade = false; }
     const tl = clock - F.limp;
-    R.gravity = true; R.friction = 0.35; R.dampScale = 0.25; R.k = F.ragK.map(k => k * (0.12 - 0.07 * clamp(tl / 0.6, 0, 1))); R.rootK = 0;
+    R.gravity = true; R.friction = 0.35; R.dampScale = 0.25; R.k = F.ragK.map(k => k * (0.12 - 0.04 * clamp(tl / 0.6, 0, 1))); R.rootK = 0;
     R.last = null; // (no motion velocity to carry: the parts only slow down - air, the floor's rub)
     const anim = clonePose(F.shown); anim.root.copy(R.x[0]); // (the lying shape, carried with the body: only a faint pull toward it)
     R.step(dt, anim, [0, 0, 0, 0], null);
