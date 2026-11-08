@@ -17,7 +17,22 @@ function tick() {
   if (S.n++ % 2 === 0) {
     const src = document.querySelector('canvas');
     const c = document.createElement('canvas'); c.width = 320; c.height = Math.round(320 * src.height / src.width);
-    c.getContext('2d').drawImage(src, 0, 0, c.width, c.height);
+    const g = c.getContext('2d');
+    g.drawImage(src, 0, 0, c.width, c.height);
+    // the victim of the newest live hit is MARKED on the frame (reviews of crowded scenes kept tracking the wrong
+    // body), with how far its root has been carried so far
+    const h = S.live[S.live.length - 1];
+    if (h) {
+      const q = h.F.P[0].clone().project(brawl.camera);
+      const x = (q.x + 1) / 2 * c.width, y = (1 - q.y) / 2 * c.height;
+      if (x > -20 && x < c.width + 20 && y > -20 && y < c.height + 20) {
+        const off = h.F.P[0].clone().sub(h.r0);
+        const dr = h.dir ? Math.max(0, off.x * h.dir.x + off.z * h.dir.z) : Math.hypot(off.x, off.z);
+        g.strokeStyle = '#0f0'; g.lineWidth = 2;
+        g.beginPath(); g.arc(x, y, 9, 0, Math.PI * 2); g.stroke();
+        g.fillStyle = '#0f0'; g.font = 'bold 11px monospace'; g.fillText(dr.toFixed(2) + 'm', x + 11, y + 4);
+      }
+    }
     S.ring.push({ wall: now, clk: brawl.clock, c });
     if (S.ring.length > 64) S.ring.shift();
   }
