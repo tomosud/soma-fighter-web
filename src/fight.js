@@ -1532,14 +1532,14 @@ function land(A, B, energy, dir, at, isHead, onArm = false) {
   }
   // the body is carried off at once (until the generated reaction takes over)
   // (every damaging blow: even one taken through a blow of its own sways the body back a little)
-  if (energy >= 12) B.knockFx = { t0: clock, dir: flat(dir).normalize(), v0: clamp(Math.sqrt(2 * energy / 70) * (down ? 1.3 : 0.7), 0.75, 3) * (armored ? 0.8 : 1), until: null, fade: 0.15 };
+  if (energy >= 12) B.knockFx = { t0: clock, dir: flat(dir).normalize(), v0: clamp(Math.sqrt(2 * energy / 70) * (down ? 1.7 : 0.8), 0.75, 3.4) * (armored ? 0.8 : 1), until: null, fade: 0.15 };
   if (A.attack) {
     if (A.attack.followed && !A.attack.landed && !A.attack.sweep && !A.attack.chained) A.track.request(followReq(A, 'now'));
     A.attack.landed = true;
   }
   B.body.flash = 0.3; // (the struck part itself lights up: impactMark)
   // the stop and the shake grow with the blow (a heavy one is felt, an ordinary one only marked)
-  hitstop = down ? 0.12 : energy < 45 ? clamp(0.04 + energy / 1200, 0.04, 0.08) : clamp(0.08 + energy / 2000, 0.08, 0.12);
+  hitstop = down ? 0.07 : energy < 45 ? clamp(0.04 + energy / 1200, 0.04, 0.08) : clamp(0.08 + energy / 2000, 0.08, 0.12); // (a knockdown's stop short: the launch must read AT the impact, not after a long freeze)
   shake = Math.max(shake, energy < 45 ? clamp(energy / 600, 0.02, 0.06) : clamp(energy / 500, 0.06, 0.14));
   // the player hurt: felt (a red edge, a stronger shake and stop, the camera knocked along the blow) and reeling a
   // moment (sluggish, presses held), so the blow reads
@@ -2224,7 +2224,7 @@ function partAt(F, at, noArms = false) {
 /** A blow pushes the part it met, along the blow, at once (a quick snap, then easing back over ~0.3 s). */
 function pushPart(F, at, dir, energy) {
   const [part, joint] = partAt(F, at);
-  (F.pushes ??= []).push({ part, dir: flat(dir).normalize(), amp: energy < 12 ? 0.05 : clamp(0.08 + energy / 300, 0.08, 0.34), t0: clock, dur: energy < 12 ? 0.2 : 0.34 });
+  (F.pushes ??= []).push({ part, dir: flat(dir).normalize(), amp: energy < 12 ? 0.05 : clamp(0.11 + energy / 240, 0.11, 0.45), t0: clock, dur: energy < 12 ? 0.2 : 0.34 });
   F.dispProbe = { joint, p0: F.P[joint].clone(), t0: clock, energy, part };
 }
 function balanceLayer(F, dtNow = 1 / 30) {
@@ -2268,7 +2268,8 @@ function hitPush(F) {
   if (!F.pushes.length) return;
   const p = clonePose(F.shown);
   for (const h of F.pushes) {
-    const t = (clock - h.t0) / h.dur, w = t < 0.15 ? t / 0.15 : (1 - (t - 0.15) / 0.85) ** 2;
+    // full on the contact frame (the snap IS the hit - ramping in arrived ~80 ms late through the hitstop), easing out
+    const t = (clock - h.t0) / h.dur, w = (1 - t) ** 1.5;
     const axis = new Vector3().crossVectors(UP, h.dir);
     if (axis.lengthSq() < 1e-6) continue;
     axis.normalize();
@@ -2309,11 +2310,12 @@ function knockOn(F) {
   // that gets no reaction of its own (a sway through a strike, a body freed to move, a body already reeling from the
   // last blow) eases back after half a second
   // (not from the motion's tag: a body struck while still in the last blow's reaction must still be carried off)
-  if (!K.until && clock - K.t0 > 0.45 && !(F.track.busy && ['hit', 'fall'].includes(F.state) && clock - K.t0 < 1.4)) { const d0 = K.v0 * 0.35; F.track.shift(K.dir.x * d0, K.dir.z * d0); F.knockFx = null; return; }
+  if (!K.until && clock - K.t0 > 0.45 && !(F.track.busy && ['hit', 'fall'].includes(F.state) && clock - K.t0 < 1.4)) { const d0 = K.v0 * 0.42; F.track.shift(K.dir.x * d0, K.dir.z * d0); F.knockFx = null; return; }
   const t = (K.until ?? clock) - K.t0;
   const w = K.until ? Math.max(0, 1 - Math.max(0, clock - K.until) / (K.fade ?? 0.15)) : 1;
   if ((K.until && w <= 0) || clock - K.t0 > 1.5) { F.knockFx = null; return; }
-  const d = K.v0 * Math.min(t, 0.35) * w;
+  // front-loaded: the body is fastest the instant it is struck (a burst on top of the carry), not a beat later
+  const d = (K.v0 * Math.min(t, 0.32) + K.v0 * 1.1 * Math.min(t, 0.1)) * w;
   K.d = d;
   F.shown.root.x += K.dir.x * d; F.shown.root.z += K.dir.z * d;
 }
@@ -2650,12 +2652,14 @@ function ragStep(F, dt) {
     if (F.restPose) { F.shown = clonePose(F.restPose); return; }
     if (!F.ragOn || !F.limp) { if (!F.ragOn) { R.reset(F.shown); R.last = null; } F.ragOn = true; F.limp = clock; F.ragW = 1; F.ragFade = false; }
     const tl = clock - F.limp;
-    // (the body keeps a real hold on the lying shape the fall gave it - the replayed pose read well, the mush after did not)
-    R.gravity = true; R.friction = 0.35; R.dampScale = 0.3; R.k = F.ragK.map(k => k * (0.24 - 0.12 * clamp(tl / 0.6, 0, 1))); R.rootK = 0;
+    // the generated fall is the star, the physics only seasons it: the body carries its momentum, rolls and
+    // slides under gravity, but the shown pose stays more than half the replayed lying shape (pure ragdoll read
+    // as a boneless heap however it was constrained)
+    R.gravity = true; R.friction = 0.35; R.dampScale = 0.3; R.k = F.ragK.map(k => k * 0.32); R.rootK = 0;
     R.last = null; // (no motion velocity to carry: the parts only slow down - air, the floor's rub)
-    const anim = clonePose(F.shown); anim.root.copy(R.x[0]); // (the lying shape, carried with the body: only a faint pull toward it)
+    const anim = clonePose(F.shown); anim.root.copy(R.x[0]); // (the lying shape, carried with the body)
     R.step(dt, anim, [0, 0, 0, 0], null);
-    F.shown = R.pose(anim);
+    F.shown = lerpPose(anim, R.pose(anim), 0.55);
     const sp = R.v.reduce((a, v) => a + v.length(), 0) / R.v.length;
     F.stillFor = sp < 0.06 ? (F.stillFor ?? 0) + dt : 0;
     if (F.stillFor > 0.5 && tl > 0.8) { F.restPose = clonePose(F.shown); F.restAt = clock; }
