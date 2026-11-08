@@ -577,7 +577,7 @@ function planReq(F, kind, mode = 'now') {
             if (!mask[i]) { biasBuf[i] = Infinity; continue; }
             let b = calm * change[i];
             if (movingOn && entTag[i] === stance) b += 1.5; // pulled along: not a clip that stays put
-            if (inFight && entTag[i] !== stance) b += 2.2;
+            if (inFight && entTag[i] !== stance) b += 3.5;
             const c = eC[i];
             if (c === cc) { if (eF[i] < cf && eF[i] > cf - 40) b += 4; }
             else if (recentClip[c]) b += 2;
@@ -2586,6 +2586,7 @@ function bodySlam(A, B, dt) {
  * - or, knocked down, stays loose until it lies still, its limbs falling as they will. What is shown is the
  * ragdoll, blended into the motion as it settles.
  */
+const RAG_TRUNK = new Set(['Spine1', 'Spine2', 'Chest', 'Neck1', 'Neck2', 'Head']);
 function jolt(F, at, J, loose, recover, feetFree = false) {
   const R = F.rag;
   if (!F.ragOn) { R.reset(F.shown); R.last = null; }
@@ -2628,7 +2629,10 @@ function ragStep(F, dt) {
   // firming muscles also damp: the body swallows the jolt and settles instead of ringing against the motion
   R.dampScale = down || lying ? 1 : 1 + 2 * u;
   const loose = F.ragLoose + (1 - F.ragLoose) * u * u;
-  R.k = F.ragK.map(k => k * (down ? Math.max(F.ragLoose, 0.25) : loose));
+  // the trunk gives too: its muscles are far stiffer than the arms', so an even loosening left the arms flailing
+  // on an upright statue - the spine takes an extra share of the blow while reeling, and firms back with the rest
+  const tf = i => (RAG_TRUNK.has(R.names[i]) ? 0.45 + 0.55 * u : 1);
+  R.k = F.ragK.map((k, i) => k * (down ? Math.max(F.ragLoose, 0.25) : loose * tf(i)));
   R.rootK = kicked ? 60 + 2440 * ((clock - F.groundJolt) / 1.0) ** 2 : down || F.state === 'down' || F.state === 'getup' ? 2500 : 600 + 2400 * u;
   const contact = F.ragFeetFree || down ? [0, 0, 0, 0] : null;
   // (the ragdoll keeps its own state: a reset, should it drift far from the motion, is not shown as a jump)
