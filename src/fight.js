@@ -59,7 +59,7 @@ const settings = {
   damage: { player: 0.6, enemy: 0.45 }, // hp per joule
   hipsMass: 12, // the part of the body's weight a moving body puts behind a blow (kg)
   regen: 3, // the player's hp back per second after 3 s without being hit
-  knockdown: 80, // J in one blow that puts an opponent on the floor (the player: 0.9 of it)
+  knockdown: 95, // J in one blow that puts an opponent on the floor (the player: 1.3 of it); below it the body is knocked but stays up, and the fight stays on its feet
 };
 
 // ---------------------------------------------------------------- the reference database
@@ -475,7 +475,10 @@ function predict(F, pose, heading) {
     if (F.spring) springStep(v, p, F.spring.target, 1 / FPS); else approach(v, F.want, 1 / FPS);
     p.addScaledVector(v, 1 / FPS);
     const face = F.faceHold ? heading : look && F.state !== 'fall' && F.state !== 'down' && Math.hypot(look.x - p.x, look.z - p.z) > 0.3 ? Math.atan2(look.x - p.x, look.z - p.z) : (v.length() > 0.3 ? Math.atan2(v.x, v.z) : yaw);
-    yaw += clamp(wrap(face - yaw), -4.5 / FPS, 4.5 / FPS);
+    // (the dogfight: the player turns quicker than an opponent, which can be got round by a player circling at
+    // ~2 m/s; an opponent off balance, or just out of a blow, hardly turns)
+    const turn = F.isPlayer ? 4.5 : F.broken && clock < F.broken ? 1.0 : clock < (F.exposed ?? 0) ? 1.1 : F.state === 'free' ? 2.2 : 1.6;
+    yaw += clamp(wrap(face - yaw), -turn / FPS, turn / FPS);
     if (TRAJ.includes(k)) out.push({ pos: p.clone(), yaw });
   }
   return out;
@@ -629,7 +632,7 @@ function warpStrike(F, frames, part, base, ready = 0, family = null) {
     const out = {};
     const rates = tempoRates(frames, pos, prof, {
       apex: n - 1, phases: F.isPlayer || charged || ready > 0.6 ? ['accel'] : ['ant', 'accel'],
-      durationScale: F.isPlayer ? 0.65 : charged ? 0.85 : 1.0, peakSpeed: F.isPlayer ? 8.5 : 7.5, maxRate: 6, out,
+      durationScale: F.isPlayer ? 0.65 : charged ? 0.85 : 1.15, peakSpeed: F.isPlayer ? 8.5 : 7.5, maxRate: 6, out,
     });
     rates.forEach((r, i) => { frames[i].rate = r; });
     // a kick, a knee: a beat at full extension (Mixamo holds 4 frames); a punch goes straight on
@@ -732,7 +735,7 @@ function strikeReq(F, family = null, mode = 'now', kindSel = null, pressId = 0, 
       if (aimPart === 'legs' && pool.some(k => k.family === 'low')) pool = pool.filter(k => k.family === 'low'); // at the legs: a low kick, a sweep
       for (const k of (pool.length ? pool : strikeKeys)) {
         const goal = local(aimOf(k));
-        const step = clamp(goal.z - k.tip.z + 0.08, -0.2, WIND[k.kind] + (F.isPlayer ? 0.25 : opts.lunge ? 0.5 : 0.1)); // (aim assist: it may step further in, the player most; a lunge far)
+        const step = clamp(goal.z - k.tip.z + 0.08, -0.2, WIND[k.kind] + (F.isPlayer ? 0.25 : opts.lunge ? 0.5 : 0.25)); // (aim assist: it may step further in, the player most; a lunge far)
         let cost = Math.abs(goal.z - k.tip.z - step) * 4 + Math.abs(goal.y - k.tip.y) * 2 + Math.abs(goal.x - k.tip.x) * 1.5;
         cost += (k.clip === F.lastStrike ? 1.0 : 0) + (k.clip === F.lastStrike2 ? 0.5 : 0) + Math.random() * 0.25;
         // the pose now: the strike whose wind-up the body is already in (or near: a deeper wind-up costs a little more)
@@ -781,6 +784,7 @@ function strikeReq(F, family = null, mode = 'now', kindSel = null, pressId = 0, 
           groundFrames(frames);
           if (!F.isPlayer && F.broken && clock < F.broken) return; // (off balance: no blow)
           F.attack = atk; atk.spliced = true;
+          if (F.isPlayer) postureHit(F, 4, 'swing');
           const dur = warpStrike(F, frames, k.part, rate, ready, k.family);
           atk.contactAt = clock + dur; // (when the limb reaches the top: the blow is under way until then)
           F.state = 'attack'; F.until = clock + dur + 0.6;
@@ -948,9 +952,13 @@ function guardReq(F, A, kind) {
  * lands; MotionBricks makes the flight, the landing and the slide. Then a moment on the floor (longer after a
  * bigger blow).
  */
-function fallPlan(F, ctx, energy, dir) {
+function fallPlan(F, ctx, energy, dir, a) {
   const A = flat(ctx[3].root);
   const blow = flat(dir).normalize();
+  // the way the body has been carried since the blow (shown on top of the motion) is where the fall starts from
+  const K = F.knockFx, carried = K && !K.baked && K.d > 0.01 ? K.dir.clone().multiplyScalar(K.d) : null;
+  if (carried) A.add(carried);
+  const bake = a0 => { if (carried && F.knockFx === K) K.baked = { o: carried, from: a0 }; };
   const hV = rig.heading(rig.positions(ctx[3])), want = Math.atan2(blow.x, blow.z);
   let best = null, bc = Infinity, yaw = 0;
   for (const k of fallKeys) {
@@ -973,13 +981,16 @@ function fallPlan(F, ctx, energy, dir) {
   const hold = 0.5 + clamp(energy / 200, 0, 0.8);
   const settle = rate => (tr2, a0, gen) => {
     groundFrames(gen);
+    bake(a0);
     const left = (tr2.frames.length - 1 - tr2.t) / FPS / rate;
     const end = tr2.frames[tr2.frames.length - 1];
     // knocked out: it lies there; alive: it stirs at once (crawling away, or toward where the player points)
     const still = F.ko ? hold + 1 : 0;
     for (let k = 0; k < FPS * still; k++) tr2.frames.push({ pose: end.pose, rate: 1, tag: end.tag });
     F.state = 'down'; F.until = clock + left + still + 0.1;
-    if (!F.ko) { tr2.request(stirReq(F, hold)); jolt(F, F.P[0].clone(), new Vector3(), 0.5, 0.5, true); }
+    // (alive: an opponent stirs once, then gets up - a fight on its feet, not a floor to pound; the player gets
+    // straight up: it is never left lying)
+    if (!F.ko) { if (!F.isPlayer) tr2.request(stirReq(F, hold)); jolt(F, F.P[0].clone(), new Vector3(), 0.5, 0.5, true); }
   };
   if (!fly) return { targets: lying, tokens: [8, 9], rate: 1.6, fixEnd: true, tag: { kind: 'down' }, after: settle(1.6) };
   // in the air: the moment on the way down, half way along, lifted
@@ -988,7 +999,7 @@ function fallPlan(F, ctx, energy, dir) {
   const landing = { kind: 'hit', mode: 'end', build: () => ({ targets: lying, tokens: [6, 7], rate: 1.5, fixEnd: true, tag: { kind: 'down' }, after: settle(1.5) }) };
   return {
     targets: air, tokens: [6], rate: 1.9, fixEnd: true, tag: { kind: 'down' },
-    after: (tr2, a0, gen) => { groundFrames(gen, true); F.state = 'fall'; F.until = clock + 5; tr2.request(landing); },
+    after: (tr2, a0, gen) => { groundFrames(gen, true); bake(a0); F.state = 'fall'; F.until = clock + 5; tr2.request(landing); },
   };
 }
 /**
@@ -1018,8 +1029,8 @@ function stirReq(F, hold, n = 0) {
         after: (tr2, a0, gen) => {
           groundFrames(gen);
           F.until = clock + (tr2.frames.length - 1 - tr2.t) / FPS / rate;
-          // a second stir (crawling on), then up
-          if (n < 2) tr2.request(stirReq(F, hold, n + 1)); // (crawling on: three stirs, then up)
+          // a second stir (crawling on), then up (two stirs: down about two seconds)
+          if (n < 1) tr2.request(stirReq(F, hold, n + 1));
         },
       };
     },
@@ -1047,7 +1058,7 @@ function getupReq(F) {
       const kneel = place(g.kneel), stand = place(g.stand);
       F.current = null;
       F.lastMatch = { name: `${g.name} → 起き上がり`, kind: 'getup', cost: 0, frame: 0 };
-      const rate = F.isPlayer ? 1.5 : 1.3;
+      const rate = F.isPlayer ? 1.8 : 1.3;
       const rise = {
         kind: 'hit', mode: 'end',
         build: () => ({
@@ -1060,7 +1071,7 @@ function getupReq(F) {
         targets: kneel, tokens: [7, 8], rate, fixEnd: true, tag: { kind: 'hit' },
         after: (tr2, a0, gen) => {
           groundFrames(gen);
-          if (!F.failedGetup && (F.hp < 0.3 * F.maxHp || (!F.isPlayer && Math.random() < 0.25))) {
+          if (!F.isPlayer && !F.failedGetup && (F.hp < 0.3 * F.maxHp || Math.random() < 0.25)) { // (the player always gets up first time)
             F.failedGetup = true; F.state = 'down'; F.until = clock + 3; tr2.request(stirReq(F, 1, 1)); return;
           }
           F.failedGetup = false; F.state = 'getup'; F.until = clock + 5; tr2.request(rise);
@@ -1078,7 +1089,7 @@ function reactReq(F, from, energy, isHead, down, dir = null, hitAt = null) {
       const away = A.clone().sub(flat(from));
       if (away.lengthSq() < 1e-6) away.set(1, 0, 0);
       away.normalize();
-      if (down && fallKeys.length) return fallPlan(F, ctx, energy, dir ?? away);
+      if (down && fallKeys.length) return fallPlan(F, ctx, energy, dir ?? away, a);
       const pool = down ? fallKeys : hitKeys.filter(h => h.where === (isHead ? 'head' : 'body') || h.where === 'any');
       const list = pool.length ? pool : hitKeys;
       // stronger blows: the bigger reactions
@@ -1088,7 +1099,9 @@ function reactReq(F, from, energy, isHead, down, dir = null, hitAt = null) {
       F.lastReact = best?.clip;
       const back = down ? 0.35 + clamp(energy / 90, 0, 1.5) : clamp(0.1 + energy / 200, 0.1, 0.55); // a big blow sends the body flying
       const dest = A.clone().addScaledVector(away, back);
-      const yaw = Math.atan2(-away.x, -away.z); // reactions face the attacker
+      // reactions face the attacker - but a body struck from the side or behind turns only part way round (it is
+      // still caught side-on: the one who got round keeps the advantage)
+      const h0 = rig.heading(rig.positions(ctx[3])), yaw = h0 + clamp(wrap(Math.atan2(-away.x, -away.z) - h0), -0.4, 0.4);
       let targets = best.frames.map(f => ground(placePose(f, yaw, ZERO, dest)));
       if (!down) {
         // the body knocked by the blow (the unseen ragdoll), and, if its centre of mass is heading off its feet,
@@ -1119,7 +1132,7 @@ function reactReq(F, from, energy, isHead, down, dir = null, hitAt = null) {
         targets, tokens: down ? [8, 9] : [6], rate: down ? 1.6 : rate, fixEnd: true, tag: { kind: down ? 'down' : 'hit' },
         after: (tr2, a0, frames) => {
           groundFrames(frames);
-          if (!down) warpReact(frames, clamp(energy / 45, 0, 1), energy);
+          if (!down) { warpReact(frames, clamp(energy / 45, 0, 1), energy); bakeKnock(F, frames, a0); }
           const left = down ? (tr2.frames.length - 1 - tr2.t) / FPS / rate : frames.reduce((s2, f) => s2 + 1 / (FPS * f.rate), 0);
           if (down) {
             const end = tr2.frames[tr2.frames.length - 1];
@@ -1220,7 +1233,7 @@ function settle(A, B, C) {
   B.lastHitBy = C.id; C.landed = true;
   // the limb's energy, and the body's own momentum behind it (a swinging, charging body hits heavier)
   const e = 0.5 * b.m * b.closing * b.closing * (b.isHead ? 1.2 : 1) + 0.5 * settings.hipsMass * (A.isPlayer ? 1 : 0.3) * b.behind * b.behind; // (the opponents lunge lighter)
-  land(A, B, e, b.n, b.at, b.isHead);
+  land(A, B, e, b.n, b.at, b.isHead, b.onArm);
 }
 // readable blows: a red edge on the screen (the player hurt), a camera kick, numbers where a blow lands
 const hurtEl = document.createElement('div');
@@ -1247,17 +1260,17 @@ function damageNumber(at, text, color, size) {
 }
 /** A blow on a body lying (or getting up): it hurts less, jolts and pushes the body along the floor; a body getting up goes back down. */
 function groundHit(A, B, energy, dir, at, isHead) {
-  const dmg = energy * 0.6 * (A.isPlayer ? settings.damage.player : settings.damage.enemy);
+  const dmg = energy * 0.4 * (A.isPlayer ? settings.damage.player : settings.damage.enemy); // (a body on the floor: kicked, but it is the standing fight that decides)
   pushPart(B, at, dir, energy);
   B.hp = Math.max(0, B.hp - dmg);
   spark(at, energy * 0.6);
   const n = flat(dir).normalize();
   jolt(B, at, n.clone().multiplyScalar(Math.sqrt(2 * energy * 6) * 1.2), 0.25, 0.6, true);
-  const push = n.clone().multiplyScalar(Math.min(0.3, energy / 300));
-  B.track.shift(push.x, push.z);
-  for (const v of B.P) { v.x += push.x; v.z += push.z; }
-  if (B.state === 'getup') { B.state = 'down'; B.until = clock + 2; B.getupKey = null; B.track.request(stirReq(B, 1, 0)); }
-  else if (B.state === 'down') B.until += clamp(energy / 150, 0.1, 0.5);
+  // the body slides along the floor with the blow: over 0.3 s (an instant shift reads as a jump, not a push)
+  if (energy >= 12) B.slide = { dir: n, dist: clamp(energy / 220, 0.14, 0.5), t0: clock, dur: 0.3, done: 0 };
+  // the player is never kept down by kicks: it hurts, the body is pushed, the getting-up goes on
+  if (B.state === 'getup' && !B.isPlayer) { B.state = 'down'; B.until = clock + 2; B.getupKey = null; B.track.request(stirReq(B, 1, 0)); }
+  else if (B.state === 'down' && !B.isPlayer) B.until += clamp(energy / 150, 0.1, 0.5);
   if (B.hp <= 0 && !B.isPlayer) B.ko = true;
   hitstop = Math.max(hitstop, 0.03); shake = Math.max(shake, 0.03);
   if (B.isPlayer) hurt = Math.max(hurt, 0.5);
@@ -1276,7 +1289,7 @@ function aspect(B, A) {
   const ang = Math.abs(wrap(Math.atan2(to.x, to.z) - h));
   return ang < 0.79 ? 'front' : ang < 2.09 ? 'flank' : 'rear';
 }
-const ASPECT = { front: { dmg: 1.0, posture: 1.0 }, flank: { dmg: 1.3, posture: 1.4 }, rear: { dmg: 1.8, posture: 2.0 } };
+const ASPECT = { front: { dmg: 1.0, posture: 1.0 }, flank: { dmg: 1.2, posture: 1.4 }, rear: { dmg: 1.5, posture: 1.8 } };
 // vital points by the part met and the side it is met from: [name, damage x, balance x]
 function vitalOf(part, asp, openGuard) {
   if (part === 'head') return asp === 'flank' ? ['jaw', 1.5, 2.2] : asp === 'rear' ? ['occiput', 1.8, 3.0] : null;
@@ -1303,26 +1316,29 @@ function breakPosture(F, why) {
   const from = player?.P[0] ?? F.P[0].clone().add(new Vector3(0, 0, 1));
   F.track.request(reactReq(F, from, 35, false, false, flat(F.P[0].clone().sub(from)).normalize())); // (a stagger: the strike it was in is called off)
 }
-function land(A, B, energy, dir, at, isHead) {
+function land(A, B, energy, dir, at, isHead, onArm = false) {
   if (B.state === 'down' || B.state === 'getup') { groundHit(A, B, energy, dir, at, isHead); return; }
   // ---- the dogfight
-  const asp = aspect(B, A), part = partAt(B, at)[0];
+  // (the arm is what the contact test says it met - a body blow at an open level is not an arm because a forearm
+  // happens to hang near it)
+  const asp = aspect(B, A), part = onArm ? 'arm' : isHead ? 'head' : partAt(B, at, true)[0];
   const inWind = B.state === 'attack' && (B.attack ? clock - B.attack.t0 < 0.35 : clock - (B.windAt ?? -9) < 0.5) && !B.charge;
   const broken = B.broken && clock < B.broken;
   // a ready opponent covers one level at a time (its stance shows which): high covers the head, low the body and legs
-  const covered = B.isPlayer || part.startsWith('arm') || (B.stance === 'low' ? part !== 'head' : part === 'head');
-  const aware = asp === 'front' && (B.state === 'free' || (B.state === 'guard' && B.guard?.kind !== 'dodge')) && clock > (B.stun ?? 0) && (B.posture ?? 1) > 0.25 && !broken && covered;
+  const covered = !B.isPlayer && (part === 'arm' || (B.stance === 'low' ? part !== 'head' : part === 'head'));
+  const aware = asp === 'front' && (B.state === 'free' || B.state === 'hit' || (B.state === 'guard' && B.guard?.kind !== 'dodge')) && clock > (B.stun ?? 0) && (B.posture ?? 1) > 0.25 && !broken && covered;
   const vital = vitalOf(part, asp, inWind);
   let balance = ASPECT[asp].posture * (vital ? vital[2] : 1) * (inWind ? 2 : 1);
   const mult = ASPECT[asp].dmg * (vital ? vital[1] : 1) * (broken && !B.isPlayer ? 2 : 1); // (a player off balance is slowed and open, not flattened)
-  energy *= Math.min(2.6, B.isPlayer ? 1 + (mult - 1) * 0.5 : mult); // (the player is spared half the extra: it is warned, not ambushed)
+  const e00 = energy; // (all the multipliers together are capped below)
+  energy *= B.isPlayer ? 1 + (mult - 1) * 0.5 : mult; // (the player is spared half the extra: it is warned, not ambushed)
   // a fighter turning a blow aside answers harder for a moment
   let answer = false;
   if (A.counterUntil && clock < A.counterUntil) { energy *= 1.3; answer = true; A.counterUntil = 0; }
   // head-on against a fighter that is ready: turned aside - little gets through, the striker's balance suffers
   if (aware && energy >= 12) {
     const e0 = energy;
-    energy *= B.isPlayer ? 0.5 : 0.2; // (the player half-turns a blow head-on: the opponents' blows still tell)
+    energy *= B.isPlayer ? 0.5 : 0.3; // (the player half-turns a blow head-on: the opponents' blows still tell)
     jolt(B, at, flat(dir).normalize().multiplyScalar(Math.sqrt(2 * e0 * 6) * 0.4), 0.6, 0.25);
     pushPart(B, at, dir, Math.max(energy, 12));
     jolt(A, at, flat(dir).normalize().multiplyScalar(-Math.sqrt(2 * e0 * 6) * 0.3), 0.6, 0.3); // (the blow bounces off)
@@ -1337,11 +1353,17 @@ function land(A, B, energy, dir, at, isHead) {
     hudFight();
     return;
   }
-  const counter_ = !!(broken || answer || (vital && !B.isPlayer && A.isPlayer));
+  const counter_ = !!(broken || answer);
   // a counter: an opponent caught in the recovery of a missed blow, or a blow right after the player stepped out of one
   let counter = counter_;
   if (!B.isPlayer && clock < (B.exposed ?? 0)) { energy *= 1.25; counter = true; B.exposed = 0; } // (one counter per whiff)
   else if (A.isPlayer && A.dodge?.flick && clock - A.dodge.at < 1.3) { energy *= 1.4; counter = true; }
+  energy = Math.min(energy, e00 * 2.6);
+  // head-on, no vital point, no counter: the player's blow does not floor anyone (only getting round, a vital point or
+  // a counter does)
+  if (A.isPlayer && asp === 'front' && !vital && !counter) energy = Math.min(energy, 45);
+  // a player off balance takes more (it is open), but is not flattened for it
+  if (B.isPlayer && broken) energy *= 1.4;
   // a touch (a glancing contact, little in it): a small mark, a small sway of the body; no stop, no shake, no
   // reaction motion - the striker carries on through
   if (energy < 12 && B.hp - energy * (A.isPlayer ? settings.damage.player : settings.damage.enemy) > 0) {
@@ -1371,7 +1393,7 @@ function land(A, B, energy, dir, at, isHead) {
   }
   B.hitAt = clock;
   {
-    const down0 = B.hp - energy * (A.isPlayer ? settings.damage.player : settings.damage.enemy) <= 0 || energy > settings.knockdown * (B.isPlayer ? 1.1 : 1);
+    const down0 = B.hp - energy * (A.isPlayer ? settings.damage.player : settings.damage.enemy) <= 0 || energy > settings.knockdown * (B.isPlayer ? 1.3 : 1);
     const J = flat(dir).normalize().multiplyScalar(Math.sqrt(2 * energy * 6)); // the momentum the blow puts in (kg m/s)
     J.y = (isHead ? 0.25 : 0.1) * J.length();
     jolt(B, at, J, clamp(0.35 - energy / 300, down0 ? 0.04 : 0.08, 0.3), clamp(0.3 + energy / 120, 0.3, 0.9), down0);
@@ -1381,10 +1403,10 @@ function land(A, B, energy, dir, at, isHead) {
   B.hp = Math.max(0, B.hp - dmg);
   spark(at, energy);
   pushPart(B, at, dir, energy * (vital ? 1.5 : 1));
-  postureHit(B, energy * (B.isPlayer ? 0.5 : 0.15) * balance, vital ? vital[0] : asp); // (an opponent's balance breaks after a few good blows, not every exchange)
+  postureHit(B, energy * (B.isPlayer ? 0.5 : 0.09) * balance, vital ? vital[0] : asp); // (an opponent's balance breaks after a few good blows, not every exchange)
   const push = flat(dir).normalize().multiplyScalar(clamp(0.35 * Math.sqrt(energy), 0.6, 2.6));
   B.knock.copy(push);
-  const down = B.hp <= 0 || energy > settings.knockdown * (B.isPlayer ? 1.1 : 1) * (broken && !B.isPlayer ? 0.5 : 1);
+  const down = B.hp <= 0 || energy > settings.knockdown * (B.isPlayer ? 1.3 : 1) * (broken && !B.isPlayer ? 0.5 : 1);
   // an opponent already throwing its blow takes a light one through it (it sways, the blow goes on): a trade
   const charging = !B.isPlayer && B.charge && clock - B.charge.t0 < 1.4 && asp === 'front'; // (from the side or behind, a charge is no armour)
   const armored = !counter && !B.isPlayer && !down && ((charging && energy < 45) || (B.state === 'attack' && B.attack?.spliced && clock - B.attack.t0 > 0.3 && energy < 25));
@@ -1403,7 +1425,7 @@ function land(A, B, energy, dir, at, isHead) {
   }
   // the body is carried off at once (until the generated reaction takes over)
   // (every damaging blow: even one taken through a blow of its own sways the body back a little)
-  if (energy >= 12) B.knockFx = { t0: clock, dir: flat(dir).normalize(), v0: clamp(Math.sqrt(2 * energy / 70) * (down ? 1.3 : 0.7), 0.75, 3) * (armored ? 0.6 : 1), until: armored ? clock + 0.25 : null, fade: armored ? 0.35 : 0.15 };
+  if (energy >= 12) B.knockFx = { t0: clock, dir: flat(dir).normalize(), v0: clamp(Math.sqrt(2 * energy / 70) * (down ? 1.3 : 0.7), 0.75, 3) * (armored ? 0.8 : 1), until: armored ? clock + 0.3 : null, fade: armored ? 0.35 : 0.15 };
   if (A.attack) {
     if (A.attack.followed && !A.attack.landed && !A.attack.sweep && !A.attack.chained) A.track.request(followReq(A, 'now'));
     A.attack.landed = true;
@@ -1419,7 +1441,7 @@ function land(A, B, energy, dir, at, isHead) {
     shake = Math.max(shake, clamp(energy / 250, 0.05, 0.18));
     hitstop = Math.max(hitstop, clamp(0.06 + energy / 1300, 0.06, 0.12));
     camKick.addScaledVector(flat(dir).normalize(), clamp(energy / 400, 0.04, 0.14));
-    B.stun = clock + clamp(0.2 + energy / 200, 0.2, 0.45);
+    B.stun = clock + clamp(0.2 + energy / 200, 0.2, 0.3); // (never more than 0.3 s out of the player's hands)
   }
   damageNumber(at, counter ? `カウンター -${Math.round(dmg)}` : `-${Math.round(dmg)}`, B.isPlayer ? '#ff5050' : counter ? '#ffd040' : '#ffffff', (B.isPlayer ? 20 : 15) + Math.min(16, energy / 5));
   if (counter) { spark(at, energy * 1.3, 0xffc030); spark(at, energy * 0.6, 0xffffff); hitstop = Math.max(hitstop, 0.1); slowUntil = Math.max(slowUntil, performance.now() + 250); camKick.addScaledVector(flat(dir).normalize(), 0.08); }
@@ -1447,10 +1469,10 @@ function start() {
 function spawn() {
   // in front of the player, a little to one side when others are already there
   const others = fighters.filter(f => !f.isPlayer && f.state !== 'out').length;
-  const h = rig.heading(player.P) + (others ? (others % 2 ? 0.9 : -0.9) : 0), d = 4.0;
+  const h = rig.heading(player.P) + (others ? (others % 2 ? 1.3 : -1.3) : 0.4), d = 3.0;
   const pos = flat(player.P[0]).add(new Vector3(Math.sin(h), 0, Math.cos(h)).multiplyScalar(d));
   const e = new Fighter(false, [0x7f97c9, 0x5fae98, 0x9a7fc9][(Fighter.seq ?? 0) % 3], pos, h + Math.PI);
-  e.hp = e.maxHp = 200 + 15 * Math.min(kos, 6);
+  e.hp = e.maxHp = 300 + 15 * Math.min(kos, 6); // (a knock-out every 15-40 s against a skilled player)
   fighters.push(e);
   hudFight();
 }
@@ -1538,8 +1560,8 @@ function think(E, dt) {
       const kind = d > 1.3 ? (Math.random() < 0.6 ? 'kick' : 'punch') : Math.random() < 0.7 ? 'punch' : 'kick';
       const u = Math.random(), part = kind === 'kick' && u < 0.3 ? 'legs' : u < 0.6 ? 'head' : 'body';
       E.aim = { enemy: P, part, joint: part === 'head' ? I.Head : part === 'body' ? I.Spine2 : I.LeftShin, off: new Vector3() };
-      // head-on: a feint (the load, then nothing) more often than the real charge
-      startCharge(E, kind, Math.random() < 0.5);
+      // head-on: now and then a feint (the load, then nothing) in place of the real charge
+      startCharge(E, kind, Math.random() < 0.15);
       B.nextCharge = clock + rand(1.6, 2.6) + 1.0; B.nextAttack = clock + 1.4;
       crew.chargeFreeUntil = clock + 0.9; crew.lastStrikeAt = clock; crew.lastStriker = E;
     }
@@ -1547,7 +1569,26 @@ function think(E, dt) {
     if (E.charge && !E.attack?.charged) { goal = pp.clone().addScaledVector(to, -(d + 0.45)); E.mode = 'evade'; }
     else if (E.charge && E.attack?.charged && !E.attack.followed) { goal = pp.clone().addScaledVector(to, 0.3); E.mode = 'lunge'; }
     // quick blows: from the side or behind, or when the player is committed (head-on otherwise: only a jab now and then)
-    if (E.state === 'free' && clock > B.nextAttack && clock > B.evadeUntil && d < 1.3 && (fromSide || committed || clock > (B.nextJab ??= clock + rand(0.6, 1.4)))) {
+    const facingP = aspect(E, P) === 'front';
+    const turn = E.state === 'free' && facingP && clock > B.nextAttack && clock > B.evadeUntil && (fromSide || committed || clock > (B.nextJab ??= clock + rand(0.9, 1.4)));
+    // its turn but a little out of reach (1.3-2 m): it drives in first, so the blow begins within reach and lands
+    if (turn && d >= 1.3 && d < 2.0 && clock > B.lungeUntil + 0.5 && !E.charge) { B.lungeUntil = clock + 0.3; goal = pp.clone().addScaledVector(to, 0.3); E.mode = 'lunge'; }
+    // the tell: a quick step back, then in with the blow
+    if (B.tellAt) {
+      goal = pp.clone().addScaledVector(to, -(d + 0.3)); E.mode = 'evade';
+      if (clock >= B.tellAt || E.state !== 'free') {
+        const k = B.tellKind; B.tellAt = null;
+        if (E.state === 'free' && strike(E, k) === 'started') {
+          B.announced = false;
+          crew.lastStrikeAt = clock; crew.lastStriker = E;
+          E.antic = { t0: clock, side: Math.random() < 0.5 ? 1 : -1 };
+          B.combo = Math.random() < 0.4 ? (Math.random() < 0.4 ? 2 : 1) : 0;
+          B.nextAttack = clock + rand(0.25, 0.6);
+          if (!fromSide && !committed) B.nextJab = clock + rand(0.9, 1.4);
+        } else B.nextAttack = clock + 0.2;
+      }
+    }
+    if (turn && d < 1.3 && !B.tellAt) {
       {
         const kind = d > 1.1 ? (Math.random() < 0.6 ? 'kick' : 'punch') : Math.random() < 0.8 ? 'punch' : 'kick';
         const u = Math.random(), part = kind === 'kick' && u < 0.3 ? 'legs' : u < 0.6 ? 'head' : 'body';
@@ -1557,15 +1598,8 @@ function think(E, dt) {
         if (clock - (crew.lastStrikeAt ?? -9) < 0.35 && crew.lastStriker !== E) B.nextAttack = clock + rand(0.12, 0.25);
         else if (!inView(P, E) && !B.announced) {
           // out of the player's sight: it announces itself first (a warning at the player's feet), then strikes
-          B.announced = true; E.warnUntil = clock + 0.4; B.nextAttack = clock + 0.4;
-        } else if (strike(E, kind) === 'started') {
-          B.announced = false;
-          crew.lastStrikeAt = clock; crew.lastStriker = E;
-          E.antic = { t0: clock, side: Math.random() < 0.5 ? 1 : -1 }; // the wind-up shows
-          B.combo = Math.random() < 0.65 ? (Math.random() < 0.4 ? 2 : 1) : 0;
-          B.nextAttack = clock + rand(0.25, 0.6);
-          if (!fromSide && !committed) B.nextJab = clock + rand(0.9, 1.8); // (head-on: now and then)
-        } else B.nextAttack = clock + 0.2;
+          B.announced = true; E.warnUntil = clock + 0.6; B.nextAttack = clock + 0.6;
+        } else { B.tellAt = clock + 0.16; B.tellKind = kind; crew.lastStrikeAt = clock; crew.lastStriker = E; } // (the tell first)
       }
     }
     // the rest of a combination: kept while the blow is out (it is chained from the top)
@@ -1598,16 +1632,35 @@ function onButtons(e) {
   buttonsPrev = b;
   mouse.x = e.clientX; mouse.y = e.clientY; mouse.seen = true;
   if (!player) return;
+  // on the floor: a click gets the player up at once (the fall itself still plays out)
+  if (pressed && player.state === 'down' && !player.ko) player.getupNow = true;
   for (const [bit, kind] of [[1, 'punch'], [2, 'kick']]) {
     if (!(pressed & bit)) continue;
-    // a left click on empty space (no opponent part under the cursor): a dash that way
-    if (bit === 1 && !aimFromCursor()) { startDash(); continue; }
+    let aim = aimFromCursor();
+    // a left click on empty space (no opponent part under the cursor): a dash that way - unless the cursor is
+    // still near the opponent the player is locked on (knocked back by a blow, stepped round in a dodge): that
+    // click is a blow at it (high or low by where the cursor is), not a step away from it
+    if (bit === 1 && !aim) {
+      aim = lockedAim();
+      const striking = player.state === 'attack' && player.attack && !player.attack.followed;
+      if (!aim && !striking) { startDash(); continue; }
+      if (!aim) aim = lockedAim(true);
+    }
     // a press not yet taken is replaced by this one (logged as replaced)
     if (player.strikeInput?.id) plog?.pressResult(player.strikeInput.id, 'replaced');
     const id = plog?.press(kind) ?? 0;
-    player.strikeInput = { t: clock, kind, id };
+    player.strikeInput = { t: clock, kind, id, aim: aim?.locked ? aim : null };
     cueStrike(kind);
   }
+}
+/** The aim a click means when the cursor is off every body but near the locked-on opponent (within `reach` m of its hips). */
+function lockedAim(loose = false) {
+  const L = player?.lockOn, c = cursorFloor();
+  if (!L || L.state === 'out' || clock >= (player.lockUntil ?? 0) || !c) return null;
+  if (flat(c).distanceTo(flat(L.P[0])) > (loose ? 2.0 : 1.1)) return null;
+  const r = canvas.getBoundingClientRect(), q = L.P[I.Chest].clone().project(camera), chestY = r.top + (1 - q.y) / 2 * r.height;
+  const high = mouse.y < chestY, joint = high ? I.Head : I.Spine2;
+  return { enemy: L, part: high ? 'head' : 'body', joint, point: L.P[joint].clone(), off: new Vector3(), score: 0, locked: true };
 }
 canvas.addEventListener('pointerdown', e => {
   try { canvas.setPointerCapture(e.pointerId); } catch { /* synthetic */ }
@@ -1743,10 +1796,10 @@ function breathe(F) {
   F.shown = rig.fixRigid(p);
 }
 /** Which part a blow at `at` met: the nearest of head, trunk, forearms, shins. */
-function partAt(F, at) {
+function partAt(F, at, noArms = false) {
   const c = [['head', I.Head], ['body', I.Spine2], ['armL', I.LeftForeArm], ['armR', I.RightForeArm], ['legL', I.LeftShin], ['legR', I.RightShin]];
   let best = c[1], bd = 9;
-  for (const x of c) { const d = F.P[x[1]].distanceTo(at); if (d < bd) { bd = d; best = x; } }
+  for (const x of c) { if (noArms && x[0].startsWith('arm')) continue; const d = F.P[x[1]].distanceTo(at); if (d < bd) { bd = d; best = x; } }
   return best;
 }
 /** A blow pushes the part it met, along the blow, at once (a quick snap, then easing back over ~0.3 s). */
@@ -1761,11 +1814,13 @@ function balanceLayer(F, dtNow = 1 / 30) {
   if (!F.isPlayer) {
     F.stanceW = (F.stanceW ?? 0) + ((F.stance === 'low' && !broken ? 1 : 0) - (F.stanceW ?? 0)) * Math.min(1, dtNow * 6);
     const sw = F.stanceW;
-    if (sw > 0.01 && (F.state === 'free' || F.state === 'guard')) {
+    // the switch overshoots for a moment (hands thrown down into the low guard, or snapped up into the high one)
+    const sinceSwitch = clock - (F.stanceAt ?? -9), pulse = sinceSwitch < 0.35 && !broken ? Math.sin(Math.PI * sinceSwitch / 0.35) * (F.stance === 'low' ? 1 : -1) : 0;
+    if ((sw > 0.01 || pulse !== 0) && (F.state === 'free' || F.state === 'guard')) {
       const p = clonePose(F.shown), P0 = rig.positions(p), h = rig.heading(P0), fwd = new Vector3(Math.sin(h), 0, Math.cos(h));
       const axis = new Vector3().crossVectors(UP, fwd).normalize();
       rotateSubtree(rig, p, I.Spine1, new Quaternion().setFromAxisAngle(axis, 0.22 * sw));
-      for (const s of ['Left', 'Right']) rotateSubtree(rig, p, I[s + 'Arm'], new Quaternion().setFromAxisAngle(axis, 0.55 * sw));
+      for (const s of ['Left', 'Right']) rotateSubtree(rig, p, I[s + 'Arm'], new Quaternion().setFromAxisAngle(axis, 0.55 * sw + 0.3 * pulse));
       p.root.y -= 0.12 * sw;
       for (const s of ['Left', 'Right']) legTo(p, s, P0[I[s + 'Foot']].clone());
       F.shown = rig.fixRigid(p);
@@ -1807,16 +1862,46 @@ function hitPush(F) {
   }
   F.shown = rig.fixRigid(p);
 }
+/**
+ * The knock becomes real: the reaction MotionBricks made starts from where the body was before the blow, so the
+ * way the body has been carried since (shown on top) is added to the reaction's frames, and held on top until the
+ * playhead reaches them (and through the blend into them).
+ */
+function bakeKnock(F, frames, a0) {
+  const K = F.knockFx;
+  if (!K || K.baked || !(K.d > 0.01)) return;
+  const o = K.dir.clone().multiplyScalar(K.d);
+  for (const f of frames) { f.pose = clonePose(f.pose); f.pose.root.add(o); }
+  K.baked = { o, from: a0 };
+}
 function knockOn(F) {
   const K = F.knockFx;
   if (!K) return;
-  const kind = F.track.tag.kind;
-  if (!K.until && (kind === 'hit' || kind === 'down')) K.until = clock;
+  if (K.baked) {
+    const w = F.track.now < K.baked.from ? 1 : F.track.blend ? F.track.blend.w ** 2 : 0;
+    if (w <= 0) { F.knockFx = null; return; }
+    F.shown.root.x += K.baked.o.x * w; F.shown.root.z += K.baked.o.z * w;
+    return;
+  }
+  // the carry holds until the blow's own reaction takes it over (bakeKnock, from the reaction's frames); a blow
+  // that gets no reaction of its own (a sway through a strike, a body freed to move, a body already reeling from the
+  // last blow) eases back after half a second
+  // (not from the motion's tag: a body struck while still in the last blow's reaction must still be carried off)
+  if (!K.until && clock - K.t0 > 0.5) { K.until = clock; K.fade = Math.max(K.fade ?? 0.15, 0.35); }
   const t = (K.until ?? clock) - K.t0;
-  const w = K.until ? Math.max(0, 1 - Math.max(0, clock - K.until) / (K.fade ?? 0.15)) : 1; // (a sway that is not followed by a reaction eases back)
-  if ((K.until && w <= 0) || clock - K.t0 > 1) { F.knockFx = null; return; }
+  const w = K.until ? Math.max(0, 1 - Math.max(0, clock - K.until) / (K.fade ?? 0.15)) : 1;
+  if ((K.until && w <= 0) || clock - K.t0 > 1.5) { F.knockFx = null; return; }
   const d = K.v0 * Math.min(t, 0.35) * w;
+  K.d = d;
   F.shown.root.x += K.dir.x * d; F.shown.root.z += K.dir.z * d;
+}
+/** The body slid along the floor by a blow taken lying: the motion shifted a little each step, slowing down. */
+function slideOn(F) {
+  const S = F.slide;
+  if (!S) return;
+  const u = Math.min(1, (clock - S.t0) / S.dur), want = S.dist * (1 - (1 - u) ** 2), step = want - S.done;
+  if (step > 0) { F.track.shift(S.dir.x * step, S.dir.z * step); S.done = want; }
+  if (u >= 1) F.slide = null;
 }
 function homing(F) {
   const A = F.attack, o = F.aim?.enemy ?? F.opponent;
@@ -1826,15 +1911,17 @@ function homing(F) {
   const goal = F.aim && F.aim.part !== 'legs' ? o.P[F.aim.joint].clone().add(F.aim.off) : k.family === 'low' ? o.P[I.LeftShin].clone().lerp(o.P[I.RightShin], 0.5) : k.high ? o.P[I.Head].clone() : o.P[I.Spine2].clone();
   // the player's limb homes in more; an opponent's a little, and not on a player stepping out of it
   if (!F.isPlayer && o.dodge && clock < o.dodge.until + 0.1) return;
-  const w = clamp((0.7 - tip.distanceTo(goal)) / 0.45, 0, 1) * (F.isPlayer ? 0.7 : 0.5);
+  const w = clamp((0.7 - tip.distanceTo(goal)) / 0.45, 0, 1) * 0.7;
   if (w <= 0) return;
-  F.shown = lerpPose(F.shown, reachLimb(F.shown, A.part, goal, F.isPlayer ? 0.2 : 0.12), w);
+  F.shown = lerpPose(F.shown, reachLimb(F.shown, A.part, goal, F.isPlayer ? 0.2 : 0.18), w);
 }
 function startCharge(E, kind, feint = false) {
+  // (a hit or a fall already on its way outranks the load: then no charge - not a fighter marked as charging that never loads)
+  if (!E.track.request(chargeLoadReq(E, kind))) { E.charge = null; return false; }
   E.charge = { t0: clock, kind, phase: 'load', feint };
   E.attack = null; E.state = 'attack'; E.until = clock + 3; E.windAt = clock; E.windKind = kind;
-  E.track.request(chargeLoadReq(E, kind));
   plog?.note('charge', { who: E.id, kind });
+  return true;
 }
 /**
  * The load of a charge: the strike's own wind-up pose (10 frames before its top), 0.4 m back from where the body is,
@@ -1939,16 +2026,20 @@ function drawWedges() {
   for (const F of fighters) {
     let m = wedges.get(F);
     if (!m) {
-      m = new THREE.Mesh(new THREE.CircleGeometry(0.95, 20, -Math.PI / 4, Math.PI / 2), new THREE.MeshBasicMaterial({ color: F.isPlayer ? 0xd9b26a : 0x9fb4e0, transparent: true, opacity: 0.12, side: THREE.DoubleSide, depthWrite: false }));
-      m.rotation.order = 'YXZ'; m.renderOrder = 2; scene.add(m); wedges.set(F, m);
+      // the fill, and an arc along its edge (the front, where blows are turned aside, reads from above)
+      const color = F.isPlayer ? 0xd9b26a : 0x9fb4e0;
+      m = new THREE.Mesh(new THREE.CircleGeometry(0.95, 20, -Math.PI / 4, Math.PI / 2), new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.12, side: THREE.DoubleSide, depthWrite: false }));
+      m.edge = new THREE.Mesh(new THREE.RingGeometry(0.89, 0.95, 20, 1, -Math.PI / 4, Math.PI / 2), new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.6, side: THREE.DoubleSide, depthWrite: false }));
+      m.renderOrder = m.edge.renderOrder = 2; m.add(m.edge); scene.add(m); wedges.set(F, m);
     }
     m.visible = !['out', 'down', 'fall'].includes(F.state);
     if (!m.visible) continue;
     const h = rig.heading(F.P);
     m.position.set(F.P[0].x, 0.02, F.P[0].z);
-    m.rotation.set(-Math.PI / 2, h, 0);
-    m.rotation.z = 0; m.quaternion.setFromEuler(new THREE.Euler(-Math.PI / 2, 0, h - Math.PI / 2, 'YXZ'));
-    m.material.opacity = (F.state === 'free' || F.state === 'guard') && (F.posture ?? 1) > 0.25 ? 0.16 : 0.05;
+    m.quaternion.setFromEuler(new THREE.Euler(-Math.PI / 2, 0, h - Math.PI / 2, 'YXZ'));
+    const ready = (F.state === 'free' || F.state === 'guard') && (F.posture ?? 1) > 0.25;
+    m.material.opacity = ready ? 0.35 : 0.08;
+    m.edge.material.opacity = ready ? 0.7 : 0.2;
   }
   for (const [F, m] of wedges) if (!fighters.includes(F)) { scene.remove(m); wedges.delete(F); }
 }
@@ -1958,7 +2049,8 @@ function drawWindups() {
     if (E.isPlayer) continue;
     const winding = E.state === 'attack' && !(E.attack?.followed) && E.state !== 'out';
     const t = winding ? clock - (E.attack?.t0 ?? E.windAt ?? clock) : 0;
-    E.body.tint += ((winding && E.charge ? 0.35 : 0) - E.body.tint) * 0.35;
+    const switching = clock - (E.stanceAt ?? -9) < 0.22 && (E.state === 'free' || E.state === 'guard'); // (a stance switch: a short glow)
+    E.body.tint += ((winding && E.charge ? 0.35 : switching ? 0.4 : 0) - E.body.tint) * 0.35;
     E.body.limb = null; E.body.limbGlow = 0; // (no glowing hand: the motion shows the blow coming)
     let m = windRings.get(E);
     if (!m) { m = new THREE.Mesh(new THREE.RingGeometry(0.85, 0.95, 40), new THREE.MeshBasicMaterial({ color: 0xffe070, transparent: true, opacity: 0.8, side: THREE.DoubleSide, depthTest: false })); m.rotation.x = -Math.PI / 2; m.renderOrder = 14; scene.add(m); windRings.set(E, m); }
@@ -2088,6 +2180,8 @@ function takeStrikeInput() {
   // reeling from a light blow: after a quarter of a second the player can hit back (a press is not lost in a trade)
   if (P.state === 'hit') { if (clock - (P.hitAt ?? 0) > 0.2) P.state = 'free'; else return; }
   P.strikeInput = null;
+  // (a click near the locked-on opponent, off its body: the blow goes to it, not to whoever is nearest)
+  if (inp.aim && inp.aim.enemy.state !== 'out' && !P.aim) { P.aim = inp.aim; P.aimAt = clock; }
   plog?.pressResult(id, strike(P, kind, id));
 }
 
@@ -2123,8 +2217,14 @@ function simulate(dt) {
       if (!A && goal.distanceTo(hips) > 0.35) player.lookAt = goal.clone().setY(1.35); // (at eye height ahead)
       if (goal.distanceTo(hips) < 0.2) goal = null; // close enough: stand
     }
-    if (player.aim) { player.lookAt = player.aim.enemy.P[player.aim.joint].clone().add(player.aim.off); player.lockOn = player.aim.enemy; player.lockUntil = clock + 0.6; } // on what the cursor is on
-    else if (player.lockOn && clock < player.lockUntil && player.lockOn.state !== 'out') player.lookAt = player.lockOn.P[I.Head].clone(); // (still facing it a moment: circling round it)
+    if (player.aim) { player.lookAt = player.aim.enemy.P[player.aim.joint].clone().add(player.aim.off); player.lockOn = player.aim.enemy; player.lockUntil = clock + 1.0; } // on what the cursor is on
+    else if (player.lockOn && player.lockOn.state !== 'out') {
+      // the lock holds while the cursor stays near the locked opponent and it is close (circling it, the cursor on
+      // the floor beside it): only a far pull, or the cursor on another opponent, lets go of it
+      const L = player.lockOn, c = cursorFloor();
+      if (c && flat(c).distanceTo(flat(L.P[0])) < 1.5 && flat(L.P[0]).distanceTo(hips) < 2.5) player.lockUntil = Math.max(player.lockUntil ?? 0, clock + 0.6);
+      if (clock < player.lockUntil) player.lookAt = L.P[I.Head].clone(); // (still facing it: circling round it)
+    }
     const reeling = player.state === 'hit' && player.stun && clock < player.stun;
     player.spring = { target: goal && (free || reeling) ? goal.clone() : null };
     // a dodge: a quick flick of the cursor to the side (or back) while an opponent close by is winding up
@@ -2132,7 +2232,16 @@ function simulate(dt) {
       const c = cursorFloor();
       if (c && player.cPrev) { player.cVel = (player.cVel ?? new Vector3()).lerp(flat(c.clone().sub(player.cPrev)).divideScalar(dt), 0.5); }
       player.cPrev = c ? c.clone() : null;
-      const threat = enemies().find(E => E.state === 'attack' && !E.attack?.followed && flat(E.P[0]).distanceTo(flat(player.P[0])) < 2.2);
+      // the threat: of the opponents striking close by, the one whose blow is nearest to landing (close, and
+      // longest under way) - not the first in the list
+      let threat = null, threatScore = Infinity;
+      for (const E of enemies()) {
+        if (E.state !== 'attack' || E.attack?.followed) continue;
+        const dE = flat(E.P[0]).distanceTo(flat(player.P[0]));
+        if (dE >= 2.2) continue;
+        const s = dE - (clock - (E.attack?.t0 ?? E.windAt ?? clock));
+        if (s < threatScore) { threatScore = s; threat = E; }
+      }
       if (threat && (player.state === 'free' || player.state === 'attack') && clock > (player.dodge?.at ?? -9) + 0.45) {
         // the pointer flicked on the screen (the last 0.15 s): sideways to the line to the attacker, or back from it
         const r = canvas.getBoundingClientRect(), scr = v => { const q = v.clone().project(camera); return [(q.x + 1) / 2 * r.width, (1 - q.y) / 2 * r.height]; };
@@ -2150,13 +2259,16 @@ function simulate(dt) {
         const across = hv.clone().addScaledVector(along, -hv.dot(along)).length();
         if (flick || across > 2.0) {
           // (a flick is a dodge: i-frames and a counter after it; the body just moving out fast only spoils the aim)
-          player.dodge = { at: clock, until: clock + (flick ? 0.3 : 0.15), iframes: flick ? clock + 0.22 : clock, flick: !!flick, goal: player.spring?.target?.clone() ?? null };
+          player.dodge = { at: clock, until: clock + (flick ? 0.4 : 0.15), iframes: flick ? clock + 0.18 : clock, flick: !!flick, goal: player.spring?.target?.clone() ?? null };
           if (flick) {
             // the burst of the step: the screen flick turned into the floor direction (sideways from the attacker)
             const side = new Vector3(along.z, 0, -along.x), sgn = Math.sign((flick.x * (scr(player.P[0].clone().add(side))[0] - scr(player.P[0])[0])) + (flick.y * (scr(player.P[0].clone().add(side))[1] - scr(player.P[0])[1]))) || 1;
-            player.vel.addScaledVector(side.clone().multiplyScalar(sgn), 1.8).addScaledVector(along, -0.4);
-            // (and round: the step goes to the attacker's side, to come back at its flank)
-            if (player.dodge.goal) player.dodge.goal.addScaledVector(side.multiplyScalar(sgn), 0.5); else player.dodge.goal = flat(player.P[0]).addScaledVector(side.multiplyScalar(sgn), 0.7);
+            player.vel.addScaledVector(side.clone().multiplyScalar(sgn), 2.2).addScaledVector(along, 0.2);
+            // and round: the step goes to a point beside the attacker (a metre off its side, level with it), so the
+            // blow passes and the player comes out on its flank - the dogfight's turn
+            player.dodge.goal = flat(threat.P[0]).addScaledVector(side.multiplyScalar(sgn), 0.95).addScaledVector(along, -0.15);
+            // and the eyes stay on the one dodged: the next click is a blow at it
+            player.lockOn = threat; player.lockUntil = Math.max(player.lockUntil ?? 0, clock + 0.6);
           }
           plog?.note('dodge', { from: threat.id, flick: !!flick });
         }
@@ -2175,7 +2287,8 @@ function simulate(dt) {
     if (F.isPlayer && F.state === 'free' && clock - (F.hitAt ?? -9) > 3 && F.hp < F.maxHp) { F.hp = Math.min(F.maxHp, F.hp + settings.regen * dt); if (Math.random() < 0.05) hudFight(); }
     if (!F.isPlayer) {
       // the stance: guard high (hands by the face) or low (crouched, hands at the body), changing now and then
-      if (clock > (F.stanceUntil ?? 0)) { F.stance = F.stance === 'low' ? 'high' : (F.stance ? 'low' : 'high'); F.stanceUntil = clock + rand(1.6, 3.2); }
+      // (held at least 3 s, so it can be read and used; the switch itself shows: a short glow and an overshoot of the stance)
+      if (clock > (F.stanceUntil ?? 0)) { if (F.stance) F.stanceAt = clock; F.stance = F.stance === 'low' ? 'high' : (F.stance ? 'low' : 'high'); F.stanceUntil = clock + rand(3.0, 4.5); }
       // covering up (after two quick blows): a guard, stepping back
       if (F.coverAt && clock > F.coverAt) {
         if (F.state === 'free' || F.state === 'attack') {
@@ -2196,6 +2309,9 @@ function simulate(dt) {
       if (F.state === 'attack' && F.prevP) F.vel.lerp(flat(F.P[0].clone().sub(F.prevP[0])).divideScalar(dt), 1 - Math.exp(-dt * 6));
       F.want.copy(F.vel);
     }
+    // the player on the floor: a click gets it up at once, and it is never left there more than 1.2 s without one
+    if (F.isPlayer && F.state === 'down') { F.downAt ??= clock; if (F.getupNow || clock - F.downAt > 1.2) F.until = Math.min(F.until, clock); }
+    else if (F.isPlayer) { F.downAt = null; F.getupNow = false; }
     // states end
     if (F.state !== 'free' && F.state !== 'out' && (clock > F.until || (F.state === 'down' && !F.ko && F.until - clock < scheduler.latency + 0.1)) && !F.track.busy) {
       if (F.state === 'down') {
@@ -2216,9 +2332,12 @@ function simulate(dt) {
     F.planTimer -= dt;
     // the player is not held by its own follow-through or a light blow: pulled, it moves on (close in, nothing
     // should feel stuck)
-    if (F.isPlayer && F.spring?.target && ((F.state === 'attack' && F.attack?.followSpliced && clock - F.attack.followSpliced > 0.08) || (F.state === 'hit' && clock - (F.hitAt ?? 0) > 0.3 && clock > (F.stun ?? 0)))) {
+    if (F.isPlayer && F.spring?.target && F.state === 'attack' && F.attack?.followSpliced && clock - F.attack.followSpliced > 0.08) {
       F.state = 'free'; F.planTimer = 0;
     }
+    // (and a light blow holds it a third of a second at most, pulling or not: the reaction plays on under whatever
+    // it does next)
+    if (F.isPlayer && F.state === 'hit' && clock - (F.hitAt ?? 0) > 0.3 && clock > (F.stun ?? 0)) { F.state = 'free'; F.planTimer = 0; }
     if (F.state === 'free' && scheduler.ready && !F.track.busy) {
       const active = F.want.length() > 0.05 || F.vel.length() > 0.05;
       // (the player's speed changes all the time on its spring: only grabbing and letting go count as a change)
@@ -2228,6 +2347,7 @@ function simulate(dt) {
       if (active && (F.planTimer <= 0 || changed)) { F.track.request(planReq(F, 'move')); F.planTimer = settings.replan; F.lastWant.copy(F.want); }
       else if (!active && F.track.remaining / FPS < scheduler.latency + 0.25) F.track.request(planReq(F, 'move', 'end'));
     }
+    slideOn(F);
     F.track.advance(dt);
   }
   scheduler.tick(fighters.filter(f => f.state !== 'out').map(f => f.track));
@@ -2289,7 +2409,8 @@ function frame(now) {
   for (let k = sparks.length - 1; k >= 0; k--) { const s = sparks[k]; s.t += dt; s.m.scale.setScalar(s.s * (1 + 4 * s.t)); s.m.material.opacity = Math.max(0, 0.9 - 3 * s.t); if (s.t > 0.3) { scene.remove(s.m); sparks.splice(k, 1); } }
   // camera: from the side of the line between the player and the nearest opponent, far enough to see both
   if (player) {
-    const o = player.opponent;
+    // (the camera's opponent is the one the player is locked on - it does not swing to whoever is nearest while circling)
+    const o = player.lockOn && player.lockOn.state !== 'out' && clock < (player.lockUntil ?? 0) ? player.lockOn : player.opponent;
     // everyone close in (within 3.5 m) framed, the one striking a little toward the middle
     const close = fighters.filter(f => !f.isPlayer && f.state !== 'out' && flat(f.P[0]).distanceTo(flat(player.P[0])) < 3.5);
     const mid = player.P[0].clone();
@@ -2302,10 +2423,12 @@ function frame(now) {
     const line = o ? flat(o.P[0].clone().sub(player.P[0])) : new Vector3(0, 0, 1);
     const side = line.lengthSq() > 1e-4 ? new Vector3(line.z, 0, -line.x).normalize() : camSide.clone();
     if (side.dot(camSide) < 0) side.negate(); // keep the camera on its side
-    camSide.lerp(side, 1 - Math.exp(-dt * 1.2)).normalize();
-    const dist = clamp(3.8 + 1.4 * radius, 4.5, 7.5);
+    // the camera turns slowly, and never faster than about 50 degrees a second (circling the opponent does not spin the view)
+    { const a0 = Math.atan2(camSide.x, camSide.z), da = clamp(wrap(Math.atan2(side.x, side.z) - a0) * (1 - Math.exp(-dt * 0.4)), -0.9 * dt, 0.9 * dt); camSide.set(Math.sin(a0 + da), 0, Math.cos(a0 + da)); }
+    const dist = clamp(3.4 + 1.3 * radius, 4.0, 6.8);
     camTarget.lerp(new Vector3(mid.x, 0.75, mid.z), 1 - Math.exp(-dt * 3));
-    camera.position.copy(camTarget).addScaledVector(camSide, dist + 0.6).add(new Vector3(0, 2.4, 0)); // (from above: the angles between fighters read)
+    // from above at about 32 degrees: who is on whose flank reads
+    camera.position.copy(camTarget).addScaledVector(camSide, dist + 0.6).add(new Vector3(0, clamp(0.62 * (dist + 0.6), 3.2, 4.6), 0));
     camera.lookAt(camTarget);
     if (shake > 0.001) { camera.position.add(new Vector3(rand(-1, 1), rand(-1, 1), rand(-1, 1)).multiplyScalar(shake)); shake *= Math.exp(-real * 12); }
     camera.position.add(camKick); camKick.multiplyScalar(Math.exp(-real / 0.08));
@@ -2326,7 +2449,7 @@ function hudStats() {
 function hudFight() {
   if (!player) return;
   $('hp-player').style.width = `${(player.hp / player.maxHp) * 100}%`;
-  const o = player.opponent;
+  const o = player.lockOn && player.lockOn.state !== 'out' && clock < (player.lockUntil ?? 0) ? player.lockOn : player.opponent; // (the one looked at)
   $('hp-enemy').style.width = o ? `${(o.hp / o.maxHp) * 100}%` : '0%';
   $('kos').textContent = `${kos}`;
   if ($('kos-pips')) $('kos-pips').textContent = '●'.repeat(Math.min(kos, 30)); // (knock-outs as marks, no words)

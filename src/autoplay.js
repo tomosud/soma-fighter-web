@@ -64,7 +64,7 @@ export async function run(brawl, seconds = 60, opt = {}) {
   brawl.plog.note?.('autoplay', { phase: 'start', kind: kindName, seed: opt.seed ?? 1, run: runId, w: Math.round(R.width), h: Math.round(R.height) });
   const ticker = makeTicker();
   const person = kind.style === 'person' ? personPolicy() : null;
-  let mode = 'press', modeUntil = 0, dodgeSide = 1, nextPress = 0, watching = null, lastHit = brawl.lastHit, flankAfter = 0, flankSide = 1, aimStance = { s: null, read: false };
+  let mode = 'press', modeUntil = 0, dodgeSide = 1, nextPress = 0, watching = null, lastHit = brawl.lastHit, flankAfter = 0, flankSide = 1, counterWin = -1, aimStance = { s: null, read: false };
   const seen = new WeakMap();
   try {
     while (brawl.clock - t0 < seconds) {
@@ -72,7 +72,10 @@ export async function run(brawl, seconds = 60, opt = {}) {
       const P = brawl.player, now = brawl.clock;
       const es = brawl.fighters.filter(f => !f.isPlayer && f.state !== 'out');
       if (!es.length) continue;
-      const near = es.reduce((a, b) => (a.P[0].distanceTo(P.P[0]) < b.P[0].distanceTo(P.P[0]) ? a : b));
+      // (a skilled player fights the one on its feet; a novice or the person pounds whatever is nearest)
+      const standing = es.filter(e => !['down', 'fall', 'getup'].includes(e.state) && e.P[0].distanceTo(P.P[0]) < 3.2);
+      const pool = (kind.flank ?? 0) >= 0.5 && standing.length ? standing : es;
+      const near = pool.reduce((a, b) => (a.P[0].distanceTo(P.P[0]) < b.P[0].distanceTo(P.P[0]) ? a : b));
       const d = Math.hypot(near.P[0].x - P.P[0].x, near.P[0].z - P.P[0].z);
       // a blow starting: noticed only if in front (as a person sees), after a reaction time
       const fw = facing(P);
@@ -94,7 +97,7 @@ export async function run(brawl, seconds = 60, opt = {}) {
         watching = { e, at: now + react, will: kind.dodge > rng() };
       }
       const lh = brawl.lastHit;
-      if (lh && lh !== lastHit) { lastHit = lh; if (lh.by !== 'あなた' && mode === 'dodge') tally.hitInDodge++; if (lh.by === 'あなた' && mode === 'counter' && !lh.touch) tally.counterHits++; }
+      if (lh && lh !== lastHit) { lastHit = lh; if (lh.by !== 'あなた' && mode === 'dodge') tally.hitInDodge++; if (lh.by === 'あなた' && mode === 'counter' && !lh.touch && counterWin !== tally.counters) { tally.counterHits++; counterWin = tally.counters; } } // (one success per counter try)
       if (watching && watching.will && now >= watching.at && mode !== 'dodge') {
         watching.will = false; mode = 'dodge'; modeUntil = now + (person ? 0.25 : 0.4); dodgeSide = rng() < 0.5 ? -1 : 1; tally.dodges++;
         person?.dodge(watching.e);
@@ -102,14 +105,16 @@ export async function run(brawl, seconds = 60, opt = {}) {
       if (watching && now > watching.at + 0.9) watching = null;
       if (mode === 'dodge' && now > modeUntil) { mode = 'counter'; modeUntil = now + 0.9; tally.counters++; nextPress = now + 0.05; person?.counter(); }
       if (mode === 'counter' && now > modeUntil) mode = 'press';
-      if (mode === 'flank' && (now > modeUntil || near.state === 'attack')) { mode = 'counter'; modeUntil = now + 0.7; nextPress = now; }
-      // head-on against a ready opponent: work round to its side first (the cursor on the floor beside it; the body
-      // keeps facing it), then strike
+      // off its front (past 50 degrees of where it faces): the flank is won - strike now, from there
+      const offFront = () => { const nf = facing(near), toP = new V(P.P[0].x - near.P[0].x, 0, P.P[0].z - near.P[0].z).normalize(); return nf.dot(toP) < Math.cos(50 * Math.PI / 180); };
+      if (mode === 'flank' && (now > modeUntil || near.state === 'attack' || (offFront() && now > modeUntil - 0.8))) { if (offFront()) tally.flanksWon = (tally.flanksWon ?? 0) + 1; mode = 'counter'; modeUntil = now + 0.7; nextPress = now; }
+      // head-on against a ready opponent: work round to its side first (the cursor on the floor beside and a little
+      // behind it; the body keeps facing it), until it is off the opponent's front (up to 1.1 s), then strike
       if (!person && mode === 'press' && d < 1.9 && ['free', 'guard'].includes(near.state) && now > (flankAfter ?? 0)) {
         const nf = facing(near), toP = new V(P.P[0].x - near.P[0].x, 0, P.P[0].z - near.P[0].z).normalize();
         if (nf.dot(toP) > Math.cos(50 * Math.PI / 180)) {
           flankAfter = now + 0.8;
-          if (rng() < (kind.flank ?? 0)) { mode = 'flank'; modeUntil = now + 0.55; flankSide = (new V(nf.z, 0, -nf.x).dot(toP) >= 0 ? 1 : -1); tally.flanks = (tally.flanks ?? 0) + 1; }
+          if (rng() < (kind.flank ?? 0)) { mode = 'flank'; modeUntil = now + 1.1; flankSide = (new V(nf.z, 0, -nf.x).dot(toP) >= 0 ? 1 : -1); tally.flanks = (tally.flanks ?? 0) + 1; }
         }
       }
       if (person) { person.step(P, near, d, now, mode); continue; }
@@ -121,7 +126,7 @@ export async function run(brawl, seconds = 60, opt = {}) {
       let [x, y] = toScreen(near.P[aimStance.read && aimStance.s === 'high' ? I.Chest : I.Head]);
       if (mode === 'flank') {
         const nf = facing(near), sd = new V(nf.z, 0, -nf.x).multiplyScalar(flankSide);
-        [x, y] = toScreen(new V(near.P[0].x + sd.x * 1.0 - nf.x * 0.1, 0, near.P[0].z + sd.z * 1.0 - nf.z * 0.1));
+        [x, y] = toScreen(new V(near.P[0].x + sd.x * 1.1 - nf.x * 0.3, 0, near.P[0].z + sd.z * 1.1 - nf.z * 0.3));
       }
       if (mode === 'dodge') {
         // a person's dodge: a quick flick of the hand sideways on the screen (across the line to the attacker), about 140 px
