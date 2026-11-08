@@ -55,6 +55,7 @@ const settings = {
   spring: { k: 14, c: 2.6, coast: 3 }, // the player's hips on a spring to the pointer (1/s^2, 1/s): under-damped, so it swings
   trigger: params.get('trigger') ?? 'click', // 'click' (right button) or 'auto' (strikes set off by the motion, as before)
   enemies: clamp(Number(params.get('enemies') ?? 3), 1, 3), // how many opponents at once
+  hitstop: params.has('hitstop'), // the freeze on a landed blow: off (the reaction itself reads now); ?hitstop or brawl.settings.hitstop = true brings it back
   w: { feetPos: 1, feetVel: 0.75, hipsVel: 1, hipsH: 0.7, hipsVy: 0.8, hands: 0.3, head: 0.3, handsVel: 0.1, trajPos: 1, trajDir: 1.2, handle: 1.5, trajH: 1 },
   damage: { player: 0.45, enemy: 0.35 }, // hp per joule (by the player, by an opponent)
   hipsMass: 12, // the part of the body's weight a moving body puts behind a blow (kg)
@@ -1532,7 +1533,7 @@ function land(A, B, energy, dir, at, isHead, onArm = false) {
   }
   // the body is carried off at once (until the generated reaction takes over)
   // (every damaging blow: even one taken through a blow of its own sways the body back a little)
-  if (energy >= 12) B.knockFx = { t0: clock, dir: flat(dir).normalize(), v0: clamp(Math.sqrt(2 * energy / 70) * (down ? 1.7 : 0.8), 0.75, 3.4) * (armored ? 0.8 : 1), until: null, fade: 0.15 };
+  if (energy >= 12) B.knockFx = { t0: clock, dir: flat(dir).normalize(), v0: clamp(Math.sqrt(2 * energy / 55) * (down ? 1.7 : 0.8), 0.7, 4.3) * (armored ? 0.8 : 1), until: null, fade: 0.15 }; // (the carry grows with the joules all the way up: a heavy blow reads heavier, not the same)
   if (A.attack) {
     if (A.attack.followed && !A.attack.landed && !A.attack.sweep && !A.attack.chained) A.track.request(followReq(A, 'now'));
     A.attack.landed = true;
@@ -1560,7 +1561,7 @@ function land(A, B, energy, dir, at, isHead, onArm = false) {
   if (B.isPlayer && B.strikeInput?.id) plog?.pressResult(B.strikeInput.id, 'lost:hit');
   if (!armored) B.attackQueued = null;
   if (B.hp <= 0 && !B.isPlayer) B.ko = true; // (the player is never left lying like a knocked-out body: it stirs and gets up, hp restored)
-  lastHit = { energy, dmg, isHead, by: A.isPlayer ? 'あなた' : '相手', t: clock, tier: down ? (energy > settings.knockdown * 1.2 ? 'fly' : 'down') : energy >= 45 ? 'heavy' : 'hit', victim: B.id, striker: A.id, pressId: A.attack?.pressId ?? 0, counter, aspect: asp, vital: vital?.[0] ?? null };
+  lastHit = { energy, dmg, isHead, by: A.isPlayer ? 'あなた' : '相手', t: clock, tier: down ? (energy > settings.knockdown * 1.2 ? 'fly' : 'down') : energy >= 45 ? 'heavy' : 'hit', victim: B.id, striker: A.id, pressId: A.attack?.pressId ?? 0, counter, aspect: asp, vital: vital?.[0] ?? null, armored };
   hudFight();
 }
 let lastHit = null, hitstop = 0, shake = 0, slowUntil = 0;
@@ -1570,7 +1571,7 @@ const jumps = [];
 
 let player = null, kos = 0, spawnAt = 0;
 // (the start: one opponent alone - a tutorial in all but name; knocked out, three come at once)
-let tutorial = true, arrivals = 0;
+let tutorial = false, arrivals = 0; // (no one-opponent opening any more: the fight starts with the full crew)
 function start() {
   player = new Fighter(true, 0xd9b26a, new Vector3(0, 0, 0), 0);
   fighters.push(player);
@@ -3023,6 +3024,7 @@ function simulate(dt) {
 function frame(now) {
   if (now - last > 150 && now - last < 10000 && player && document.visibilityState === 'visible') plog?.note('hitch', { ms: Math.round(now - last), fighters: fighters.length });
   const real = Math.min(0.1, (now - last) / 1000);
+  if (!settings.hitstop) hitstop = 0; // (the freeze is off by default: the snap and the launch ARE the impact)
   if (started) { perf.frames++; perf.gaps.push(now - last); if (hitstop > 0 || now < slowUntil) perf.slow += real; }
   if (hitstop > 0) hitstop -= real;
   hurt = Math.max(0, hurt - real / 0.35);
@@ -3208,6 +3210,7 @@ $('start').addEventListener('click', loadModel);
 function begin() {
   if (started) return;
   started = true; last = performance.now(); acc = 0;
+  arrivals = settings.enemies - 1; // the whole crew walks in at the start, moments apart
   if (scheduler.ready) $('overlay').classList.add('hidden');
   plog = createPlayLog({ get player() { return player; }, get fighters() { return fighters; }, get clock() { return clock; }, mouse, get lastHit() { return lastHit; }, crew, cursorFloor, settings, I });
   if ($('play-log-info')) $('play-log-info').textContent = plog.local ? `記録中（20 秒ごとに eval_out/play_${plog.sid}_* へ）` : '記録中（ボタンで保存）';

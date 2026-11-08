@@ -7,7 +7,7 @@
 //   - rootD20 for knockdown blows: how far the body has been carried 0.2 s in (the launch)
 // and keeps a rolling ring of frames so the biggest blows save a contact sheet each (eval_out/hit_<n>.png):
 // the picture for the number, so "the launch is late" is a measurable, visible thing.
-const S = { hits: [], live: [], ring: [], sheets: 0, res: null, err: null, tk: null, lastHitT: null, n: 0, wall0: 0 };
+const S = { hits: [], live: [], ring: [], sheets: 0, res: null, err: null, tk: null, lastHitT: null, n: 0, wall0: 0, strikes: [], liveStrikes: new Map(), lastClk: null };
 
 function tick() {
   const brawl = window.brawl;
@@ -23,7 +23,7 @@ function tick() {
   }
   // a new landed blow?
   const LH = brawl.lastHit;
-  if (LH && LH.t !== S.lastHitT && LH.tier !== 'touch' && LH.tier !== 'blocked') {
+  if (LH && LH.t !== S.lastHitT && LH.tier !== 'touch' && LH.tier !== 'blocked' && !LH.armored) {
     S.lastHitT = LH.t;
     const F = brawl.fighters.find(f => f.id === LH.victim);
     if (F) {
@@ -31,8 +31,8 @@ function tick() {
       const joint = probe ? probe.joint : 0;
       S.live.push({
         t0: brawl.clock, wall0: now, F, joint, energy: LH.energy, tier: LH.tier ?? 'hit',
-        p0: F.P[joint].clone(), r0: F.P[0].clone(), latMs: null, latRootMs: null, d10: null, d20: null, rootD20: null,
-        down: false, done: false,
+        p0: F.P[joint].clone(), r0: F.P[0].clone(), dir: F.knockFx?.dir?.clone() ?? null, latMs: null, latRootMs: null, d10: null, d20: null, rootD20: null,
+        down: false, done: false, curve: [],
       });
     }
   }
@@ -42,7 +42,10 @@ function tick() {
     const t = brawl.clock - h.t0;
     if (h.F.state === 'fall' || h.F.state === 'down') h.down = true;
     const dp = h.F.P[h.joint] ? h.F.P[h.joint].distanceTo(h.p0) : 0;
-    const dr = h.F.P[0].distanceTo(h.r0);
+    // along the blow (the victim's own walking does not count as being carried)
+    const off = h.F.P[0].clone().sub(h.r0);
+    const dr = h.dir ? Math.max(0, off.x * h.dir.x + off.z * h.dir.z) : Math.hypot(off.x, off.z);
+    h.curve.push({ t: +t.toFixed(3), dr: +dr.toFixed(3), dp: +dp.toFixed(3) });
     if (h.latMs == null && dp > 0.05) h.latMs = Math.round(now - h.wall0);
     if (h.latRootMs == null && dr > 0.08) h.latRootMs = Math.round(now - h.wall0);
     if (h.d10 == null && t >= 0.1) h.d10 = +dp.toFixed(3);
@@ -56,7 +59,56 @@ function tick() {
     }
   }
   S.live = S.live.filter(h => !h.done);
+  // the striking limb's speed, strike by strike (the curve of the blow: wind-up, burst, follow-through)
+  const dtc = S.lastClk == null ? 0 : brawl.clock - S.lastClk; S.lastClk = brawl.clock;
+  if (dtc > 0.004 && dtc < 0.1) for (const F of brawl.fighters) {
+    const A = F.state === 'attack' ? F.attack : null;
+    let st = S.liveStrikes.get(F);
+    if (A && A.part && (!st || st.id !== A.id)) { st = { id: A.id, kind: A.kind, who: F.isPlayer ? 'P' : 'E', t0: brawl.clock, pts: [], prev: null }; S.liveStrikes.set(F, st); }
+    if (!st) continue;
+    if (!A || st.id !== A.id || brawl.clock - st.t0 > 1.0) {
+      if (st.pts.length > 10) S.strikes.push(st);
+      S.liveStrikes.delete(F);
+      continue;
+    }
+    const I = brawl.rig.index, tip = F.P[I[A.part]];
+    if (st.prev) st.pts.push({ t: +(brawl.clock - st.t0).toFixed(3), v: +(tip.distanceTo(st.prev) / dtc).toFixed(2) });
+    st.prev = tip.clone();
+  }
 }
+
+/**
+ * The curves as one picture (eval_out/hit_curves.png):
+ * - top: every strike's limb-tip speed over its first second, one row each, grouped by kind - a good blow reads as
+ *   a dark wind-up, one bright burst, a fading tail; mush reads as grey all along
+ * - bottom: every landed blow's root displacement over 0.6 s, one row each, SORTED BY ENERGY - if the effect fits
+ *   the energy, the picture brightens steadily from top to bottom, with no bright light rows or dark heavy ones
+ */
+async function saveCurves() {
+  const CW = 4, RH = 5, X0 = 120, strikes = [...S.strikes].sort((a, b) => (a.who + a.kind).localeCompare(b.who + b.kind));
+  const hits = [...S.hits].sort((a, b) => a.energy - b.energy);
+  const W = X0 + 62 * CW + 20, H1 = strikes.length * RH, H2 = hits.length * RH;
+  const c = document.createElement('canvas'); c.width = W; c.height = H1 + H2 + 90;
+  const g = c.getContext('2d'); g.fillStyle = '#181818'; g.fillRect(0, 0, c.width, c.height);
+  const col = u => { u = Math.max(0, Math.min(1, u)); return `rgb(${Math.round(255 * u ** 0.7)},${Math.round(235 * u ** 1.6)},${Math.round(90 * (1 - u) + 30)})`; };
+  g.font = '10px monospace';
+  g.fillStyle = '#ddd'; g.fillText('strike limb speed 0-1s (bright = fast, full = 11 m/s)', 4, 12);
+  strikes.forEach((st, r) => {
+    const y = 18 + r * RH;
+    g.fillStyle = '#999'; g.fillText(`${st.who} ${st.kind}`, 4, y + RH - 1);
+    for (const p of st.pts) { const x = X0 + Math.floor(p.t * 60) * CW; g.fillStyle = col(p.v / 11); g.fillRect(x, y, CW, RH - 1); }
+  });
+  const yB = 18 + H1 + 30;
+  g.fillStyle = '#ddd'; g.fillText('hit -> root carried 0-0.6s, rows sorted by energy (bright = far, full = 0.9 m)', 4, yB - 8);
+  hits.forEach((h, r) => {
+    const y = yB + r * RH;
+    g.fillStyle = h.down ? '#fa6' : '#999'; g.fillText(`${Math.round(h.energy)}J${h.down ? ' D' : ''}`, 4, y + RH - 1);
+    for (const p of h.curve) { const x = X0 + Math.floor(p.t * 100) * CW; g.fillStyle = col(p.dr / 0.9); g.fillRect(x, y, CW, RH - 1); }
+  });
+  const blob = await new Promise(r => c.toBlob(r, 'image/png'));
+  await fetch('/save/hit_curves.png', { method: 'POST', body: blob });
+}
+export { saveCurves };
 
 async function saveSheet(h, k) {
   const frames = S.ring.filter(f => f.wall >= h.wall0 - 200 && f.wall <= h.wall0 + 650);
@@ -83,8 +135,8 @@ export async function start(opts = {}) {
   S.tk?.terminate();
   S.tk = new Worker(URL.createObjectURL(new Blob(['setInterval(()=>postMessage(0),16)'], { type: 'text/javascript' })));
   S.tk.onmessage = tick;
-  Object.assign(S, { hits: [], live: [], ring: [], sheets: 0, res: null, err: null, lastHitT: window.brawl.lastHit?.t ?? null, n: 0 });
-  ap.series(window.brawl, { secs, seeds: [seed], kinds: [kind] }).then(r => { S.res = r; stop(); }).catch(e => { S.err = String(e.stack); stop(); });
+  Object.assign(S, { hits: [], live: [], ring: [], sheets: 0, res: null, err: null, lastHitT: window.brawl.lastHit?.t ?? null, n: 0, strikes: [], liveStrikes: new Map(), lastClk: null });
+  ap.series(window.brawl, { secs, seeds: [seed], kinds: [kind] }).then(r => { S.res = r; stop(); saveCurves(); }).catch(e => { S.err = String(e.stack); stop(); });
   return 'running';
 }
 export function stop() { S.tk?.terminate(); S.tk = null; }
@@ -107,6 +159,22 @@ export function result() {
       latRootMs: med(hs.map(h => h.latRootMs).filter(v => v != null)),
       rootD20: mean(hs.map(h => h.rootD20).filter(v => v != null)),
     };
+  }
+  // does the effect fit the energy? displacement by energy band, and the rank correlation (1 = strictly: more J,
+  // further carried)
+  const bins = [[12, 30], [30, 60], [60, 100], [100, 999]];
+  out.byEnergy = bins.map(([a, b]) => {
+    const hs = S.hits.filter(h => h.energy >= a && h.energy < b && h.rootD20 != null);
+    return { band: `${a}-${b}J`, n: hs.length, rootD20: mean(hs.map(h => h.rootD20)), d20: mean(hs.map(h => h.d20).filter(v => v != null)) };
+  });
+  {
+    const hs = S.hits.filter(h => h.rootD20 != null);
+    const rank = arr => { const idx = arr.map((v, i) => [v, i]).sort((x, y) => x[0] - y[0]); const r = []; idx.forEach(([, i], k) => r[i] = k); return r; };
+    const ra = rank(hs.map(h => h.energy)), rb = rank(hs.map(h => h.rootD20));
+    const n = hs.length, ma = (n - 1) / 2;
+    let num = 0, da = 0, db2 = 0;
+    for (let i = 0; i < n; i++) { num += (ra[i] - ma) * (rb[i] - ma); da += (ra[i] - ma) ** 2; db2 += (rb[i] - ma) ** 2; }
+    out.energyEffectCorr = n > 5 ? +(num / Math.sqrt(da * db2)).toFixed(2) : null;
   }
   return { done: done(), ...out, sheets: S.sheets };
 }
