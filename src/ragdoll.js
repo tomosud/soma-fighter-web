@@ -78,6 +78,7 @@ export class Ragdoll {
     this.dampOf = this.mass.map(m => (m < 1 ? 14 : 5));
     this.x = rest; this.p = rest.map(v => v.clone()); this.v = rest.map(() => new Vector3());
     this.rootK = 3000; this.footK = 30000; this.pullK = 500; this.pullMax = 400; this.damp = 5; this.substeps = 8;
+    this.resetDist = 1.5; // how far a particle may stray from the motion before the failsafe snaps it back (a flight raises it)
     this.gravity = false;
     this.dampScale = 1; // (a limp body: low, its momentum carries it)
     this.friction = 0; // (0: the floor is slippery for all but planted feet; up to 1: what touches it sticks)
@@ -117,7 +118,7 @@ export class Ragdoll {
     }) : T.map(() => new Vector3());
     this.last = T;
     // failsafe: if the body has been flung far from the motion, put it back on the motion
-    if (this.x.some((x, i) => !Number.isFinite(x.x) || x.distanceTo(T[i]) > 1.5)) this.reset(anim);
+    if (this.x.some((x, i) => !Number.isFinite(x.x) || x.distanceTo(T[i]) > this.resetDist)) this.reset(anim);
     const planted = {
       Left: contact ? Math.max(contact[0], contact[1]) > 0.5 : true,
       Right: contact ? Math.max(contact[2], contact[3]) > 0.5 : true,

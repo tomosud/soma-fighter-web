@@ -1500,7 +1500,7 @@ function land(A, B, energy, dir, at, isHead, onArm = false) {
   B.hitAt = clock;
   {
     const down0 = B.hp - energy * (A.isPlayer ? settings.damage.player : settings.damage.enemy) <= 0 || energy > settings.knockdown * (B.isPlayer ? 1.4 : 1);
-    const J = flat(dir).normalize().multiplyScalar(Math.sqrt(2 * energy * 6)); // the momentum the blow puts in (kg m/s)
+    const J = flat(dir).normalize().multiplyScalar(Math.min(42, Math.sqrt(2 * energy * 6))); // the momentum the blow puts in (kg m/s; capped - a 300 J counter must not explode the physics)
     J.y = (isHead ? 0.25 : 0.1) * J.length();
     jolt(B, at, J, clamp(0.35 - energy / 300, down0 ? 0.04 : 0.08, 0.3), clamp(0.3 + energy / 120, 0.3, 0.9), down0);
     jolt(A, at, J.clone().multiplyScalar(-0.18), 0.75, 0.2); // (the striker feels its own blow: contact with weight in it)
@@ -2694,13 +2694,14 @@ function ragStep(F, dt) {
   // until the fall arrived); once the fall's frames play, the muscles take the body over to them
   const falling = down && F.track.tag.kind !== 'down';
   R.rootK = kicked ? 60 + 2440 * ((clock - F.groundJolt) / 1.0) ** 2 : falling ? 150 : down || F.state === 'down' || F.state === 'getup' ? 2500 : 600 + 2400 * u;
+  R.resetDist = falling || down ? 3.2 : 1.5; // (a flight is SUPPOSED to leave the old frames behind: no snap back mid-air)
   const contact = F.ragFeetFree || down ? [0, 0, 0, 0] : null;
   // (the ragdoll keeps its own state: a reset, should it drift far from the motion, is not shown as a jump)
   const before = R.x[0].clone();
   R.step(dt, F.shown, contact, null);
   const ragged = R.pose(F.shown);
   const drift = ragged.root.distanceTo(F.shown.root);
-  if (R.x[0].distanceTo(before) > 0.3 || drift > (kicked || falling ? 1.1 : 0.45)) F.ragFade = true;
+  if (R.x[0].distanceTo(before) > 0.3 || (!falling && drift > (kicked ? 1.1 : 0.45))) F.ragFade = true;
   // (kicked on the floor: the motion is moved along to where the body has gone - no pull back to where it lay)
   if (kicked) { const d = flat(R.x[0].clone().sub(F.shown.root)).multiplyScalar(1 - Math.exp(-dt / 0.2)); F.track.shift(d.x, d.z); }
   // back to the motion once firm again; on the floor (lying, stirring) the motion's own; drifting off: at once
