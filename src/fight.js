@@ -83,6 +83,8 @@ PoseDB.load(rig, new URL('../assets/fightdb', import.meta.url).href).then(d => {
   for (let i = 0; i < d.n; i++) {
     const c = d.clips[d.entClip[i]];
     entTag[i] = T[c.tag ?? 'move'];
+    // a casual stand is no fighting stance: never preferred as one when squared up with an opponent
+    if (entTag[i] === T.stance && /looking_off|clown|weapon|hadouken|thai_chi|idle_to_stan/.test(c.name)) entTag[i] = T.move;
     entryAt.set(`${d.entClip[i]}:${d.entMirror[i]}:${d.entFrame[i]}`, i);
     const x = d.entryFeatures(i);
     const hipsA = [x[58], x[59], x[60]];
@@ -567,10 +569,14 @@ function planReq(F, kind, mode = 'now') {
         recentClip.fill(0); for (const c of recentSet) recentClip[c] = 1;
         {
           const mask = maskOf(kind), eC = db.entClip, eF = db.entFrame, cc = cont ? F.current.clip : -1, cf = cont ? cont.frame : 0, stance = T.stance;
+          // standing still with an opponent close: a fighting stance, not a plain stand (the guard comes from the
+          // reference clip, so the generation itself holds it - no procedural arms)
+          const opp = F.opponent, inFight = passive && kind === 'move' && opp && opp.state !== 'out' && flat(opp.P[0].clone().sub(F.P[0])).length() < 3;
           for (let i = 0; i < db.n; i++) {
             if (!mask[i]) { biasBuf[i] = Infinity; continue; }
             let b = calm * change[i];
             if (movingOn && entTag[i] === stance) b += 1.5; // pulled along: not a clip that stays put
+            if (inFight && entTag[i] !== stance) b += 1.2;
             const c = eC[i];
             if (c === cc) { if (eF[i] < cf && eF[i] > cf - 40) b += 4; }
             else if (recentClip[c]) b += 2;
@@ -1352,7 +1358,8 @@ function groundHit(A, B, energy, dir, at, isHead) {
   // (a body on the floor kicked: its ragdoll takes the blow loose and free - it rolls and slides as far as the blow
   // sends it, its limbs flop, and the motion is moved along to where it ended up; see ragStep)
   B.groundJolt = clock;
-  jolt(B, at, n.clone().addScaledVector(UP, 0.25).multiplyScalar(Math.sqrt(2 * energy * 6) * 1.15), 0.12, 1.0, true);
+  // (a kick into a lying body: it jolts and shifts it a little - limbs flop, the body does not shoot across the floor)
+  jolt(B, at, n.clone().addScaledVector(UP, 0.25).multiplyScalar(Math.min(13, Math.sqrt(2 * energy * 2))), 0.12, 1.0, true);
   // the player is never kept down by kicks: it hurts, the body is pushed, the getting-up goes on
   if (B.state === 'getup' && !B.isPlayer) { B.state = 'down'; B.until = clock + 2; B.getupKey = null; B.track.request(stirReq(B, 1, 0)); }
   else if (B.state === 'down' && !B.isPlayer) B.until += clamp(energy / 150, 0.1, 0.5);
@@ -1854,7 +1861,28 @@ function autoStrike(F) {
  * into it (as a body falls into its first step before the foot moves). Up to 10 cm, gone again as MotionBricks'
  * own steps catch up. Nothing is slid: the generated footwork is untouched.
  */
-const TUNE = { lead: true, spec: true, track: true };
+const TUNE = { lead: true, spec: true, track: true, probe: false,
+  // one switch per display layer (ablation: cut a layer, measure, compare; rag only cuts the standing-hit ragdoll)
+  layers: { rag: true, knock: true, balance: true, hitPush: true, breathe: true, footLock: true, lead: true, anticipate: true, spec: true, jump: true, settle: true, setOff: true, alive: true, homing: true } };
+// per-layer contribution (TUNE.probe): how far each layer moves the key joints (m) and how much that moves flickers
+const PROBE = {};
+const probePrev = new Map();
+const PROBE_J = ['LeftHand', 'RightHand', 'LeftFoot', 'RightFoot', 'Head'];
+function probeStart(F) {
+  let P0 = rig.positions(F.shown);
+  const key = (F.isPlayer ? 'P' : 'E') + ':' + F.state;
+  let prev = probePrev.get(F); if (!prev) { prev = {}; probePrev.set(F, prev); }
+  return name => {
+    const P1 = rig.positions(F.shown);
+    let d = P1[0].distanceTo(P0[0]);
+    for (const n of PROBE_J) { const dd = P1[I[n]].distanceTo(P0[I[n]]); if (dd > d) d = dd; }
+    const s = PROBE[key + ':' + name] ??= { n: 0, sum: 0, max: 0, flick: 0 };
+    s.n++; s.sum += d; if (d > s.max) s.max = d;
+    const pv = prev[name]; if (pv != null) s.flick += Math.abs(d - pv);
+    prev[name] = d;
+    P0 = P1;
+  };
+}
 function leadOn(F, dt, r0) {
   F.debt ??= new Vector3();
   if (!TUNE.lead || F.state !== 'free' || F.ragOn || (F.dash && clock < F.dash.until) || !F.spring?.target) { F.debt.multiplyScalar(Math.exp(-dt / 0.08)); return; }
@@ -1976,6 +2004,7 @@ function trackIn(F, dt) {
 function anticipate(F) {
   const A = F.antic;
   if (!A) return;
+  if (!['free', 'attack', 'guard'].includes(F.state)) { F.antic = null; return; } // (a wind-up has no place on a body falling or on the floor)
   const t = clock - A.t0;
   if (F.track.tag.kind === 'attack' && !A.until) A.until = clock;
   if (A.big) { chamber(F, A, t); return; }
@@ -2157,7 +2186,7 @@ function footLock(F) {
  */
 /** On the floor, alive: the chest and head rise and fall, the body never lies like a thing. */
 function breathe(F) {
-  if (F.state !== 'down' && F.state !== 'fall' || F.ko) return;
+  if (F.state !== 'down' || F.ko) return; // (only lying on the floor: a body in the air does not breathe-bob)
   const p = clonePose(F.shown), t = clock * 2.4 + (F.id ?? 0);
   rotateSubtree(rig, p, I.Spine2, new Quaternion().setFromAxisAngle(new Vector3(1, 0, 0), 0.06 * Math.sin(t)));
   rotateSubtree(rig, p, I.Neck1, new Quaternion().setFromAxisAngle(new Vector3(1, 0, 0), 0.1 * Math.sin(t * 0.7 + 1)));
@@ -2188,9 +2217,9 @@ function balanceLayer(F, dtNow = 1 / 30) {
     if ((sw > 0.01 || pulse !== 0) && (F.state === 'free' || F.state === 'guard')) {
       const p = clonePose(F.shown), P0 = rig.positions(p), h = rig.heading(P0), fwd = new Vector3(Math.sin(h), 0, Math.cos(h));
       const axis = new Vector3().crossVectors(UP, fwd).normalize();
-      rotateSubtree(rig, p, I.Spine1, new Quaternion().setFromAxisAngle(axis, 0.22 * sw));
-      for (const s of ['Left', 'Right']) rotateSubtree(rig, p, I[s + 'Arm'], new Quaternion().setFromAxisAngle(axis, 0.55 * sw + 0.3 * pulse));
-      p.root.y -= 0.12 * sw;
+      rotateSubtree(rig, p, I.Spine1, new Quaternion().setFromAxisAngle(axis, 0.1 * sw));
+      for (const s of ['Left', 'Right']) rotateSubtree(rig, p, I[s + 'Arm'], new Quaternion().setFromAxisAngle(axis, 0.26 * sw + 0.22 * pulse));
+      p.root.y -= 0.06 * sw;
       for (const s of ['Left', 'Right']) legTo(p, s, P0[I[s + 'Foot']].clone());
       F.shown = rig.fixRigid(p);
     }
@@ -2198,10 +2227,10 @@ function balanceLayer(F, dtNow = 1 / 30) {
   const w = broken ? 1 : clamp((0.7 - (F.posture ?? 1)) / 0.7, 0, 1);
   if (w <= 0.01 || ['down', 'fall', 'getup', 'out'].includes(F.state)) return;
   const p = clonePose(F.shown), h = rig.heading(rig.positions(p)), fwd = new Vector3(Math.sin(h), 0, Math.cos(h));
-  const axis = new Vector3().crossVectors(UP, fwd).normalize(), sway = Math.sin(clock * (broken ? 4.5 : 3)) * (broken ? 0.1 : 0.04) * w;
-  rotateSubtree(rig, p, I.Spine2, new Quaternion().setFromAxisAngle(axis, (broken ? 0.35 : 0.12) * w));
-  rotateSubtree(rig, p, I.Neck1, new Quaternion().setFromAxisAngle(axis, (broken ? 0.5 : 0.15) * w));
-  for (const s of ['Left', 'Right']) rotateSubtree(rig, p, I[s + 'Arm'], new Quaternion().setFromAxisAngle(fwd, (s === 'Left' ? -1 : 1) * 0.4 * w)); // (the guard drops)
+  const axis = new Vector3().crossVectors(UP, fwd).normalize(), sway = Math.sin(clock * (broken ? 4.5 : 3)) * (broken ? 0.1 : 0.015) * w;
+  rotateSubtree(rig, p, I.Spine2, new Quaternion().setFromAxisAngle(axis, (broken ? 0.35 : 0.06) * w));
+  rotateSubtree(rig, p, I.Neck1, new Quaternion().setFromAxisAngle(axis, (broken ? 0.5 : 0.08) * w));
+  for (const s of ['Left', 'Right']) rotateSubtree(rig, p, I[s + 'Arm'], new Quaternion().setFromAxisAngle(fwd, (s === 'Left' ? -1 : 1) * (broken ? 0.4 : 0.18) * w)); // (the guard drops)
   p.root.addScaledVector(new Vector3(fwd.z, 0, -fwd.x), sway);
   if (broken) {
     const P0 = rig.positions(p); p.root.y -= 0.1;
@@ -2210,6 +2239,8 @@ function balanceLayer(F, dtNow = 1 / 30) {
   F.shown = rig.fixRigid(p);
 }
 function hitPush(F) {
+  // a falling or lying body: the ragdoll carries the blow; bending limbs on top of it only fights it
+  if (['fall', 'down', 'getup', 'out'].includes(F.state)) { F.pushes = null; return; }
   if (!F.pushes?.length) return;
   F.pushes = F.pushes.filter(h => clock - h.t0 < h.dur);
   if (!F.pushes.length) return;
@@ -2586,9 +2617,11 @@ function ragStep(F, dt) {
   F.ragT += dt;
   const down = F.state === 'fall';
   const kicked = lying && clock - (F.groundJolt ?? -9) < 1.0;
-  R.gravity = lying || down; R.friction = lying ? 0.2 : 0; R.dampScale = 1;
+  R.gravity = lying || down; R.friction = lying ? (kicked ? 0.45 : 0.2) : 0;
   // muscles firm up again (not while going down: the body stays loose until it lies)
   const u = down ? 0 : clamp(F.ragT / F.ragRecover, 0, 1);
+  // firming muscles also damp: the body swallows the jolt and settles instead of ringing against the motion
+  R.dampScale = down || lying ? 1 : 1 + 2 * u;
   const loose = F.ragLoose + (1 - F.ragLoose) * u * u;
   R.k = F.ragK.map(k => k * (down ? Math.max(F.ragLoose, 0.25) : loose));
   R.rootK = kicked ? 60 + 2440 * ((clock - F.groundJolt) / 1.0) ** 2 : down || F.state === 'down' || F.state === 'getup' ? 2500 : 600 + 2400 * u;
@@ -2603,8 +2636,8 @@ function ragStep(F, dt) {
   if (kicked) { const d = flat(R.x[0].clone().sub(F.shown.root)).multiplyScalar(1 - Math.exp(-dt / 0.2)); F.track.shift(d.x, d.z); }
   // back to the motion once firm again; on the floor (lying, stirring) the motion's own; drifting off: at once
   if (F.ragFade) F.ragW = Math.max(0, F.ragW - dt / 0.12);
-  else if (kicked) F.ragW = clock - F.groundJolt < 0.5 ? 1 : Math.max(0.35, F.ragW - dt / 0.5); // (all ragdoll while the blow plays out)
-  else if (F.state === 'down') F.ragW = Math.max(0.35, F.ragW - dt / 0.4);
+  else if (kicked) F.ragW = clock - F.groundJolt < 0.5 ? 1 : Math.max(0.55, F.ragW - dt / 0.5); // (all ragdoll while the blow plays out)
+  else if (F.state === 'down') F.ragW = Math.max(0.55, F.ragW - dt / 0.4); // (lying: gravity settles the limbs the fall clip leaves in the air)
   else if (F.state === 'getup') F.ragW = Math.max(0, F.ragW - dt / 0.4);
   else if (!down && u >= 1) F.ragW = Math.max(0, F.ragW - dt / 0.2);
   if (F.ragW <= 0) { F.ragOn = false; F.ragFade = false; return; }
@@ -2858,20 +2891,24 @@ function simulate(dt) {
   for (const F of fighters) {
     F.prevP = F.P;
     F.shown = clonePose(F.track.display);
-    ragStep(F, hitstop > 0 ? dt * 4 : dt);
-    knockOn(F);
-    balanceLayer(F, dt);
-    hitPush(F);
-    breathe(F);
-    footLock(F);
-    leadLayer(F);
-    anticipate(F);
-    specStrike(F);
-    jumpLayer(F);
-    settleLayer(F);
-    setOffLean(F);
-    aliveLayer(F, dt);
-    homing(F);
+    const L = TUNE.layers;
+    // probe: how much each layer moves the pose (key joints, m) and how much that offset flickers step to step
+    const pr = TUNE.probe ? probeStart(F) : null;
+    if (L.rag || F.ko || F.state === 'down' || F.state === 'out' || F.state === 'fall' || F.state === 'getup') ragStep(F, hitstop > 0 ? dt * 4 : dt);
+    pr?.('rag');
+    if (L.knock) knockOn(F); pr?.('knock');
+    if (L.balance) balanceLayer(F, dt); pr?.('balance');
+    if (L.hitPush) hitPush(F); pr?.('hitPush');
+    if (L.breathe) breathe(F); pr?.('breathe');
+    if (L.footLock) footLock(F); pr?.('footLock');
+    if (L.lead) leadLayer(F); pr?.('lead');
+    if (L.anticipate) anticipate(F); pr?.('anticipate');
+    if (L.spec) specStrike(F); pr?.('spec');
+    if (L.jump) jumpLayer(F); pr?.('jump');
+    if (L.settle) settleLayer(F); pr?.('settle');
+    if (L.setOff) setOffLean(F); pr?.('setOff');
+    if (L.alive) aliveLayer(F, dt); pr?.('alive');
+    if (L.homing) homing(F); pr?.('homing');
     F.P = rig.positions(F.shown);
     // (the play log: how far the struck part moved 0.2 s after a blow)
     if (F.dispProbe && clock - F.dispProbe.t0 >= 0.2) { const D = F.dispProbe; plog?.note('partDisp', { who: F.isPlayer ? 'P' : F.id, part: D.part, disp: +F.P[D.joint].distanceTo(D.p0).toFixed(3), energy: +D.energy.toFixed(1) }); F.dispProbe = null; }
@@ -3129,6 +3166,7 @@ if (params.has('debug')) {
     aim(a) { aimOverride = a; },
     draw: () => frame(performance.now()),
     tune: TUNE,
+    probe: { data: PROBE, reset: () => { for (const k in PROBE) delete PROBE[k]; probePrev.clear(); } },
     get perf() { return perf.last; },
     start: begin,
     onStep: null,
