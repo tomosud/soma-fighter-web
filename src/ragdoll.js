@@ -52,6 +52,25 @@ export class Ragdoll {
     }
     this.limits.push([this.index.Head, this.index.Chest, rest[this.index.Head].distanceTo(rest[this.index.Chest]) * 0.72]); // the head never folds onto the chest
     this.limits.push([this.index.Neck1, this.index.Hips, rest[this.index.Neck1].distanceTo(rest[this.index.Hips]) * 0.6]); // the trunk crunches, it does not jackknife flat
+    // self collision: a limb never sinks into the trunk, the head or the other limb - without it a loose body's
+    // parts buried themselves in each other and the heap read as boneless
+    this.selfPairs = [];
+    {
+      const arms = [], legs = [], core = ['Hips', 'Spine1', 'Spine2', 'Chest', 'Head'].map(n => this.index[n]);
+      for (const s of ['Left', 'Right']) {
+        arms.push([`${s}Arm`, `${s}ForeArm`, `${s}Hand`].map(n => this.index[n]));
+        legs.push([`${s}Leg`, `${s}Shin`, `${s}Foot`].map(n => this.index[n]));
+      }
+      const add = (i, j) => {
+        if (i === j || this.parent[i] === j || this.parent[j] === i) return;
+        const r = (this.radius[i] + this.radius[j]) * 1.3;
+        if (rest[i].distanceTo(rest[j]) > r * 1.05) this.selfPairs.push([i, j, r]);
+      };
+      for (const side of arms) for (const i of side) { for (const c of core) add(i, c); for (const lg of legs) for (const j of lg) add(i, j); }
+      for (const lg of legs) for (const i of lg) for (const c of core) add(i, c);
+      for (const i of arms[0]) for (const j of arms[1]) add(i, j);
+      for (const i of legs[0]) for (const j of legs[1]) add(i, j);
+    }
     this.restY = rest.map(v => v.y);
     this.feet = { Left: FEET.Left.map(n => this.index[n]), Right: FEET.Right.map(n => this.index[n]) };
     this.isFoot = this.names.map(n => FEET.Left.includes(n) || FEET.Right.includes(n));
@@ -163,6 +182,15 @@ export class Ragdoll {
           x[i].addScaledVector(e, -c * w[i]);
           x[j].addScaledVector(e, c * w[j]);
         }
+      }
+      // parts never bury themselves in each other (once per substep is firm enough)
+      for (const [i, j, r] of this.selfPairs) {
+        e.copy(x[i]).sub(x[j]);
+        const l = e.length();
+        if (l >= r || l < 1e-9) continue;
+        const c = (l - r) / l / (w[i] + w[j]);
+        x[i].addScaledVector(e, -c * w[i]);
+        x[j].addScaledVector(e, c * w[j]);
       }
       // floor: nothing goes through it; feet grip (they keep only part of their sliding), the rest slides
       for (let i = 0; i < x.length; i++) {

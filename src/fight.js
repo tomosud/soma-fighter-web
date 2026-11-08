@@ -777,6 +777,7 @@ function strikeReq(F, family = null, mode = 'now', kindSel = null, pressId = 0, 
       // the body's own motion in its frame (x left, z forward), for the clip whose own travel into the blow matches
       const mv = new Vector3(F.vel.x, 0, F.vel.z).applyAxisAngle(UP, -hNow);
       let best = null, bc = Infinity;
+      const flurry = F.isPlayer && clock - (F.strikeStartedAt ?? -9) < 0.8; // pressed again hard on the heels of the last blow
       const byKind = k => !kindSel || (kindSel === 'punch' ? k.kind === 'punch' || k.kind === 'elbow' : k.kind === 'kick' || k.kind === 'knee');
       const byPart = k => !aimPart || (aimPart === 'legs' ? k.family === 'low' || !k.high : aimPart === 'head' ? k.high || k.kind === 'punch' : k.family !== 'low');
       // (running in hard and a kick pressed: a jump kick - a front, side or round kick, the body off the floor)
@@ -792,7 +793,9 @@ function strikeReq(F, family = null, mode = 'now', kindSel = null, pressId = 0, 
         // (variety: the last four strikes thrown cost more the more recent, the same family too, and more left to chance)
         { const hi = (F.hist ?? []).indexOf(k.clip); if (hi >= 0) cost += [1.4, 1.0, 0.6, 0.35][hi]; }
         cost += (k.family === F.lastFamily ? 0.7 : 0) + (k.family === F.lastFamily2 ? 0.35 : 0) + Math.random() * 0.7;
-        cost -= (F.isPlayer ? 1.3 : 1.4) * k.size; // (a wide swing reads; a short poke does not)
+        // (a wide swing reads; a short poke does not - but a flurry of quick presses wants quick short blows:
+        // jabs and snaps between the big swings, so mashing makes a varied rain of strikes, not one slow arc)
+        cost += (flurry ? 0.8 : -(F.isPlayer ? 1.3 : 1.4)) * k.size;
         if (F.isPlayer && k.kind === 'elbow' && kindSel === 'punch') cost += 0.6; // (a press for a punch: a punch, the short elbow only when nothing else fits)
         // wound up: the hand drawn back is the one that throws (a cross, a hook - not the lead hand's short jab)
         const cocked = F.antic?.big && F.antic.signs?.rear;
@@ -844,7 +847,8 @@ function strikeReq(F, family = null, mode = 'now', kindSel = null, pressId = 0, 
       // already wound up that way: out sooner (less wind-up, a little faster)
       const ready = clamp(1 - dPose / 0.8, 0, 1);
       if (F.isPlayer && mode === 'now') F.spec = { pose: targets[0], t0: Math.min(clock, F.windAt ?? clock), atk }; // (shown from the press on: specStrike)
-      const rate = RATE[k.kind] * (1 + 0.25 * ready) * (opts.lunge ? 1.25 : 1);
+      F.strikeStartedAt = clock;
+      const rate = RATE[k.kind] * (1 + 0.25 * ready) * (opts.lunge ? 1.25 : 1) * (flurry ? 1.12 : 1);
       atk.ready = ready;
       return {
         targets, tokens: [6], rate, fixEnd: true, tag: { kind: 'attack' },
@@ -1498,7 +1502,7 @@ function land(A, B, energy, dir, at, isHead, onArm = false) {
     const J = flat(dir).normalize().multiplyScalar(Math.sqrt(2 * energy * 6)); // the momentum the blow puts in (kg m/s)
     J.y = (isHead ? 0.25 : 0.1) * J.length();
     jolt(B, at, J, clamp(0.35 - energy / 300, down0 ? 0.04 : 0.08, 0.3), clamp(0.3 + energy / 120, 0.3, 0.9), down0);
-    jolt(A, at, J.clone().multiplyScalar(-0.12), 0.75, 0.2);
+    jolt(A, at, J.clone().multiplyScalar(-0.18), 0.75, 0.2); // (the striker feels its own blow: contact with weight in it)
   }
   const dmg = energy * (A.isPlayer ? settings.damage.player : settings.damage.enemy);
   B.hp = Math.max(0, B.hp - dmg);
@@ -2333,6 +2337,30 @@ function homing(F) {
   if (w <= 0) return;
   F.shown = lerpPose(F.shown, reachLimb(F.shown, A.part, goal, F.isPlayer ? 0.2 : 0.32), w);
 }
+/**
+ * A blow never runs through the body: the striking fist or foot stops at the struck body's surface, with a few
+ * centimetres of squash and no more - it meets flesh. The contact test still fires (it reads deeper than this), so
+ * nothing lands differently; only the picture stops pretending the arm is a ghost.
+ */
+function strikeStop(F) {
+  const A = F.attack;
+  if (F.state !== 'attack' || !A?.part || /ForeArm|Shin/.test(A.part)) return;
+  const P = rig.positions(F.shown), tip = P[I[A.part]];
+  for (const O of fighters) {
+    if (O === F || O.state === 'out') continue;
+    if (flat(O.P[0]).distanceTo(flat(F.P[0])) > 1.6) continue;
+    const head = O.P[I.Head], hips = O.P[0], neck = O.P[I.Neck1];
+    let best = null;
+    { const d = tip.distanceTo(head) - 0.12; if (d < -0.04) best = { d, c: head, r: 0.12 }; }
+    { const seg = neck.clone().sub(hips), t = clamp(tip.clone().sub(hips).dot(seg) / Math.max(1e-6, seg.lengthSq()), 0, 1), on = hips.clone().addScaledVector(seg, t);
+      const d = tip.distanceTo(on) - 0.16; if (d < -0.04 && (!best || d < best.d)) best = { d, c: on, r: 0.16 }; }
+    if (!best) continue;
+    const out = tip.clone().sub(best.c);
+    if (out.lengthSq() < 1e-6) continue;
+    const goal = best.c.clone().addScaledVector(out.normalize(), best.r - 0.04);
+    F.shown = reachLimb(F.shown, A.part, goal, 0.3);
+  }
+}
 function startCharge(E, kind, feint = false) {
   // (a hit or a fall already on its way outranks the load: then no charge - not a fighter marked as charging that never loads)
   if (!E.track.request(chargeLoadReq(E, kind))) { E.charge = null; return false; }
@@ -2622,7 +2650,8 @@ function ragStep(F, dt) {
     if (F.restPose) { F.shown = clonePose(F.restPose); return; }
     if (!F.ragOn || !F.limp) { if (!F.ragOn) { R.reset(F.shown); R.last = null; } F.ragOn = true; F.limp = clock; F.ragW = 1; F.ragFade = false; }
     const tl = clock - F.limp;
-    R.gravity = true; R.friction = 0.35; R.dampScale = 0.25; R.k = F.ragK.map(k => k * (0.12 - 0.04 * clamp(tl / 0.6, 0, 1))); R.rootK = 0;
+    // (the body keeps a real hold on the lying shape the fall gave it - the replayed pose read well, the mush after did not)
+    R.gravity = true; R.friction = 0.35; R.dampScale = 0.3; R.k = F.ragK.map(k => k * (0.24 - 0.12 * clamp(tl / 0.6, 0, 1))); R.rootK = 0;
     R.last = null; // (no motion velocity to carry: the parts only slow down - air, the floor's rub)
     const anim = clonePose(F.shown); anim.root.copy(R.x[0]); // (the lying shape, carried with the body: only a faint pull toward it)
     R.step(dt, anim, [0, 0, 0, 0], null);
@@ -2931,6 +2960,7 @@ function simulate(dt) {
     if (L.setOff) setOffLean(F); pr?.('setOff');
     if (L.alive) aliveLayer(F, dt); pr?.('alive');
     if (L.homing) homing(F); pr?.('homing');
+    strikeStop(F);
     // no pop: a root stepping farther than a body moves in one frame (a splice landing a carried offset, a ragdoll
     // fade) keeps only a frame's worth now; the excess is held and eased out over a tenth of a second
     {
@@ -2958,16 +2988,23 @@ function simulate(dt) {
   for (let a = 0; a < live.length; a++) for (let b = a + 1; b < live.length; b++) {
     const A = live[a], B = live[b];
     const d = flat(B.P[0].clone().sub(A.P[0])), len = d.length();
-    // the trunks (hips to neck, 17 cm round) do not pass through each other; lying bodies are stepped over
+    // the trunks (hips to neck, 17 cm round) do not pass through each other; lying bodies are stepped over.
+    // the one driving in displaces the other: walking into a body shoulders it aside (contact with weight in it),
+    // and the push is firm enough that bodies no longer stand inside each other
     const c = segSeg(A.P[0], A.P[I.Neck1], B.P[0], B.P[I.Neck1]);
     const sep = flat(c.b.clone().sub(c.a)), gap = 0.36 - c.d;
     if (gap > 0 && len > 1e-4) {
-      const push = (sep.lengthSq() > 1e-6 ? sep.normalize() : d.normalize()).multiplyScalar(Math.min(0.05, gap * 0.5));
-      A.track.shift(-push.x, -push.z); B.track.shift(push.x, push.z);
-      for (const [F, nn] of [[A, push.clone().negate().normalize()], [B, push.clone().normalize()]]) if (F.isPlayer) { const into = -F.vel.dot(nn); if (into > 0) F.vel.addScaledVector(nn, into); }
+      const dir = sep.lengthSq() > 1e-6 ? sep.normalize() : d.normalize();
+      const va = A.prevP ? Math.max(0, flat(A.P[0].clone().sub(A.prevP[0])).divideScalar(dt).dot(dir)) : 0;
+      const vb = B.prevP ? Math.max(0, -flat(B.P[0].clone().sub(B.prevP[0])).divideScalar(dt).dot(dir)) : 0;
+      const sB = (0.15 + va) / (0.3 + va + vb);
+      const amt = Math.min(0.08, gap * 0.6);
+      const pushA = dir.clone().multiplyScalar(-amt * (1 - sB)), pushB = dir.clone().multiplyScalar(amt * sB);
+      A.track.shift(pushA.x, pushA.z); B.track.shift(pushB.x, pushB.z);
+      for (const [F, nn] of [[A, dir.clone().negate()], [B, dir]]) if (F.isPlayer) { const into = -F.vel.dot(nn); if (into > 0) F.vel.addScaledVector(nn, into); }
       // (the shown positions move with it, so the push is not taken for a speed)
-      for (const v of A.P) { v.x -= push.x; v.z -= push.z; }
-      for (const v of B.P) { v.x += push.x; v.z += push.z; }
+      for (const v of A.P) { v.x += pushA.x; v.z += pushA.z; }
+      for (const v of B.P) { v.x += pushB.x; v.z += pushB.z; }
     }
   }
   // hits both ways
