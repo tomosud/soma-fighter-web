@@ -59,6 +59,7 @@ export async function run(brawl, seconds = 60, opt = {}) {
   const I = brawl.rig.index;
   const facing = P => { const l = P.P[I.LeftArm], r = P.P[I.RightArm]; return new V(-(l.z - r.z), 0, l.x - r.x).normalize(); };
   const tally = { dodges: 0, hitInDodge: 0, counters: 0, counterHits: 0, presses: 0, seen: 0, unseen: 0 };
+  brawl.plog.pin = true; // (no new log part in the middle of a run: its frame numbers hold)
   const t0 = brawl.clock, f0 = brawl.plog.frameCount, e0 = brawl.plog.events.length;
   const runId = opt.run ?? Math.round(Math.random() * 1e6);
   brawl.plog.note?.('autoplay', { phase: 'start', kind: kindName, seed: opt.seed ?? 1, run: runId, w: Math.round(R.width), h: Math.round(R.height) });
@@ -148,6 +149,7 @@ export async function run(brawl, seconds = 60, opt = {}) {
   brawl.plog.note?.('autoplay', { phase: 'end', kind: kindName, seed: opt.seed ?? 1, run: runId });
   const sum = brawl.plog.summaryFrom(f0);
   Object.assign(sum, extraMeasures(brawl.plog, f0, e0, (brawl.plog.frameCount - f0) / 30));
+  brawl.plog.pin = false;
   tally.dodgeOk = tally.dodges ? +((tally.dodges - tally.hitInDodge) / tally.dodges).toFixed(2) : null;
   tally.counterRate = tally.counters ? +(tally.counterHits / tally.counters).toFixed(2) : null;
   if (person) Object.assign(tally, person.tally);

@@ -1476,6 +1476,7 @@ function spawn() {
   const e = new Fighter(false, [0x7f97c9, 0x5fae98, 0x9a7fc9][(Fighter.seq ?? 0) % 3], pos, h + Math.PI);
   e.hp = e.maxHp = 300 + 15 * Math.min(kos, 6); // (a knock-out every 15-40 s against a skilled player)
   fighters.push(e);
+  plog?.note('spawn', { id: e.id });
   hudFight();
 }
 /**
@@ -2398,6 +2399,7 @@ function simulate(dt) {
 }
 
 function frame(now) {
+  if (now - last > 150 && now - last < 10000 && player && document.visibilityState === 'visible') plog?.note('hitch', { ms: Math.round(now - last), fighters: fighters.length });
   const real = Math.min(0.1, (now - last) / 1000);
   if (hitstop > 0) hitstop -= real;
   hurt = Math.max(0, hurt - real / 0.35);
@@ -2429,8 +2431,8 @@ function frame(now) {
     { const a0 = Math.atan2(camSide.x, camSide.z), da = clamp(wrap(Math.atan2(side.x, side.z) - a0) * (1 - Math.exp(-dt * 0.4)), -0.9 * dt, 0.9 * dt); camSide.set(Math.sin(a0 + da), 0, Math.cos(a0 + da)); }
     const dist = clamp(3.4 + 1.3 * radius, 4.0, 6.8);
     camTarget.lerp(new Vector3(mid.x, 0.75, mid.z), 1 - Math.exp(-dt * 3));
-    // from above at about 32 degrees: who is on whose flank reads
-    camera.position.copy(camTarget).addScaledVector(camSide, dist + 0.6).add(new Vector3(0, clamp(0.62 * (dist + 0.6), 3.2, 4.6), 0));
+    // from a little above (about 22 degrees down): more from the side, still enough to read who is on whose flank
+    camera.position.copy(camTarget).addScaledVector(camSide, dist + 0.6).add(new Vector3(0, clamp(0.4 * (dist + 0.6), 1.9, 3.0), 0));
     camera.lookAt(camTarget);
     if (shake > 0.001) { camera.position.add(new Vector3(rand(-1, 1), rand(-1, 1), rand(-1, 1)).multiplyScalar(shake)); shake *= Math.exp(-real * 12); }
     camera.position.add(camKick); camKick.multiplyScalar(Math.exp(-real / 0.08));

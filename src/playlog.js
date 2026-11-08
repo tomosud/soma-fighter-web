@@ -8,17 +8,23 @@
 //   - blows: how soon the struck body moves, how far, which fall, how varied
 //   - on the floor: how much the body moves while down (or lies still like a thing)
 //   - flat time: close in, yet nothing happening (no press, strike, blow, attack, fall, no real movement)
-// Saved while playing to eval_out/play_<session>_* (tools/serve.mjs, local only), or downloaded with the button:
-//   play_<s>_timeline.png (the whole play as rows over time), play_<s>_segments.png (one row per stretch),
-//   play_<s>_log.json (every frame, press and event, and the stretches' summaries)
+// Saved while playing to eval_out/play_<session>_p<part>_* (tools/serve.mjs, local only), or downloaded with the button:
+//   play_<s>_p<n>_log.json (every frame, press and event, and the stretches' summaries), a new part every 5 minutes
+//   (the page keeps only the part being played: a long session neither grows the memory nor slows the saving);
+//   with the button also play_<s>_p<n>_timeline.png (the part as rows over time) and _segments.png (one row per stretch)
 const FPS = 30;
 const ENGAGE_IN = 2.2, ENGAGE_OUT = 3.0; // m between the hips: in close range below, apart above
 const STATE = { free: 0, guard: 1, attack: 2, hit: 3, getup: 4, down: 4.5, fall: 5, out: 5 };
 const PART = { head: 1, body: 2, legs: 3 };
 const PHASE = { hold: 0.5, wait: 1, foot: 2, lunge: 3.5, evade: 4.5 };
 
+const PART_FRAMES = 5 * 60 * FPS;
+
 export function createPlayLog(ctx) {
-  const sid = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
+  const sid0 = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
+  let part = 1, pin = false;
+  const pname = () => `${sid0}_p${String(part).padStart(2, '0')}`;
+  let sid = pname();
   const local = /^(127\.0\.0\.1|localhost)$/.test(location.hostname);
   const frames = [], events = [], segments = [], presses = [], pressById = new Map();
   let step = 0, seg = null, lastHit = null, lastAttack = null, lastSave = 0, engaged = false, pressSeq = 0;
@@ -225,7 +231,8 @@ export function createPlayLog(ctx) {
       el: near ? +limbSpeed(near, dt).toFixed(2) : 0, pl: +limbSpeed(P, dt).toFixed(2),
       act: es.filter(e => Math.hypot(e.P[0].x - P.P[0].x, e.P[0].z - P.P[0].z) < 3 && ['free', 'guard', 'attack'].includes(e.state)).length,
     });
-    if (local && clock - lastSave > 20) { lastSave = clock; save(); }
+    if (frames.length >= PART_FRAMES && !pin) nextPart();
+    else if (local && clock - lastSave > 20) { lastSave = clock; flush(); }
   }
 
   // ---------------------------------------------------------------- pictures
@@ -326,10 +333,30 @@ export function createPlayLog(ctx) {
   }
   const png = cv => new Promise(r => cv.toBlob(r, 'image/png'));
   function json() { return JSON.stringify({ sid, date: new Date().toISOString(), fps: FPS, total: summarize({ f0: 0, f1: frames.length, events }), segments: segments.concat(seg ? [{ ...seg, ...summarize(seg), events: undefined }] : []), presses, events, frames }); }
+  // (while playing, only the frames since the last flush go out: a whole long session stringified every 20 s froze
+  // the page for seconds; the server keeps the log and appends)
+  let sent = 0;
+  function delta() {
+    const body = JSON.stringify({ sid, date: new Date().toISOString(), fps: FPS, total: summarize({ f0: 0, f1: frames.length, events }), segments: segments.concat(seg ? [{ ...seg, ...summarize(seg), events: undefined }] : []), presses, events, from: sent, frames: frames.slice(sent) });
+    sent = frames.length;
+    return body;
+  }
+  /** Close this part (its last frames go out) and start the next one empty. */
+  function nextPart() {
+    if (seg) closeSegment();
+    if (local) { const name = sid, body = delta(); fetch(`/append-log/play_${name}_log.json`, { method: 'POST', body }).catch(() => {}); }
+    frames.length = 0; events.length = 0; segments.length = 0; presses.length = 0; pressById.clear(); watches.length = 0;
+    lastHit = null; lastAttack = null; engaged = false; sent = 0; lastSave = ctx.clock;
+    part++; sid = pname();
+  }
+  async function flush() {
+    if (!local) return;
+    try { await fetch(`/append-log/play_${sid}_log.json`, { method: 'POST', body: delta() }); } catch { /* the page works on without the local server */ }
+  }
   async function save() {
     if (!local) return;
     try {
-      await fetch(`/save/play_${sid}_log.json`, { method: 'POST', body: json() });
+      await flush();
       await fetch(`/save/play_${sid}_timeline.png`, { method: 'POST', body: await png(timeline()) });
       await fetch(`/save/play_${sid}_segments.png`, { method: 'POST', body: await png(segmentTable()) });
     } catch { /* the page works on without the local server */ }
@@ -354,6 +381,6 @@ export function createPlayLog(ctx) {
     if (p.outcome == null || p.outcome === 'queued') { p.outcome = outcome; p.tOutcome = +(ctx.clock - p.t).toFixed(2); }
     else p.later = outcome;
   }
-  addEventListener('pagehide', () => { if (local) navigator.sendBeacon?.(`/save/play_${sid}_log.json`, json()); });
-  return { summaryFrom: f0 => summarize({ f0, f1: frames.length, events: events.filter(e => e.f >= f0) }), get frameCount() { return frames.length; }, step: stepLog, press, pressResult, note, save, download, get sid() { return sid; }, get local() { return local; }, summary: () => summarize({ f0: 0, f1: frames.length, events }), segments, frames, events, presses };
+  addEventListener('pagehide', () => { if (local) navigator.sendBeacon?.(`/append-log/play_${sid}_log.json`, delta()); });
+  return { summaryFrom: f0 => summarize({ f0, f1: frames.length, events: events.filter(e => e.f >= f0) }), get frameCount() { return frames.length; }, get pin() { return pin; }, set pin(v) { pin = !!v; }, step: stepLog, press, pressResult, note, save, download, get sid() { return sid; }, get local() { return local; }, summary: () => summarize({ f0: 0, f1: frames.length, events }), segments, frames, events, presses };
 }

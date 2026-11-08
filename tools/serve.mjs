@@ -3,7 +3,8 @@
 // For local tooling only (it listens on 127.0.0.1): POST /save/<name> writes the body to eval_out/<name> (the
 // evaluator's heat maps and scores), and files may be read from other origins (the Mixamo download helper).
 import { createServer } from 'node:http';
-import { createReadStream, mkdirSync, statSync, writeFileSync } from 'node:fs';
+import { createReadStream, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { writeFile } from 'node:fs/promises';
 import { basename, extname, join, normalize, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -14,9 +15,41 @@ const TYPES = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '
   '.bin': 'application/octet-stream' };
 const CORS = { 'access-control-allow-origin': '*', 'access-control-allow-private-network': 'true', 'access-control-allow-headers': '*', 'access-control-allow-methods': 'GET, POST, OPTIONS' };
 
+// POST /append-log/<name>: a play log sent in pieces ({ ...head, from, frames }): the head replaces the kept one, the
+// frames go in from index `from` (a piece sent twice lands in the same place). The page never stringifies the whole log.
+const logs = new Map();
+const writing = new Map();
+function appendLog(name, body) {
+  const file = join(root, 'eval_out', name);
+  let log = logs.get(name);
+  if (!log) { try { log = existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : null; } catch { log = null; } }
+  const { from = 0, frames = [], ...head } = JSON.parse(body);
+  const kept = log?.frames ?? [];
+  kept.length = Math.min(kept.length, from);
+  for (const f of frames) kept.push(f);
+  log = { ...head, frames: kept };
+  logs.delete(name); logs.set(name, log);
+  while (logs.size > 3) logs.delete(logs.keys().next().value); // (only the parts being written are kept)
+  // (one write at a time per file; the latest wins)
+  if (writing.get(name)) { writing.set(name, 'again'); return; }
+  const write = () => { writing.set(name, true); writeFile(file, JSON.stringify(log)).finally(() => { if (writing.get(name) === 'again') write(); else writing.delete(name); }); };
+  write();
+}
+
 createServer((req, res) => {
   if (req.method === 'OPTIONS') { res.writeHead(204, CORS).end(); return; }
   const url = new URL(req.url, 'http://x');
+  if (req.method === 'POST' && url.pathname.startsWith('/append-log/')) {
+    const name = basename(decodeURIComponent(url.pathname.slice(12)));
+    if (!/^[\w.-]+\.json$/.test(name)) { res.writeHead(400, CORS).end('bad name'); return; }
+    const chunks = [];
+    req.on('data', c => chunks.push(c));
+    req.on('end', () => {
+      mkdirSync(join(root, 'eval_out'), { recursive: true });
+      try { appendLog(name, Buffer.concat(chunks).toString('utf8')); res.writeHead(200, CORS).end('ok'); } catch (e) { res.writeHead(400, CORS).end(String(e)); }
+    });
+    return;
+  }
   if (req.method === 'POST' && url.pathname.startsWith('/save/')) {
     const name = basename(decodeURIComponent(url.pathname.slice(6)));
     if (!/^[\w.-]+$/.test(name)) { res.writeHead(400, CORS).end('bad name'); return; }
