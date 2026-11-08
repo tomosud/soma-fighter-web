@@ -4,7 +4,8 @@
 // besides the series' own scores:
 //   - swing: per strike, the striking limb's tip relative to the hips in the body's facing frame from the strike's
 //     start for 1 s: amp (largest distance between two tip positions), reach (how far forward at the top), pull (from
-//     the rearmost point before the top to the top: the wind-up and swing together)
+//     the rearmost point before the top to the top: the wind-up and swing together), glide (how far the hips travel
+//     from the strike's start to its top: a body gliding into its blow rather than planting)
 //   - pops: frames where a hand jumps more than 0.25 m relative to the hips from one drawn frame to the next
 //   - starve: the share of time each fighter's motion has run out (waiting for the model)
 const S = { sw: new Map(), by: {}, pops: { n: 0, big: 0 }, prev: new Map(), errs: [], res: null, err: null, tk: null };
@@ -28,6 +29,7 @@ function tick() {
     const P = F.P, l = P[I.LeftArm], r = P[I.RightArm];
     let fx = -(l.z - r.z), fz = l.x - r.x; const n = Math.hypot(fx, fz) || 1; fx /= n; fz /= n;
     s.pts.push(Object.fromEntries(PARTS.map(pt => { const tp = P[I[pt]], dx = tp.x - P[0].x, dz = tp.z - P[0].z; return [pt, [dx * fx + dz * fz, dx * fz - dz * fx, tp.y - P[0].y]]; })));
+    (s.hips ??= []).push([P[0].x, P[0].z]);
   }
   brawl.fighters.forEach((F, i) => { const k = i === 0 ? 'P' : 'E' + i; const s = S.by[k] ??= { n: 0, starve: 0 }; if (F.state === 'out') return; s.n++; if (F.track.remaining < 1) s.starve++; });
 }
@@ -41,9 +43,11 @@ export function swing() {
     let amp = 0; for (const a of p) for (const b of p) amp = Math.max(amp, Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]));
     let iMax = 0; p.forEach((v, i) => { if (v[0] > p[iMax][0]) iMax = i; });
     const back = Math.min(...p.slice(0, iMax + 1).map(v => v[0]));
-    out[s.who].push({ kind: s.kind, amp, reach: p[iMax][0], pull: p[iMax][0] - back });
+    const h = s.hips ?? [[0, 0]], hi = h[Math.min(iMax, h.length - 1)];
+    out[s.who].push({ kind: s.kind, amp, reach: p[iMax][0], pull: p[iMax][0] - back, glide: Math.hypot(hi[0] - h[0][0], hi[1] - h[0][1]) });
   }
-  const sum = a => a.length ? { n: a.length, amp: +(a.reduce((x, y) => x + y.amp, 0) / a.length).toFixed(2), reach: +(a.reduce((x, y) => x + y.reach, 0) / a.length).toFixed(2), pull: +(a.reduce((x, y) => x + y.pull, 0) / a.length).toFixed(2) } : null;
+  const avg = (a, k) => +(a.reduce((x, y) => x + y[k], 0) / a.length).toFixed(2);
+  const sum = a => a.length ? { n: a.length, amp: avg(a, 'amp'), reach: avg(a, 'reach'), pull: avg(a, 'pull'), glide: avg(a, 'glide') } : null;
   return { P: sum(out.P), Pp: sum(out.P.filter(x => x.kind === 'punch')), Pk: sum(out.P.filter(x => x.kind === 'kick')), E: sum(out.E), Ep: sum(out.E.filter(x => x.kind === 'punch')), Ek: sum(out.E.filter(x => x.kind === 'kick')) };
 }
 

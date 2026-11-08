@@ -47,7 +47,7 @@ export class Track {
     const n = this.frames.length;
     const i = Math.min(n - 1, Math.floor(this.t));
     // (motion asked for and not here yet: the last frames are eked out - slowing into the wait, not stopping dead)
-    const left = n - 1 - this.t, ease = this.busy && left < 4 ? Math.max(0.2, left / 4) : 1;
+    const left = n - 1 - this.t, ease = this.busy && left < 4 ? Math.max(0.45, left / 4) : 1;
     this.t = Math.min(n - 1, this.t + dt * FPS * this.frames[i].rate * ease);
     const i0 = Math.floor(this.t), i1 = Math.min(n - 1, i0 + 1);
     lerpPose(this.frames[i0].pose, this.frames[i1].pose, this.t - i0, this.display);
@@ -154,6 +154,8 @@ export class Scheduler {
       const spec = req.build(track, a, ctx);
       const align = encodeRequest(this.rig, batch, b, ctx, spec.targets, spec.tokens);
       const origin = req.context ? track.frame(a).pose.root.clone() : null;
+      // (kept for the bone view: what the model was asked for - the target poses and the pose it starts from)
+      track.asked = { targets: spec.targets.map(clonePose), from: clonePose(ctx[3]), kind: req.kind };
       return { track, req, serial: track.serial, a, ctx, spec, align, origin };
     });
     for (let b = metas.length; b < BATCH; b++) encodeRequest(this.rig, batch, b, metas[0].ctx, metas[0].spec.targets, metas[0].spec.tokens); // padding

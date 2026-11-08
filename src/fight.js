@@ -452,6 +452,8 @@ function startDash() {
   return true;
 }
 function feelOf(F) {
+  // (the player striking: the feet take the weight - the body brakes hard and does not drift through the blow)
+  if (F.isPlayer && F.state === 'attack' && !(F.attack?.followed)) return { k: 0.6, c: 2.6, vmax: 1.0 };
   if (F.dash && clock < F.dash.until) return { k: 1.6, c: 1.2, vmax: 1.45 };
   if (F.charge && F.attack?.charged) return { k: 1.8, c: 1.4, vmax: 1.3 };
   if (F.dodge && clock < F.dodge.until) return { k: 2.4, c: 2.3, vmax: 1.3 };
@@ -641,7 +643,7 @@ function warpStrike(F, frames, part, base, ready = 0, family = null) {
     rates.forEach((r, i) => { frames[i].rate = r; });
     // a kick, a knee: a beat at full extension (Mixamo holds 4 frames); a punch goes straight on
     const hold = holdFrames(prof);
-    if (hold > 0) frames[n - 1].rate = Math.min(frames[n - 1].rate, 1 / hold);
+    if (hold > 0) frames[n - 1].rate = Math.min(frames[n - 1].rate, 1 / (0.6 * hold)); // (a beat, not a stop)
     return frames.reduce((a, f) => a + 1 / (FPS * f.rate), 0);
   }
   const sp = pos.map((q, i) => (i ? q.distanceTo(pos[i - 1]) * FPS : 0));
@@ -712,7 +714,7 @@ function strikeReq(F, family = null, mode = 'now', kindSel = null, pressId = 0, 
       // opponent's strike aims where the player is now, so a step aside in the wind-up makes it miss
       let OP = opp?.P;
       if (opp && F.isPlayer) OP = rig.positions(opp.track.frame(opp.track.now + tLand * FPS).pose);
-      else if (opp) OP = rig.positions(opp.track.frame(opp.track.now + 0.4 * tLand * FPS).pose);
+      else if (opp) OP = rig.positions(opp.track.frame(opp.track.now + 0.7 * tLand * FPS).pose); // (an opponent leads the player a little: a blow thrown at a moving body still meets it)
       const head = opp ? OP[I.Head].clone().add(new Vector3(0, -0.02, 0)) : A.clone().add(new Vector3(Math.sin(yaw), 1.5, Math.cos(yaw)));
       const body = opp ? OP[I.Spine2].clone() : head.clone().setY(1.1);
       const speedIn = opp ? F.vel.dot(flat(opp.P[0].clone().sub(A)).normalize()) : 0;
@@ -720,7 +722,7 @@ function strikeReq(F, family = null, mode = 'now', kindSel = null, pressId = 0, 
       if (F.isPlayer && F.spring) {
         const v = F.vel.clone(), p = A.clone();
         for (let t = 0; t < tLand; t += 1 / 30) { springStep(v, p, F.spring.target, 1 / 30); p.addScaledVector(v, 1 / 30); }
-        A.add(p.sub(A).clampLength(0, 1.2));
+        A.add(p.sub(A).clampLength(0, 0.8)); // (planted: it steps in, it does not glide in)
       } else A.addScaledVector(F.vel, tLand * 0.6);
       // face where the two will be (the player's strikes)
       if (opp && F.isPlayer) { yaw = Math.atan2(OP[0].x - A.x, OP[0].z - A.z); c = Math.cos(-yaw); sn = Math.sin(-yaw); }
@@ -1175,10 +1177,30 @@ function reactReq(F, from, energy, isHead, down, dir = null, hitAt = null) {
 // striking points and the effective mass behind each (kg)
 const STRIKE_MASS = { LeftHand: 1.4, RightHand: 1.4, LeftForeArm: 2.0, RightForeArm: 2.0, LeftFoot: 3.5, RightFoot: 3.5, LeftShin: 4.5, RightShin: 4.5 };
 const sparks = [];
+const sparkGeo = new THREE.RingGeometry(0.8, 1, 28);
 function spark(at, energy, color = 0xffe9a8) {
-  const m = new THREE.Mesh(new THREE.SphereGeometry(0.06, 12, 8), new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.9, depthTest: false }));
+  // (a ring opening out from the contact, not a ball over it: what met what stays in view inside it)
+  const m = new THREE.Mesh(sparkGeo, new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.75, depthTest: false, side: THREE.DoubleSide }));
   m.position.copy(at); m.renderOrder = 20; scene.add(m);
-  sparks.push({ m, t: 0, s: 1 + Math.min(4, energy / 40) });
+  sparks.push({ m, t: 0, s: 0.07 * (1 + Math.min(2.5, energy / 50)) });
+}
+/**
+ * What struck what: the striking limb (fist and forearm, or foot and shin) and the part it met light up in the same
+ * colour for a moment - the player's blows gold, an opponent's on the player red, a blow taken on a guard or turned
+ * aside blue - so the impact reads even when the flash is over it.
+ */
+const LIMB = { Hand: ['Arm', 'ForeArm', 'Hand', 'HandMiddleEnd'], ForeArm: ['Arm', 'ForeArm', 'Hand'], Foot: ['Shin', 'Foot', 'ToeBase'], Shin: ['Leg', 'Shin', 'Foot'] };
+const PART_BONES = { head: [['Neck1'], true], body: [['Hips', 'Spine2', 'Chest'], false], armL: [['LeftArm', 'LeftForeArm', 'LeftHand'], false], armR: [['RightArm', 'RightForeArm', 'RightHand'], false], legL: [['LeftShin', 'LeftFoot'], false], legR: [['RightShin', 'RightFoot'], false] };
+function impactMark(A, B, at, kind, energy = 30, hitPart = null) {
+  const color = kind === 'guard' ? [0.35, 0.65, 1.0] : A.isPlayer ? [1.0, 0.75, 0.2] : [1.0, 0.12, 0.08];
+  const k = kind === 'touch' ? 0.45 : clamp(0.7 + energy / 150, 0.7, 1.2), c = color.map(x => x * k), dur = kind === 'touch' ? 0.25 : 0.45;
+  const limb = A.strikePart ?? A.attack?.part;
+  if (limb) { const side = limb.startsWith('Left') ? 'Left' : 'Right', seg = limb.replace(/^(Left|Right)/, ''); A.body.mark((LIMB[seg] ?? [seg]).map(n => side + n), false, c, dur); }
+  let part = hitPart ?? partAt(B, at)[0];
+  if (part === 'arm') part = B.P[I.LeftForeArm].distanceTo(at) < B.P[I.RightForeArm].distanceTo(at) ? 'armL' : 'armR';
+  if (part === 'legs') part = B.P[I.LeftShin].distanceTo(at) < B.P[I.RightShin].distanceTo(at) ? 'legL' : 'legR';
+  const [names, head] = PART_BONES[part] ?? PART_BONES.body;
+  B.body.mark(names, head, c, dur);
 }
 /**
  * Contact of A's striking limbs with B's head (sphere) or trunk (capsule). While a limb is in contact its fastest
@@ -1259,7 +1281,9 @@ function settle(A, B, C) {
   B.lastHitBy = C.id; C.landed = true;
   // the limb's energy, and the body's own momentum behind it (a swinging, charging body hits heavier)
   const e = 0.5 * b.m * b.closing * b.closing * (b.isHead ? 1.2 : 1) + 0.5 * settings.hipsMass * (A.isPlayer ? 1 : 0.3) * b.behind * b.behind; // (the opponents lunge lighter)
+  A.strikePart = b.part; // (the limb that met the body: it lights up with the part it struck)
   land(A, B, e, b.n, b.at, b.isHead, b.onArm);
+  A.strikePart = null;
 }
 // readable blows: a red edge on the screen (the player hurt), a camera kick, numbers where a blow lands
 const hurtEl = document.createElement('div');
@@ -1371,6 +1395,7 @@ function land(A, B, energy, dir, at, isHead, onArm = false) {
     shove(B, dir, clamp(0.06 + e0 / 500, 0.08, 0.2)); shove(A, dir.clone().negate(), clamp(0.04 + e0 / 700, 0.06, 0.15));
     if (A.attack) A.attack.landed = true;
     spark(at, e0 * 0.5, 0x9fd3ff);
+    impactMark(A, B, at, 'guard', e0, part);
     shake = Math.max(shake, 0.03);
     B.hp = Math.max(0, B.hp - energy * (A.isPlayer ? settings.damage.player : settings.damage.enemy));
     postureHit(A, 6 + 0.05 * e0, 'guardedInto'); postureHit(B, 0.04 * e0, 'guard');
@@ -1397,6 +1422,7 @@ function land(A, B, energy, dir, at, isHead, onArm = false) {
   if (energy < 12 && B.hp - energy * (A.isPlayer ? settings.damage.player : settings.damage.enemy) > 0) {
     B.hp = Math.max(0, B.hp - energy * (A.isPlayer ? settings.damage.player : settings.damage.enemy));
     spark(at, energy * 0.3, 0xd8d8d8);
+    impactMark(A, B, at, 'touch', energy, part);
     const J = flat(dir).normalize().multiplyScalar(Math.sqrt(2 * energy * 6) * 0.6);
     jolt(B, at, J, 0.7, 0.25);
     shove(B, dir, 0.05 + energy * 0.004);
@@ -1415,6 +1441,7 @@ function land(A, B, energy, dir, at, isHead, onArm = false) {
     pushPart(B, at, dir, Math.max(energy, 12)); // (the guarding arm is knocked aside)
     if (A.attack) A.attack.landed = true;
     spark(at, energy, 0x9fd3ff);
+    impactMark(A, B, at, 'guard', energy, part);
     shake = Math.max(shake, 0.02);
     B.hp = Math.max(0, B.hp - energy * (A.isPlayer ? settings.damage.player : settings.damage.enemy));
     lastHit = { energy, dmg: 0, isHead, by: A.isPlayer ? 'あなた' : '相手', t: clock, blocked: true, tier: 'blocked', victim: B.id, striker: A.id, pressId: A.attack?.pressId ?? 0 };
@@ -1432,6 +1459,7 @@ function land(A, B, energy, dir, at, isHead, onArm = false) {
   const dmg = energy * (A.isPlayer ? settings.damage.player : settings.damage.enemy);
   B.hp = Math.max(0, B.hp - dmg);
   spark(at, energy);
+  impactMark(A, B, at, 'hit', energy, part);
   pushPart(B, at, dir, energy * (vital ? 1.5 : 1));
   postureHit(B, energy * (B.isPlayer ? 0.5 : 0.09) * balance, vital ? vital[0] : asp); // (an opponent's balance breaks after a few good blows, not every exchange)
   const push = flat(dir).normalize().multiplyScalar(clamp(0.35 * Math.sqrt(energy), 0.6, 2.6));
@@ -1439,7 +1467,7 @@ function land(A, B, energy, dir, at, isHead, onArm = false) {
   const down = B.hp <= 0 || energy > settings.knockdown * (B.isPlayer ? 1.4 : 1) * (broken && !B.isPlayer ? 0.5 : 1);
   // an opponent already throwing its blow takes a light one through it (it sways, the blow goes on): a trade
   const charging = !B.isPlayer && B.charge && clock - B.charge.t0 < 1.4 && asp === 'front'; // (from the side or behind, a charge is no armour)
-  const armored = !counter && !B.isPlayer && !down && ((charging && energy < 45) || (B.state === 'attack' && B.attack?.spliced && clock - B.attack.t0 > 0.3 && energy < 25));
+  const armored = !counter && !B.isPlayer && !down && ((charging && energy < 45) || (B.state === 'attack' && B.attack?.spliced && clock - B.attack.t0 > 0.3 && energy < 25) || (clock < (B.armorUntil ?? 0) && energy < 70));
   if (!armored) B.charge = null;
   if (!armored) {
     B.state = down ? 'fall' : 'hit';
@@ -1451,7 +1479,8 @@ function land(A, B, energy, dir, at, isHead, onArm = false) {
   // an opponent caught twice in quick succession covers up and backs off (mashing alone does not hold it)
   if (!B.isPlayer && !down && !armored) {
     B.recentHits = (B.recentHits ?? []).filter(t => clock - t < 1.2); B.recentHits.push(clock);
-    if (B.recentHits.length >= 2) { B.coverAt = clock + 0.35; B.recentHits = []; }
+    // (half the time it covers up and backs off; half the time it bursts back through the player's blows)
+    if (B.recentHits.length >= 2) { if (Math.random() < 0.5) B.coverAt = clock + 0.35; else B.burstAt = clock + 0.2; B.recentHits = []; }
   }
   // the body is carried off at once (until the generated reaction takes over)
   // (every damaging blow: even one taken through a blow of its own sways the body back a little)
@@ -1460,7 +1489,7 @@ function land(A, B, energy, dir, at, isHead, onArm = false) {
     if (A.attack.followed && !A.attack.landed && !A.attack.sweep && !A.attack.chained) A.track.request(followReq(A, 'now'));
     A.attack.landed = true;
   }
-  B.body.flash = 1;
+  B.body.flash = 0.3; // (the struck part itself lights up: impactMark)
   // the stop and the shake grow with the blow (a heavy one is felt, an ordinary one only marked)
   hitstop = down ? 0.12 : energy < 45 ? clamp(0.04 + energy / 1200, 0.04, 0.08) : clamp(0.08 + energy / 2000, 0.08, 0.12);
   shake = Math.max(shake, energy < 45 ? clamp(energy / 600, 0.02, 0.06) : clamp(energy / 500, 0.06, 0.14));
@@ -1503,7 +1532,7 @@ function spawn() {
   const h = rig.heading(player.P) + (others ? (others % 2 ? 1.3 : -1.3) : 0.4), d = 3.0;
   const pos = flat(player.P[0]).add(new Vector3(Math.sin(h), 0, Math.cos(h)).multiplyScalar(d));
   const e = new Fighter(false, [0x7f97c9, 0x5fae98, 0x9a7fc9][(Fighter.seq ?? 0) % 3], pos, h + Math.PI);
-  e.hp = e.maxHp = 300 + 15 * Math.min(kos, 6); // (a knock-out every 15-40 s against a skilled player)
+  e.hp = e.maxHp = 400 + 20 * Math.min(kos, 6); // (a knock-out every 20-45 s: one opponent is a fight, not a pushover)
   fighters.push(e);
   plog?.note('spawn', { id: e.id });
   hudFight();
@@ -1579,7 +1608,8 @@ function think(E, dt) {
     if (clock < B.evadeUntil) E.mode = 'evade';
     if (clock < B.evadeUntil) goal = ep.clone().addScaledVector(to, -0.7).addScaledVector(side, 0.6 * B.evDir);
     // driving in to strike
-    if (clock < B.lungeUntil) { goal = pp.clone().addScaledVector(to, 0.3); E.mode = 'lunge'; }
+    // (driving in stops short of the body - at punching range, with room for the blow to be seen)
+    if (clock < B.lungeUntil) { goal = pp.clone().addScaledVector(to, -0.95); E.mode = 'lunge'; }
     // strike: in range, its turn
     if (clock < (E.exposed ?? 0)) B.nextAttack = Math.max(B.nextAttack, E.exposed + rand(0.3, 0.6));
     // a charge: step back and load, hold, then lunge with the blow (one opponent at a time; every 2-3 s each)
@@ -1604,20 +1634,21 @@ function think(E, dt) {
     const facingP = aspect(E, P) === 'front';
     const turn = E.state === 'free' && facingP && clock > B.nextAttack && clock > B.evadeUntil && (fromSide || committed || clock > (B.nextJab ??= clock + rand(0.45, 0.75)));
     // its turn but a little out of reach (1.3-2 m): it drives in first, so the blow begins within reach and lands
-    if (turn && d >= 1.3 && d < 2.0 && clock > B.lungeUntil + 0.5 && !E.charge) { B.lungeUntil = clock + 0.3; goal = pp.clone().addScaledVector(to, 0.3); E.mode = 'lunge'; }
+    if (turn && d >= 1.3 && d < 2.0 && clock > B.lungeUntil + 0.5 && !E.charge) { B.lungeUntil = clock + 0.3; goal = pp.clone().addScaledVector(to, -0.95); E.mode = 'lunge'; }
     // the tell: a quick step back, then in with the blow
     if (B.tellAt) {
-      goal = pp.clone().addScaledVector(to, -(d + 0.3)); E.mode = 'evade';
+      goal = pp.clone().addScaledVector(to, -Math.max(d + 0.3, 1.25)); E.mode = 'evade'; // (out to a little beyond reach: the wind-up and the blow have room to show)
       if (clock >= B.tellAt || E.state !== 'free') {
         const k = B.tellKind; B.tellAt = null;
         if (E.state === 'free' && strike(E, k) === 'started') {
+          if (B.burst) { E.armorUntil = clock + 0.6; B.burst = false; } // (bursting back: light blows do not stop this one)
           B.announced = false;
           crew.lastStrikeAt = clock; crew.lastStriker = E;
           E.antic ??= { t0: clock, side: Math.random() < 0.5 ? 1 : -1 };
           B.combo = Math.random() < 0.5 ? (Math.random() < 0.4 ? 2 : 1) : 0;
           B.nextAttack = clock + rand(0.15, 0.35);
           if (!fromSide && !committed) B.nextJab = clock + rand(0.45, 0.75);
-        } else { B.nextAttack = clock + 0.2; if (E.antic?.big && !E.antic.baked) E.antic.until ??= clock; }
+        } else { B.nextAttack = clock + 0.2; B.burst = false; if (E.antic?.big && !E.antic.baked) E.antic.until ??= clock; }
       }
     }
     if (turn && d < 1.3 && !B.tellAt) {
@@ -1794,6 +1825,55 @@ function anticipate(F) {
  * up and the trunk leans back further, the weight on the back leg); it is held until the strike's motion shows,
  * then let go in 0.08 s - the snap.
  */
+/**
+ * The player setting off: before the generated step comes (the model takes a moment), the body tips the way it is
+ * pulled - over 0.06 s, held while the step is on its way, eased out as it arrives - so a pull answers at once.
+ */
+function setOffLean(F) {
+  const S = F.setOff;
+  if (!S) return;
+  const t = clock - S.t0;
+  if (F.state !== 'free') S.until ??= clock;
+  const w = Math.min(1, t / 0.06) * (t < 0.3 ? 1 : Math.max(0, 1 - (t - 0.3) / 0.3)) * (S.until != null ? Math.max(0, 1 - (clock - S.until) / 0.08) : 1);
+  if (t > 0.6 || w <= 0) { F.setOff = null; return; }
+  const p = clonePose(F.shown), P0 = rig.positions(p);
+  const feet = ['Left', 'Right'].map(sd => P0[I[sd + 'Foot']].clone());
+  const axis = new Vector3().crossVectors(UP, S.dir).normalize();
+  const pivot = feet[0].clone().lerp(feet[1], 0.5).setY(0);
+  rotateSubtree(rig, p, 0, new Quaternion().setFromAxisAngle(axis, 0.12 * w), pivot);
+  rotateSubtree(rig, p, I.Spine1, new Quaternion().setFromAxisAngle(axis, 0.08 * w));
+  p.root.addScaledVector(S.dir, 0.05 * w);
+  ['Left', 'Right'].forEach((sd, i) => legTo(p, sd, feet[i]));
+  F.shown = rig.fixRigid(p);
+}
+/**
+ * A living body is never still: when the shown pose has all but stopped (a held top of a strike, a body waiting for
+ * its next motion, a guard held) a little motion comes in over it - the trunk breathing and swaying, the head
+ * settling, the arms drifting - at a few centimetres, never hiding the pose; it fades as the body moves again.
+ */
+function aliveLayer(F, dt) {
+  if (['fall', 'down', 'getup', 'out'].includes(F.state) || F.ragOn) { F.aliveW = 0; F.aliveBase = null; return; }
+  const P = rig.positions(F.shown), D = rig.positions(F.track.display), prev = F.aliveBase;
+  F.aliveBase = [I.Head, I.LeftHand, I.RightHand, I.Spine2].map(j => D[j].clone());
+  if (!prev) return;
+  let sp = 0; F.aliveBase.forEach((v, i) => { sp += v.distanceTo(prev[i]); }); sp /= 4 * Math.max(dt, 1e-3);
+  const want = clamp(1 - (sp - 0.15) / 0.5, 0, 1);
+  F.aliveW = (F.aliveW ?? 0) + (want - (F.aliveW ?? 0)) * (1 - Math.exp(-dt / (want > (F.aliveW ?? 0) ? 0.25 : 0.08)));
+  const w = F.aliveW;
+  if (w < 0.02) return;
+  const ph = F.alivePh ??= Math.random() * 100, t = clock + ph;
+  const h = rig.heading(P), fwd = new Vector3(Math.sin(h), 0, Math.cos(h)), lat = new Vector3().crossVectors(UP, fwd).normalize();
+  const p = clonePose(F.shown);
+  const feet = ['Left', 'Right'].map(sd => P[I[sd + 'Foot']].clone());
+  const breath = Math.sin(t * 2 * Math.PI * 0.45), sway = Math.sin(t * 2 * Math.PI * 0.31 + 1.3), jit = Math.sin(t * 2 * Math.PI * 1.7 + 0.4);
+  rotateSubtree(rig, p, I.Spine1, new Quaternion().setFromAxisAngle(lat, 0.035 * breath * w));
+  rotateSubtree(rig, p, I.Spine1, new Quaternion().setFromAxisAngle(UP, 0.04 * sway * w));
+  rotateSubtree(rig, p, I.Neck1, new Quaternion().setFromAxisAngle(fwd, 0.04 * jit * w));
+  for (const [sd, k] of [['Left', 0.7], ['Right', -0.9]]) rotateSubtree(rig, p, I[sd + 'Arm'], new Quaternion().setFromAxisAngle(lat, 0.05 * Math.sin(t * 2 * Math.PI * 0.6 + k) * w));
+  p.root.addScaledVector(lat, 0.02 * sway * w); p.root.y += 0.012 * breath * w;
+  ['Left', 'Right'].forEach((sd, i) => legTo(p, sd, feet[i]));
+  F.shown = rig.fixRigid(p);
+}
 function windWeight(A, t) { const u = Math.min(1, Math.max(0, t) / (A.fast ? 0.1 : 0.25)); return u * u * (3 - 2 * u); }
 function chamber(F, A, t) {
   const win = windWeight(A, t);
@@ -1835,8 +1915,9 @@ function windPose(pose, A, w) {
   if (!S.rear) { const P1 = rig.positions(p); S.rear = P1[I.LeftArm].dot(fwd) < P1[I.RightArm].dot(fwd) ? 'Left' : 'Right'; }
   for (const side of kick ? ['Left', 'Right'] : [S.rear]) {
     const arm = I[side + 'Arm'], fore = I[side + 'ForeArm'], hand = I[side + 'Hand'];
-    const aA = kick ? 0.5 : 0.95;
-    rotateSubtree(rig, p, arm, new Quaternion().setFromAxisAngle(lat, sgn('arm' + side, arm, lat, aA, Q => kick ? Q[hand].y : -Q[hand].dot(fwd) + 0.5 * Q[hand].y) * aA * w));
+    const aA = kick ? 0.35 : 0.95;
+    // (kick: the hands come up in front, a guard for balance - not overhead; punch: the hand drawn back behind the shoulder)
+    rotateSubtree(rig, p, arm, new Quaternion().setFromAxisAngle(lat, sgn('arm' + side, arm, lat, aA, Q => kick ? Q[hand].dot(fwd) + 0.3 * Q[hand].y : -Q[hand].dot(fwd) + 0.5 * Q[hand].y) * aA * w));
     rotateSubtree(rig, p, fore, new Quaternion().setFromAxisAngle(lat, sgn('fore' + side, fore, lat, 0.6, Q => Q[hand].y - 0.3 * Q[hand].dot(fwd) * (kick ? -1 : 1)) * 0.6 * w));
   }
   // the feet stay where they were (the hips sink into bent knees, not the feet into the floor)
@@ -2030,7 +2111,7 @@ function homing(F) {
   if (!F.isPlayer && o.dodge && clock < o.dodge.until + 0.1) return;
   const w = clamp((0.7 - tip.distanceTo(goal)) / 0.45, 0, 1) * 0.7;
   if (w <= 0) return;
-  F.shown = lerpPose(F.shown, reachLimb(F.shown, A.part, goal, F.isPlayer ? 0.2 : 0.18), w);
+  F.shown = lerpPose(F.shown, reachLimb(F.shown, A.part, goal, F.isPlayer ? 0.2 : 0.26), w);
 }
 function startCharge(E, kind, feint = false) {
   // (a hit or a fall already on its way outranks the load: then no charge - not a fighter marked as charging that never loads)
@@ -2089,6 +2170,8 @@ function strike(F, kind = null, pressId = 0) {
     const h = rig.heading(F.P), left = new Vector3(Math.cos(h), 0, -Math.sin(h)), to = flat((F.aim?.enemy ?? F.opponent).P[0].clone().sub(F.P[0]));
     F.antic = { t0: clock, side: Math.sign(to.dot(left) || 1), big: true, fast: true, kind: kind ?? 'punch' };
   }
+  // (out of a run the plant takes most of the momentum; out of a dodge the step carries into the counter)
+  if (F.isPlayer) { if (!(F.dodge && clock - F.dodge.at < 0.6)) F.vel.multiplyScalar(F.dash && clock < F.dash.until + 0.2 ? 0.45 : 0.7); F.dash = null; F.setOff = null; }
   F.state = 'attack'; F.until = clock + 1.0;
   return 'started';
 }
@@ -2180,6 +2263,38 @@ function drawWindups() {
     m.material.opacity = 0.5 + 0.5 * p;
   }
   for (const [E, m] of windRings) if (!fighters.includes(E)) { scene.remove(m); windRings.delete(E); }
+}
+/**
+ * Where a blow is coming from, readable from a distance: from the moment an opponent commits (driving in, the
+ * wind-up, a charge's load) until its blow lands or is over, a narrow wedge on the floor points from it at the
+ * player - faint while it closes in, brighter through the wind-up, full as the blow is thrown.
+ */
+const laneGeo = (() => { const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.BufferAttribute(new Float32Array([-0.2, 0, 0, 0.2, 0, 0, 0, 0, 1]), 3)); g.setIndex([0, 2, 1]); return g; })();
+const lanes = new Map();
+function drawLanes() {
+  for (const E of fighters) {
+    if (E.isPlayer) continue;
+    let m = lanes.get(E);
+    const B = E.brain, A = E.antic;
+    let a = 0;
+    if (player && E.state !== 'out' && !['down', 'fall', 'getup'].includes(player.state)) {
+      if (E.state === 'attack' && !(E.attack?.followed) && !(E.attack?.landed)) a = 0.85; // the blow under way
+      else if (A?.big && !A.until) a = 0.35 + 0.45 * Math.min(1, (clock - A.t0) / 0.3); // the wind-up
+      else if (B && clock < (B.lungeUntil ?? 0)) a = 0.3; // driving in
+    }
+    if (!m && a > 0) { m = new THREE.Mesh(laneGeo, new THREE.MeshBasicMaterial({ color: 0xff5a28, transparent: true, opacity: 0, side: THREE.DoubleSide, depthTest: false })); m.renderOrder = 13; scene.add(m); lanes.set(E, m); }
+    if (!m) continue;
+    // (eased: no flicker)
+    m.userData.a = (m.userData.a ?? 0) + (a - (m.userData.a ?? 0)) * (a > (m.userData.a ?? 0) ? 0.5 : 0.25);
+    m.visible = m.userData.a > 0.03;
+    if (!m.visible) continue;
+    const from = flat(E.P[0]), to = flat(player.P[0]).sub(from), len = Math.max(0.2, to.length() - 0.25);
+    m.position.set(from.x, 0.025, from.z);
+    m.rotation.set(0, Math.atan2(to.x, to.z), 0);
+    m.scale.set(1, 1, len);
+    m.material.opacity = 0.75 * m.userData.a;
+  }
+  for (const [E, m] of lanes) if (!fighters.includes(E)) { scene.remove(m); m.material.dispose(); lanes.delete(E); }
 }
 const warnArcs = new Map();
 function drawWarnings() {
@@ -2310,7 +2425,7 @@ function takeStrikeInput() {
 const STEP = 1 / 60;
 let acc = 0, last = performance.now(), clock = 0, fpsAcc = 0, fpsN = 0, fps = 0;
 const camTarget = new Vector3(0, 0.9, 0), camSide = new Vector3(1, 0, 0), camLean = new Vector3();
-let camDist = 4.6;
+let camDist = 4.6, camRaise = 0;
 function simulate(dt) {
   if (!db) return;
   if (settings.trigger !== 'auto') takeStrikeInput();
@@ -2395,6 +2510,13 @@ function simulate(dt) {
         }
       }
     }
+    {
+      const tg = player.spring.target, pull = tg ? flat(tg.clone().sub(player.P[0])) : null;
+      if (!pull || pull.length() < 0.3 || player.vel.length() > 1.4) player.setOffArmed = true;
+      if (player.setOffArmed && pull && pull.length() > 0.5 && player.vel.length() < 1.0 && player.state === 'free') {
+        player.setOffArmed = false; player.setOff = { t0: clock, dir: pull.normalize() }; if (!player.track.busy) player.planTimer = 0;
+      }
+    }
     springStep(player.vel, flat(player.P[0]), player.spring.target, dt, feelOf(player));
     if (!free) player.vel.multiplyScalar(Math.exp(-dt * 4));
     // striking: the spring's speed follows what the body really does (no speed stored up for a lurch afterwards)
@@ -2418,6 +2540,18 @@ function simulate(dt) {
           F.state = 'guard'; F.until = clock + 0.9; F.guard = { kind: 'high', high: true, until: clock + 0.9 };
           if (F.brain) { F.brain.evadeUntil = clock + 0.5; F.brain.evDir = Math.random() < 0.5 ? -1 : 1; }
         } else if (clock > F.coverAt + 1) F.coverAt = null;
+      }
+      // bursting back: a short wind-up, then a strike that light blows do not stop (it cuts into the player's combination)
+      if (F.burstAt && clock > F.burstAt) {
+        const pd = ['down', 'fall', 'getup'].includes(player.state);
+        if (!pd && (F.state === 'free' || (F.state === 'hit' && !F.track.busy)) && F.brain && flat(player.P[0].clone().sub(F.P[0])).length() < 1.6) {
+          F.burstAt = null; F.counterAt = null; F.coverAt = null;
+          F.state = 'free'; F.brain.burst = true;
+          const kind = Math.random() < 0.6 ? 'punch' : 'kick';
+          F.brain.tellAt = clock + 0.18; F.brain.tellKind = kind; F.brain.nextAttack = clock; F.brain.evadeUntil = 0;
+          F.antic = { t0: clock, side: Math.random() < 0.5 ? 1 : -1, big: true, fast: true, kind };
+          plog?.note('burst', { who: F.id });
+        } else if (clock > F.burstAt + 0.8) F.burstAt = null;
       }
       if (F.counterAt && clock > F.counterAt) {
         F.counterAt = null;
@@ -2485,6 +2619,8 @@ function simulate(dt) {
     breathe(F);
     footLock(F);
     anticipate(F);
+    setOffLean(F);
+    aliveLayer(F, dt);
     homing(F);
     F.P = rig.positions(F.shown);
     // (the play log: how far the struck part moved 0.2 s after a blow)
@@ -2530,8 +2666,8 @@ function frame(now) {
   while (acc >= STEP) { simulate(STEP); acc -= STEP; }
   for (const F of fighters) F.body.update(F.P, rig.extraPositions(F.shown, F.P), dt);
   drawLook();
-  for (let k = dusts.length - 1; k >= 0; k--) { const D = dusts[k]; D.t += dt; D.m.scale.setScalar(1 + D.t * 9); D.m.material.opacity = Math.max(0, 0.8 - D.t * 3.2); if (D.t > 0.25) { scene.remove(D.m); dusts.splice(k, 1); } }
-  for (let k = sparks.length - 1; k >= 0; k--) { const s = sparks[k]; s.t += dt; s.m.scale.setScalar(s.s * (1 + 4 * s.t)); s.m.material.opacity = Math.max(0, 0.9 - 3 * s.t); if (s.t > 0.3) { scene.remove(s.m); sparks.splice(k, 1); } }
+  for (let k = dusts.length - 1; k >= 0; k--) { const D = dusts[k]; D.t += dt; D.m.scale.setScalar(1 + D.t * 9); D.m.material.opacity = Math.max(0, 0.8 - D.t * 3.2); if (D.t > 0.25) { scene.remove(D.m); D.m.geometry.dispose(); D.m.material.dispose(); dusts.splice(k, 1); } }
+  for (let k = sparks.length - 1; k >= 0; k--) { const s = sparks[k]; s.t += dt; s.m.quaternion.copy(camera.quaternion); s.m.scale.setScalar(s.s * (1 + 6 * s.t)); s.m.material.opacity = Math.max(0, 0.75 - 2.6 * s.t); if (s.t > 0.3) { scene.remove(s.m); s.m.material.dispose(); sparks.splice(k, 1); } }
   // camera: from the side of the line between the player and the nearest opponent, far enough to see both
   if (player) {
     // (the camera's opponent is the one the player is locked on - it does not swing to whoever is nearest while circling)
@@ -2563,18 +2699,65 @@ function frame(now) {
     const dist = camDist;
     camTarget.lerp(new Vector3(mid.x, 0.75, mid.z), 1 - Math.exp(-dt * 2));
     // from a little above (about 22 degrees down): more from the side, still enough to read who is on whose flank
-    camera.position.copy(camTarget).addScaledVector(camSide, dist + 0.6).add(new Vector3(0, clamp(0.4 * (dist + 0.6), 1.9, 3.0), 0));
+    // (an opponent between the camera and the player would hide the exchange: then the camera rises a little, over it)
+    {
+      const eye = camTarget.clone().addScaledVector(camSide, dist + 0.6).setY(1.2), pl = player.P[0].clone().setY(1.1), ray = pl.clone().sub(eye), L = ray.length(); ray.normalize();
+      let occ = 0;
+      for (const f of fighters) { if (f.isPlayer || f.state === 'out') continue; const v = f.P[0].clone().setY(1.1).sub(eye), along = v.dot(ray); if (along > 0.3 && along < L - 0.3 && v.addScaledVector(ray, -along).length() < 0.45) occ = 1; }
+      camRaise += (occ - camRaise) * (1 - Math.exp(-dt / 0.5));
+    }
+    camera.position.copy(camTarget).addScaledVector(camSide, dist + 0.6 - 0.6 * camRaise).add(new Vector3(0, clamp(0.4 * (dist + 0.6), 1.9, 3.0) + 1.3 * camRaise, 0));
     camera.lookAt(camTarget);
     if (shake > 0.001) { camera.position.add(new Vector3(rand(-1, 1), rand(-1, 1), rand(-1, 1)).multiplyScalar(shake)); shake *= Math.exp(-real * 12); }
     camera.position.add(camKick); camKick.multiplyScalar(Math.exp(-real / 0.08));
     hurtEl.style.opacity = hurt.toFixed(2);
     stage.followFloor(player.P[0]);
   }
+  drawBones();
+  drawLanes();
   stage.render();
   fpsAcc += dt; fpsN++;
   if (fpsAcc > 0.5) { fps = fpsN / fpsAcc; fpsAcc = 0; fpsN = 0; hudStats(); }
 }
 function loop(now) { frame(now); requestAnimationFrame(loop); }
+
+// ---------------------------------------------------------------- the bone view (B key)
+// What MotionBricks is asked for, drawn over the bodies as bones: each fighter's last request - its target poses
+// (the first bright, the rest fainter: where the motion must pass) and the pose it starts from (grey; for a strike
+// the wound-up body). Toggled with the B key; nothing is drawn otherwise.
+let boneView = false;
+const boneLines = new Map();
+const BONE_SETS = 5; // targets (up to 4) + the start
+function boneMesh(F) {
+  let m = boneLines.get(F);
+  if (m) return m;
+  const segs = rig.parents.filter(p => p >= 0).length * BONE_SETS;
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(segs * 6), 3));
+  geo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(segs * 6), 3));
+  m = new THREE.LineSegments(geo, new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.95, depthTest: false }));
+  m.renderOrder = 20; m.frustumCulled = false; scene.add(m); boneLines.set(F, m);
+  return m;
+}
+function drawBones() {
+  for (const [F, m] of boneLines) if (!boneView || !fighters.includes(F) || F.state === 'out') { m.visible = false; if (!fighters.includes(F)) { scene.remove(m); m.geometry.dispose(); m.material.dispose(); boneLines.delete(F); } }
+  if (!boneView) return;
+  for (const F of fighters) {
+    if (F.state === 'out' || !F.track.asked) continue;
+    const m = boneMesh(F), pos = m.geometry.attributes.position.array, col = m.geometry.attributes.color.array;
+    const A = F.track.asked, base = new THREE.Color(F.isPlayer ? 0xffd860 : 0x60e0ff);
+    const sets = [[A.from, new THREE.Color(0x9a9a9a)], ...A.targets.slice(0, 4).map((t, i) => [t, base.clone().multiplyScalar(i === 0 ? 1 : 0.55)])];
+    let k = 0;
+    for (const [pose, c] of sets) {
+      const P = rig.positions(pose);
+      rig.parents.forEach((p, j) => { if (p < 0) return; pos.set([P[p].x, P[p].y, P[p].z, P[j].x, P[j].y, P[j].z], k * 6); col.set([c.r, c.g, c.b, c.r, c.g, c.b], k * 6); k++; });
+    }
+    m.geometry.setDrawRange(0, k * 2);
+    m.geometry.attributes.position.needsUpdate = true; m.geometry.attributes.color.needsUpdate = true;
+    m.visible = true;
+  }
+}
+addEventListener('keydown', e => { if ((e.key === 'b' || e.key === 'B') && !e.repeat) { boneView = !boneView; drawBones(); } });
 
 function hudStats() {
   if (!scheduler.ready) return;

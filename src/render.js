@@ -32,10 +32,14 @@ export class Mannequin {
     });
     this.head = new THREE.Mesh(new THREE.SphereGeometry(0.115, 20, 14), this.material.clone());
     this.tint = 0; this.limb = null; this.limbGlow = 0; // (a wind-up: the body glows orange, the striking limb more)
+    this.marks = []; // (a blow: the limb that struck and the part it struck light up in one colour for a moment)
     this.head.castShadow = true;
     this.group.add(this.head);
     scene.add(this.group);
   }
+
+  /** Light up bones (by joint name; `head` for the head) in a colour for `dur` seconds, fading. */
+  mark(names, head, color, dur = 0.35) { this.marks.push({ names: new Set(names), head, color, dur, t: 1 }); }
 
   update(P, X, dt) {
     const tmp = new THREE.Vector3();
@@ -50,11 +54,17 @@ export class Mannequin {
     this.flash = Math.max(0, this.flash - dt * 4);
     const er = this.flash * 0.9 + this.tint * 0.5, eg = this.flash * 0.25 + this.tint * 0.16, eb = this.flash * 0.1;
     const chain = this.limb ? (/Hand|ForeArm/.test(this.limb) ? [this.limb.replace(/Hand|ForeArm/, 'ForeArm'), this.limb.replace(/Hand|ForeArm/, 'Hand')] : [this.limb.replace(/Foot|Shin/, 'Shin'), this.limb.replace(/Foot|Shin/, 'Foot')]) : [];
+    for (const m of this.marks) m.t -= dt / m.dur;
+    this.marks = this.marks.filter(m => m.t > 0);
+    // (the strongest mark per channel: blows in quick succession do not stack into white)
+    const markOf = (a, b, head) => { let r = 0, g = 0, bl = 0; for (const m of this.marks) if (head ? m.head : m.names.has(a) || m.names.has(b)) { const w = m.t * m.t; r = Math.max(r, m.color[0] * w); g = Math.max(g, m.color[1] * w); bl = Math.max(bl, m.color[2] * w); } return [r, g, bl]; };
     for (const { a, b, mesh } of this.bones) {
       const on = chain.includes(a) || chain.includes(b);
-      mesh.material.emissive.setRGB(er + (on ? this.limbGlow : 0), eg + (on ? this.limbGlow * 0.4 : 0), eb);
+      const mk = markOf(a, b, false);
+      mesh.material.emissive.setRGB(er + (on ? this.limbGlow : 0) + mk[0], eg + (on ? this.limbGlow * 0.4 : 0) + mk[1], eb + mk[2]);
     }
-    this.head.material.emissive.setRGB(er, eg, eb);
+    const mh = markOf(null, null, true);
+    this.head.material.emissive.setRGB(er + mh[0], eg + mh[1], eb + mh[2]);
   }
 }
 
