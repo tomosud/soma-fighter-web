@@ -629,7 +629,7 @@ const WIND = { punch: 0.5, elbow: 0.35, knee: 0.45, kick: 0.6 }; // how far a st
  * contact played fast enough that the limb is shown at about 8 m/s (so the energy follows the pace), then easing
  * out. Opponents wind up slower (it shows what is coming, so it can be stepped out of).
  */
-function warpStrike(F, frames, part, base, ready = 0, family = null) {
+function warpStrike(F, frames, part, base, ready = 0, family = null, wound = false) {
   const j = I[part], n = frames.length;
   const pos = frames.map(f => rig.positions(f.pose)[j]);
   const prof = tempoProfile(family);
@@ -637,8 +637,8 @@ function warpStrike(F, frames, part, base, ready = 0, family = null) {
     const charged = !F.isPlayer && F.attack?.charged;
     const out = {};
     const rates = tempoRates(frames, pos, prof, {
-      apex: n - 1, phases: F.isPlayer || charged || ready > 0.6 ? ['accel'] : ['ant', 'accel'],
-      durationScale: F.isPlayer ? 0.65 : charged ? 0.85 : 1.15, peakSpeed: F.isPlayer ? 8.5 : 7.5, maxRate: 6, out,
+      apex: n - 1, phases: F.isPlayer || charged || wound || ready > 0.6 ? ['accel'] : ['ant', 'accel'],
+      durationScale: F.isPlayer ? 0.65 : charged ? 0.85 : wound ? 0.7 : 1.15, peakSpeed: F.isPlayer ? 8.5 : 7.5, maxRate: 6, out,
     });
     rates.forEach((r, i) => { frames[i].rate = r; });
     // a kick, a knee: a beat at full extension (Mixamo holds 4 frames); a punch goes straight on
@@ -798,6 +798,7 @@ function strikeReq(F, family = null, mode = 'now', kindSel = null, pressId = 0, 
       if (opp) defend(opp, F, k);
       if (opp) targets = targets.map(t => { const r = clonePose(t); gaze(r, head); return rig.fixRigid(r); });
       // (it takes over when its motion is spliced in: until then the strike being played is the one that counts)
+      const wound = !F.isPlayer && !!F.antic?.baked && F.antic.a === a; // (generated out of a held wind-up: it snaps out)
       const atk = { part: k.part, id: Math.random(), kind: k.kind, key: k, yaw, at, followed: false, landed: false, sweep: swing && /hook|round/.test(k.family), t0: clock, pressId, aimPart, charged: !!opts.lunge };
       F.lastMatch = { name: k.name, kind: 'attack', cost: bc, frame: 0, dPose: +dPose.toFixed(2) };
       F.current = null;
@@ -812,7 +813,7 @@ function strikeReq(F, family = null, mode = 'now', kindSel = null, pressId = 0, 
           if (!F.isPlayer && F.broken && clock < F.broken) return; // (off balance: no blow)
           F.attack = atk; atk.spliced = true;
           if (F.isPlayer) postureHit(F, 2, 'swing');
-          const dur = warpStrike(F, frames, k.part, rate, ready, k.family);
+          const dur = warpStrike(F, frames, k.part, rate, ready, k.family, wound);
           atk.contactAt = clock + dur; // (when the limb reaches the top: the blow is under way until then)
           F.state = 'attack'; F.until = clock + dur + 0.6;
         },
@@ -1177,10 +1178,10 @@ function reactReq(F, from, energy, isHead, down, dir = null, hitAt = null) {
 // striking points and the effective mass behind each (kg)
 const STRIKE_MASS = { LeftHand: 1.4, RightHand: 1.4, LeftForeArm: 2.0, RightForeArm: 2.0, LeftFoot: 3.5, RightFoot: 3.5, LeftShin: 4.5, RightShin: 4.5 };
 const sparks = [];
-const sparkGeo = new THREE.RingGeometry(0.8, 1, 28);
+const sparkGeo = new THREE.RingGeometry(0.7, 1, 28);
 function spark(at, energy, color = 0xffe9a8) {
   // (a ring opening out from the contact, not a ball over it: what met what stays in view inside it)
-  const m = new THREE.Mesh(sparkGeo, new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.75, depthTest: false, side: THREE.DoubleSide }));
+  const m = new THREE.Mesh(sparkGeo, new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.9, depthTest: false, side: THREE.DoubleSide }));
   m.position.copy(at); m.renderOrder = 20; scene.add(m);
   sparks.push({ m, t: 0, s: 0.07 * (1 + Math.min(2.5, energy / 50)) });
 }
@@ -1637,7 +1638,7 @@ function think(E, dt) {
     if (turn && d >= 1.3 && d < 2.0 && clock > B.lungeUntil + 0.5 && !E.charge) { B.lungeUntil = clock + 0.3; goal = pp.clone().addScaledVector(to, -0.95); E.mode = 'lunge'; }
     // the tell: a quick step back, then in with the blow
     if (B.tellAt) {
-      goal = pp.clone().addScaledVector(to, -Math.max(d + 0.3, 1.25)); E.mode = 'evade'; // (out to a little beyond reach: the wind-up and the blow have room to show)
+      goal = pp.clone().addScaledVector(to, -Math.max(d + 0.2, 1.1)); E.mode = 'evade'; // (out to just beyond reach: the wind-up and the blow have room to show, and the blow still reaches)
       if (clock >= B.tellAt || E.state !== 'free') {
         const k = B.tellKind; B.tellAt = null;
         if (E.state === 'free' && strike(E, k) === 'started') {
@@ -1662,7 +1663,7 @@ function think(E, dt) {
         else if (!inView(P, E) && !B.announced) {
           // out of the player's sight: it announces itself first (a warning at the player's feet), then strikes
           B.announced = true; E.warnUntil = clock + 0.45; B.nextAttack = clock + 0.45;
-        } else { B.tellAt = clock + 0.32; B.tellKind = kind; crew.lastStrikeAt = clock; crew.lastStriker = E; E.antic = { t0: clock, side: Math.random() < 0.5 ? 1 : -1, big: true, kind }; } // (the tell first: a chamber held)
+        } else { B.tellAt = clock + 0.36; B.tellKind = kind; crew.lastStrikeAt = clock; crew.lastStriker = E; E.antic = { t0: clock, side: Math.random() < 0.5 ? 1 : -1, big: true, kind }; } // (the tell first: a chamber held)
       }
     }
     // the rest of a combination: kept while the blow is out (it is chained from the top)
@@ -1913,12 +1914,15 @@ function windPose(pose, A, w) {
   rotateSubtree(rig, p, I.Spine1, new Quaternion().setFromAxisAngle(lat, sgn('lean', I.Spine1, lat, full, Q => -Q[I.Head].dot(fwd)) * lean));
   p.root.y -= 0.07 * w;
   if (!S.rear) { const P1 = rig.positions(p); S.rear = P1[I.LeftArm].dot(fwd) < P1[I.RightArm].dot(fwd) ? 'Left' : 'Right'; }
+  // the hands placed, not swung: for a punch the fist drawn back beside the ear on the turned-back side (elbow
+  // back, cocked); for a kick both hands up in front of the face (a guard, for balance)
+  const P2 = rig.positions(p), up = new Vector3(0, 1, 0);
   for (const side of kick ? ['Left', 'Right'] : [S.rear]) {
-    const arm = I[side + 'Arm'], fore = I[side + 'ForeArm'], hand = I[side + 'Hand'];
-    const aA = kick ? 0.35 : 0.95;
-    // (kick: the hands come up in front, a guard for balance - not overhead; punch: the hand drawn back behind the shoulder)
-    rotateSubtree(rig, p, arm, new Quaternion().setFromAxisAngle(lat, sgn('arm' + side, arm, lat, aA, Q => kick ? Q[hand].dot(fwd) + 0.3 * Q[hand].y : -Q[hand].dot(fwd) + 0.5 * Q[hand].y) * aA * w));
-    rotateSubtree(rig, p, fore, new Quaternion().setFromAxisAngle(lat, sgn('fore' + side, fore, lat, 0.6, Q => Q[hand].y - 0.3 * Q[hand].dot(fwd) * (kick ? -1 : 1)) * 0.6 * w));
+    const sh = P2[I[side + 'Arm']], hand = P2[I[side + 'Hand']], out = side === 'Left' ? lat : lat.clone().negate();
+    const goal = kick ? sh.clone().addScaledVector(fwd, 0.28).addScaledVector(up, 0.12).addScaledVector(out, -0.06)
+                      : sh.clone().addScaledVector(fwd, -0.16).addScaledVector(up, 0.04).addScaledVector(out, 0.1);
+    const q = reachLimb(p, side + 'Hand', hand.clone().lerp(goal, w), 1.0);
+    for (const j of rig.subtree(I[side + 'Arm'])) p.rot[j].copy(q.rot[j]);
   }
   // the feet stay where they were (the hips sink into bent knees, not the feet into the floor)
   ['Left', 'Right'].forEach((sd, i) => legTo(p, sd, feet[i]));
@@ -2003,7 +2007,7 @@ function partAt(F, at, noArms = false) {
 /** A blow pushes the part it met, along the blow, at once (a quick snap, then easing back over ~0.3 s). */
 function pushPart(F, at, dir, energy) {
   const [part, joint] = partAt(F, at);
-  (F.pushes ??= []).push({ part, dir: flat(dir).normalize(), amp: energy < 12 ? 0.04 : clamp(0.06 + energy / 400, 0.06, 0.28), t0: clock, dur: energy < 12 ? 0.2 : 0.32 });
+  (F.pushes ??= []).push({ part, dir: flat(dir).normalize(), amp: energy < 12 ? 0.05 : clamp(0.08 + energy / 300, 0.08, 0.34), t0: clock, dur: energy < 12 ? 0.2 : 0.34 });
   F.dispProbe = { joint, p0: F.P[joint].clone(), t0: clock, energy, part };
 }
 function balanceLayer(F, dtNow = 1 / 30) {
@@ -2238,8 +2242,9 @@ function drawWedges() {
     m.position.set(F.P[0].x, 0.02, F.P[0].z);
     m.quaternion.setFromEuler(new THREE.Euler(-Math.PI / 2, 0, h - Math.PI / 2, 'YXZ'));
     const ready = (F.state === 'free' || F.state === 'guard') && (F.posture ?? 1) > 0.25;
-    m.material.opacity = ready ? 0.35 : 0.08;
-    m.edge.material.opacity = ready ? 0.7 : 0.2;
+    const busy = fighters.some(E => !E.isPlayer && E.state === 'attack' && !(E.attack?.followed) && flat(E.P[0]).distanceTo(flat(F.P[0])) < 2.5) ? 0.35 : 1; // (a blow coming: the fans step back)
+    m.material.opacity = (ready ? 0.35 : 0.08) * busy;
+    m.edge.material.opacity = (ready ? 0.7 : 0.2) * busy;
   }
   for (const [F, m] of wedges) if (!fighters.includes(F)) { scene.remove(m); wedges.delete(F); }
 }
@@ -2289,6 +2294,7 @@ function drawLanes() {
     m.visible = m.userData.a > 0.03;
     if (!m.visible) continue;
     const from = flat(E.P[0]), to = flat(player.P[0]).sub(from), len = Math.max(0.2, to.length() - 0.25);
+    a *= clamp((to.length() - 1.0) / 0.5, 0, 1); // (close in, the body and its ring say it: the lane is for blows coming from a distance)
     m.position.set(from.x, 0.025, from.z);
     m.rotation.set(0, Math.atan2(to.x, to.z), 0);
     m.scale.set(1, 1, len);
@@ -2667,7 +2673,7 @@ function frame(now) {
   for (const F of fighters) F.body.update(F.P, rig.extraPositions(F.shown, F.P), dt);
   drawLook();
   for (let k = dusts.length - 1; k >= 0; k--) { const D = dusts[k]; D.t += dt; D.m.scale.setScalar(1 + D.t * 9); D.m.material.opacity = Math.max(0, 0.8 - D.t * 3.2); if (D.t > 0.25) { scene.remove(D.m); D.m.geometry.dispose(); D.m.material.dispose(); dusts.splice(k, 1); } }
-  for (let k = sparks.length - 1; k >= 0; k--) { const s = sparks[k]; s.t += dt; s.m.quaternion.copy(camera.quaternion); s.m.scale.setScalar(s.s * (1 + 6 * s.t)); s.m.material.opacity = Math.max(0, 0.75 - 2.6 * s.t); if (s.t > 0.3) { scene.remove(s.m); s.m.material.dispose(); sparks.splice(k, 1); } }
+  for (let k = sparks.length - 1; k >= 0; k--) { const s = sparks[k]; s.t += dt; s.m.quaternion.copy(camera.quaternion); s.m.scale.setScalar(s.s * (1 + 6 * s.t)); s.m.material.opacity = Math.max(0, 0.9 - 3 * s.t); if (s.t > 0.3) { scene.remove(s.m); s.m.material.dispose(); sparks.splice(k, 1); } }
   // camera: from the side of the line between the player and the nearest opponent, far enough to see both
   if (player) {
     // (the camera's opponent is the one the player is locked on - it does not swing to whoever is nearest while circling)
@@ -2698,7 +2704,7 @@ function frame(now) {
     camDist += (clamp(3.4 + 1.3 * radius, 4.0, 6.8) - camDist) * (1 - Math.exp(-dt / 1.2));
     const dist = camDist;
     camTarget.lerp(new Vector3(mid.x, 0.75, mid.z), 1 - Math.exp(-dt * 2));
-    // from a little above (about 22 degrees down): more from the side, still enough to read who is on whose flank
+    // from a little above (about 18 degrees down): from the side, so a blow travels across the screen; still enough to read flanks
     // (an opponent between the camera and the player would hide the exchange: then the camera rises a little, over it)
     {
       const eye = camTarget.clone().addScaledVector(camSide, dist + 0.6).setY(1.2), pl = player.P[0].clone().setY(1.1), ray = pl.clone().sub(eye), L = ray.length(); ray.normalize();
@@ -2706,7 +2712,7 @@ function frame(now) {
       for (const f of fighters) { if (f.isPlayer || f.state === 'out') continue; const v = f.P[0].clone().setY(1.1).sub(eye), along = v.dot(ray); if (along > 0.3 && along < L - 0.3 && v.addScaledVector(ray, -along).length() < 0.45) occ = 1; }
       camRaise += (occ - camRaise) * (1 - Math.exp(-dt / 0.5));
     }
-    camera.position.copy(camTarget).addScaledVector(camSide, dist + 0.6 - 0.6 * camRaise).add(new Vector3(0, clamp(0.4 * (dist + 0.6), 1.9, 3.0) + 1.3 * camRaise, 0));
+    camera.position.copy(camTarget).addScaledVector(camSide, dist + 0.6 - 0.6 * camRaise).add(new Vector3(0, clamp(0.33 * (dist + 0.6), 1.6, 2.6) + 1.3 * camRaise, 0));
     camera.lookAt(camTarget);
     if (shake > 0.001) { camera.position.add(new Vector3(rand(-1, 1), rand(-1, 1), rand(-1, 1)).multiplyScalar(shake)); shake *= Math.exp(-real * 12); }
     camera.position.add(camKick); camKick.multiplyScalar(Math.exp(-real / 0.08));
