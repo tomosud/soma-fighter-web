@@ -2689,19 +2689,24 @@ function ragStep(F, dt) {
   // on an upright statue - the spine takes an extra share of the blow while reeling, and firms back with the rest
   const tf = i => (RAG_TRUNK.has(R.names[i]) ? 0.45 + 0.55 * u : 1);
   R.k = F.ragK.map((k, i) => k * (down ? Math.max(F.ragLoose, 0.25) : loose * tf(i)));
-  R.rootK = kicked ? 60 + 2440 * ((clock - F.groundJolt) / 1.0) ** 2 : down || F.state === 'down' || F.state === 'getup' ? 2500 : 600 + 2400 * u;
+  // going down, before the generated fall is the motion playing, the body is the PHYSICS': the root nearly free,
+  // so the blow's momentum tips and carries it (it used to be pinned to the old standing frames - a statue sliding
+  // until the fall arrived); once the fall's frames play, the muscles take the body over to them
+  const falling = down && F.track.tag.kind !== 'down';
+  R.rootK = kicked ? 60 + 2440 * ((clock - F.groundJolt) / 1.0) ** 2 : falling ? 150 : down || F.state === 'down' || F.state === 'getup' ? 2500 : 600 + 2400 * u;
   const contact = F.ragFeetFree || down ? [0, 0, 0, 0] : null;
   // (the ragdoll keeps its own state: a reset, should it drift far from the motion, is not shown as a jump)
   const before = R.x[0].clone();
   R.step(dt, F.shown, contact, null);
   const ragged = R.pose(F.shown);
   const drift = ragged.root.distanceTo(F.shown.root);
-  if (R.x[0].distanceTo(before) > 0.3 || drift > (kicked ? 0.9 : 0.45)) F.ragFade = true;
+  if (R.x[0].distanceTo(before) > 0.3 || drift > (kicked || falling ? 1.1 : 0.45)) F.ragFade = true;
   // (kicked on the floor: the motion is moved along to where the body has gone - no pull back to where it lay)
   if (kicked) { const d = flat(R.x[0].clone().sub(F.shown.root)).multiplyScalar(1 - Math.exp(-dt / 0.2)); F.track.shift(d.x, d.z); }
   // back to the motion once firm again; on the floor (lying, stirring) the motion's own; drifting off: at once
   if (F.ragFade) F.ragW = Math.max(0, F.ragW - dt / 0.12);
   else if (kicked) F.ragW = clock - F.groundJolt < 0.75 ? 1 : Math.max(0.55, F.ragW - dt / 0.5); // (all ragdoll while the blow plays out)
+  else if (down) F.ragW = falling ? 1 : Math.max(0.5, F.ragW - dt / 0.25); // (physics flies it; the playing fall gathers it in)
   else if (F.state === 'down') F.ragW = Math.max(0.55, F.ragW - dt / 0.4); // (lying: gravity settles the limbs the fall clip leaves in the air)
   else if (F.state === 'getup') F.ragW = Math.max(0, F.ragW - dt / 0.4);
   else if (!down && u >= 1) F.ragW = Math.max(0, F.ragW - dt / 0.2);
