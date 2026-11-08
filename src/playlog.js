@@ -106,7 +106,7 @@ export function createPlayLog(ctx) {
       reactDisp: med(reacts.map(e => e.disp06)),
       reactSpread: reacts.length > 2 ? +Math.sqrt(mean(reacts.map(e => (e.disp06 ?? 0) ** 2)) - (mean(reacts.map(e => e.disp06 ?? 0)) ** 2)).toFixed(2) : null,
       falls: fallsHere.length, fallKinds: new Set(fallsHere.map(e => e.fall.name)).size, kos: E.filter(e => e.type === 'ko').length, dodges: E.filter(e => e.type === 'dodge').length,
-      hitsUnseen: taken.filter(e => !e.touch && e.tier !== 'ground').length ? +(taken.filter(e => !e.touch && e.tier !== 'ground' && (e.angle == null || (e.angle > 55 && !e.warned) || (e.wind ?? 0) < 0.3)).length / taken.filter(e => !e.touch && e.tier !== 'ground').length).toFixed(2) : null,
+      hitsUnseen: taken.filter(e => !e.touch && e.tier !== 'ground').length ? +(taken.filter(e => !e.touch && e.tier !== 'ground' && (e.angle == null || (e.wind ?? 0) < 0.3) /* (from out of sight the red arc at the feet shows all through the wind-up: seen if it had 0.3 s) */).length / taken.filter(e => !e.touch && e.tier !== 'ground').length).toFixed(2) : null,
       warnedBehind: taken.filter(e => !e.touch && e.tier !== 'ground' && e.angle > 55).length,
       longestApart: (() => { let best = 0, run = 0; for (const fr of F) { if (fr.d > 3) run++; else { best = Math.max(best, run); run = 0; } } return +(Math.max(best, run) / FPS).toFixed(1); })(), dodged: E.filter(e => e.type === 'dodged').length, counters: given.filter(e => e.counter).length,
       playerStill: n ? +(F.filter(fr => fr.ps >= 3 && (fr.pl ?? fr.hv) < 0.08).length / n).toFixed(2) : null, // (unable to act and the body not moving: limbs and head)

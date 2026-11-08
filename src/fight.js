@@ -1098,7 +1098,7 @@ function checkHits(A, B, dt) {
   // a strike asked for but not yet under way (the motion still the one before): nothing it touches counts; an
   // opponent's blow does not land in its first 0.3 s (the wind-up is always there to see)
   if (A.state === 'attack' && !A.attack) { A.contacts.delete(B); return; }
-  if (!A.isPlayer && A.attack && clock - A.attack.t0 < 0.2) { A.contacts.delete(B); return; }
+  if (!A.isPlayer && A.attack && clock - A.attack.t0 < 0.3) { A.contacts.delete(B); return; }
   if (B.dodge && clock < B.dodge.iframes) {
     if (A.attack && !A.attack.dodgedBy) { A.attack.dodgedBy = B.id; plog?.note('dodged', { by: A.id }); if (B.isPlayer) { damageNumber(B.P[I.Head].clone().add(new Vector3(0, 0.25, 0)), 'かわした', '#9fe0ff', 22); slowUntil = performance.now() + 120; } }
     A.contacts.delete(B); return;
@@ -1205,7 +1205,7 @@ function land(A, B, energy, dir, at, isHead) {
   // a counter: an opponent caught in the recovery of a missed blow, or a blow right after the player stepped out of one
   let counter = false;
   if (!B.isPlayer && clock < (B.exposed ?? 0)) { energy *= 1.25; counter = true; B.exposed = 0; } // (one counter per whiff)
-  else if (A.isPlayer && clock - (A.dodge?.at ?? -9) < 1.0) { energy *= 1.4; counter = true; }
+  else if (A.isPlayer && A.dodge?.flick && clock - A.dodge.at < 1.0) { energy *= 1.4; counter = true; }
   // a touch (a glancing contact, little in it): a small mark, a small sway of the body; no stop, no shake, no
   // reaction motion - the striker carries on through
   if (energy < 12 && B.hp - energy * (A.isPlayer ? settings.damage.player : settings.damage.enemy) > 0) {
@@ -1246,7 +1246,7 @@ function land(A, B, energy, dir, at, isHead) {
   B.knock.copy(push);
   const down = B.hp <= 0 || energy > settings.knockdown * (B.isPlayer ? 0.9 : 1); // (the player stays up a little less)
   // an opponent already throwing its blow takes a light one through it (it sways, the blow goes on): a trade
-  const armored = !counter && !B.isPlayer && B.state === 'attack' && B.attack?.spliced && !down && energy < 28;
+  const armored = !counter && !B.isPlayer && B.state === 'attack' && B.attack?.spliced && !down && energy < 40;
   if (!armored) {
     B.state = down ? 'fall' : 'hit';
     B.until = clock + 3;
@@ -1286,7 +1286,7 @@ function land(A, B, energy, dir, at, isHead) {
   if (B.isPlayer && B.attackQueued != null) plog?.pressResult(B.queuedPress, 'lost:hit');
   if (B.isPlayer && B.strikeInput?.id) plog?.pressResult(B.strikeInput.id, 'lost:hit');
   if (!armored) B.attackQueued = null;
-  if (B.hp <= 0) B.ko = true;
+  if (B.hp <= 0 && !B.isPlayer) B.ko = true; // (the player is never left lying like a knocked-out body: it stirs and gets up, hp restored)
   lastHit = { energy, dmg, isHead, by: A.isPlayer ? 'あなた' : '相手', t: clock, tier: down ? (energy > settings.knockdown * 1.2 ? 'fly' : 'down') : energy >= 45 ? 'heavy' : 'hit', victim: B.id, striker: A.id, pressId: A.attack?.pressId ?? 0, counter };
   hudFight();
 }
@@ -1391,7 +1391,7 @@ function think(E, dt) {
           crew.lastStrikeAt = clock; crew.lastStriker = E;
           E.antic = { t0: clock, side: Math.random() < 0.5 ? 1 : -1 }; // the wind-up shows
           B.combo = Math.random() < 0.65 ? (Math.random() < 0.4 ? 2 : 1) : 0;
-          B.nextAttack = clock + rand(0.35, 0.8);
+          B.nextAttack = clock + rand(0.3, 0.7);
         } else B.nextAttack = clock + 0.2;
       }
     }
@@ -1848,8 +1848,9 @@ function simulate(dt) {
         // or the body itself already moving out across the line fast
         const along = flat(threat.P[0].clone().sub(player.P[0])).normalize(), hv = player.prevP ? flat(player.P[0].clone().sub(player.prevP[0])).divideScalar(dt) : new Vector3();
         const across = hv.clone().addScaledVector(along, -hv.dot(along)).length();
-        if (flick || across > 1.2) {
-          player.dodge = { at: clock, until: clock + (flick ? 0.3 : 0.15), iframes: clock + 0.22 };
+        if (flick || across > 2.0) {
+          // (a flick is a dodge: i-frames and a counter after it; the body just moving out fast only spoils the aim)
+          player.dodge = { at: clock, until: clock + (flick ? 0.3 : 0.15), iframes: flick ? clock + 0.22 : clock, flick: !!flick };
           if (flick) {
             // the burst of the step: the screen flick turned into the floor direction (sideways from the attacker)
             const side = new Vector3(along.z, 0, -along.x), sgn = Math.sign((flick.x * (scr(player.P[0].clone().add(side))[0] - scr(player.P[0])[0])) + (flick.y * (scr(player.P[0].clone().add(side))[1] - scr(player.P[0])[1]))) || 1;
