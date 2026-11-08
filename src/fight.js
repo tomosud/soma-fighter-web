@@ -30,7 +30,6 @@ let plog = null; // the play log (src/playlog.js)
 const MB_REV = '54fc563aeaaf819a753d72cc9fdc6713989cdd43';
 const MODELS = {
   fp16: `https://media.githubusercontent.com/media/NVlabs/motionbricks/${MB_REV}/motionbricks/assets/onnx/soma/mmm_v6_soma_fp16.onnx`,
-  fp32: `https://media.githubusercontent.com/media/NVlabs/motionbricks/${MB_REV}/motionbricks/assets/onnx/soma/mmm_v6_soma_fp32.onnx`,
 };
 const params = new URLSearchParams(location.search);
 const $ = id => document.getElementById(id);
@@ -56,10 +55,10 @@ const settings = {
   trigger: params.get('trigger') ?? 'click', // 'click' (right button) or 'auto' (strikes set off by the motion, as before)
   enemies: clamp(Number(params.get('enemies') ?? 3), 1, 3), // how many opponents at once
   w: { feetPos: 1, feetVel: 0.75, hipsVel: 1, hipsH: 0.7, hipsVy: 0.8, hands: 0.3, head: 0.3, handsVel: 0.1, trajPos: 1, trajDir: 1.2, handle: 1.5, trajH: 1 },
-  damage: { player: 0.6, enemy: 0.45 }, // hp per joule
+  damage: { player: 0.45, enemy: 0.35 }, // hp per joule (by the player, by an opponent)
   hipsMass: 12, // the part of the body's weight a moving body puts behind a blow (kg)
   regen: 3, // the player's hp back per second after 3 s without being hit
-  knockdown: 95, // J in one blow that puts an opponent on the floor (the player: 1.3 of it); below it the body is knocked but stays up, and the fight stays on its feet
+  knockdown: 95, // J in one blow that puts an opponent on the floor (the player: 1.4 of it, which only a blow from behind reaches); below it the body is knocked but stays up, and the fight stays on its feet
 };
 
 // ---------------------------------------------------------------- the reference database
@@ -174,7 +173,8 @@ function buildKeys(d) {
           return { N, pose: fr[0], feat: poseFeat(rig.positions(fr[0]), rig.positions(fr[1])) };
         });
         const travel = flat(chamber[0].pose.root).negate().divideScalar(6 / FPS); // (m/s, in the top's frame: +z forward)
-        strikeKeys.push({ clip: k, name: c.name, part, kind, family: familyOf(c.name, kind), frames, tip, high: tip.y > 1.25, miss, hit, chamber, travel });
+        const arc = rig.positions(chamber[1].pose)[I[part]].distanceTo(tip) + 0.5 * Math.max(0, tip.y - 1.0);
+        strikeKeys.push({ clip: k, name: c.name, part, kind, family: familyOf(c.name, kind), frames, tip, high: tip.y > 1.25, miss, hit, chamber, travel, size: clamp((arc - 0.35) / 0.6, 0, 1) });
       }
     }
     if (c.tag === 'block' && !/restrain|transition/.test(c.name)) {
@@ -396,6 +396,7 @@ class Fighter {
     this.isPlayer = isPlayer;
     this.id = Fighter.seq = (Fighter.seq ?? 0) + 1;
     this.track = new Track(rig, { stance: standPose ?? rig.restPose() });
+    this.track.priority = isPlayer ? 0.3 : 0;
     this.track.reset(pos, yaw);
     this.body = new Mannequin(scene, rig, color);
     this.vel = new Vector3(); this.want = new Vector3();
@@ -587,11 +588,14 @@ function planReq(F, kind, mode = 'now') {
       const out = targets.map((t, k) => { if (k === 0 || posedAll) return t; const r = clonePose(t); r.free = true; return r; });
       const t0 = Math.max(6, Math.round((lead + 2) / 4));
       const rate = kind === 'attack' ? 1.35 : kind === 'hit' ? 1.15 : 1;
+      // (the player setting off - pulled on from slow - takes its first steps quicker: the move feels instant)
+      const setOff = kind === 'move' && F.isPlayer && !!F.spring?.target && F.vel.length() < 1.4 && flat(F.spring.target.clone().sub(Pn[0])).length() > 0.5;
       return {
         targets: out, tokens: kind === 'attack' ? [t0] : [6, 7], rate, fixEnd: kind === 'move' ? (moving ? 'root' : true) : true,
         tag: { kind: kind === 'move' ? (moving ? 'move' : 'idle') : kind === 'attack' ? 'attack' : 'hit' },
         after: (tr2, a0, frames) => {
           groundFrames(frames);
+          if (setOff) frames.forEach((f, i) => { if (i < 12) f.rate = (f.rate ?? rate) * (1 + 0.6 * (1 - i / 12)); });
           const left = (tr2.frames.length - 1 - tr2.t) / FPS / rate;
           if (kind === 'attack') { F.state = 'attack'; F.until = clock + frames.length / FPS / rate + 0.15; }
           if (kind === 'hit') { F.state = 'hit'; F.until = clock + left; }
@@ -680,6 +684,16 @@ function onLegs(strikePose, legPose) {
 function strikeReq(F, family = null, mode = 'now', kindSel = null, pressId = 0, opts = {}) {
   return {
     kind: 'attack', mode, interrupt: mode === 'now',
+    // (wound up: the context the model starts from is the wound-up body, held - so the motion it makes swings out of it)
+    context(tr, a) {
+      const base = tr.context(a), A = F.antic;
+      if (!A?.big || mode !== 'now' || A.until) return base;
+      const w = windWeight(A, clock - A.t0 + Math.max(0, a - tr.now) / FPS);
+      if (w < 0.2) return base;
+      A.baked = true; A.a = a;
+      const wound = windPose(base[3], A, w);
+      return [windPose(base[0], A, 0.85 * w), windPose(base[1], A, 0.95 * w), wound, wound];
+    },
     build(tr, a, ctx) {
       const from = ctx[3];
       // the body as it will be when the strike starts (the request's context: now + the wait, or the end of a
@@ -735,9 +749,15 @@ function strikeReq(F, family = null, mode = 'now', kindSel = null, pressId = 0, 
       if (aimPart === 'legs' && pool.some(k => k.family === 'low')) pool = pool.filter(k => k.family === 'low'); // at the legs: a low kick, a sweep
       for (const k of (pool.length ? pool : strikeKeys)) {
         const goal = local(aimOf(k));
-        const step = clamp(goal.z - k.tip.z + 0.08, -0.2, WIND[k.kind] + (F.isPlayer ? 0.25 : opts.lunge ? 0.5 : 0.25)); // (aim assist: it may step further in, the player most; a lunge far)
+        const step = clamp(goal.z - k.tip.z + 0.08, -0.45, WIND[k.kind] + (F.isPlayer ? 0.25 : opts.lunge ? 0.5 : 0.25)); // (aim assist: it may step further in, the player most; a lunge far)
         let cost = Math.abs(goal.z - k.tip.z - step) * 4 + Math.abs(goal.y - k.tip.y) * 2 + Math.abs(goal.x - k.tip.x) * 1.5;
         cost += (k.clip === F.lastStrike ? 1.0 : 0) + (k.clip === F.lastStrike2 ? 0.5 : 0) + Math.random() * 0.25;
+        cost -= (F.isPlayer ? 1.3 : 1.4) * k.size; // (a wide swing reads; a short poke does not)
+        if (F.isPlayer && k.kind === 'elbow' && kindSel === 'punch') cost += 0.6; // (a press for a punch: a punch, the short elbow only when nothing else fits)
+        if (!F.isPlayer) cost += (k.family === F.lastFamily ? 0.8 : 0) + (k.family === F.lastFamily2 ? 0.4 : 0);
+        // wound up: the hand drawn back is the one that throws (a cross, a hook - not the lead hand's short jab)
+        const cocked = F.antic?.big && F.antic.signs?.rear;
+        if (cocked && (k.kind === 'punch' || k.kind === 'elbow') && !k.part.startsWith(cocked)) cost += 1.5;
         // the pose now: the strike whose wind-up the body is already in (or near: a deeper wind-up costs a little more)
         const dPose = Math.min(featCost(feat, k.chamber[0].feat), 0.15 + featCost(feat, k.chamber[1].feat));
         cost += 2.5 * dPose;
@@ -751,7 +771,7 @@ function strikeReq(F, family = null, mode = 'now', kindSel = null, pressId = 0, 
       }
       if (!best) return planReq(F, 'move').build(tr, a, ctx);
       const { k, step, dPose } = best;
-      F.lastStrike2 = F.lastStrike; F.lastStrike = k.clip;
+      F.lastStrike2 = F.lastStrike; F.lastStrike = k.clip; F.lastFamily2 = F.lastFamily; F.lastFamily = k.family;
       const fwd = new Vector3(Math.sin(yaw), 0, Math.cos(yaw));
       const at = A.clone().addScaledVector(fwd, step);
       const aim = aimOf(k).clone();
@@ -765,8 +785,13 @@ function strikeReq(F, family = null, mode = 'now', kindSel = null, pressId = 0, 
       }
       // the four target frames run through the target (from short of it to well past it): they carry the
       // limb's speed into the contact; the fist / foot is bent onto that line (an elbow or a knee is placed by the step)
-      const through = [-0.22, -0.08, 0.06, 0.2];
-      if (!/ForeArm|Shin/.test(k.part)) targets = targets.map((t, i) => reachLimb(t, k.part, aim.clone().addScaledVector(fwd, through[i]), F.isPlayer ? 0.5 : 0.35));
+      const through = F.isPlayer ? [-0.26, -0.06, 0.14, 0.34] : [-0.22, -0.08, 0.06, 0.2]; // (the player's fist goes on well through)
+      targets = targets.map(t => bigTop(t, k, fwd, F.isPlayer ? 1.3 : 1));
+      if (!/ForeArm|Shin/.test(k.part)) targets = targets.map((t, i) => {
+        const g = aim.clone().addScaledVector(fwd, through[i]), tip = rig.positions(t)[I[k.part]];
+        const short = g.clone().sub(tip).dot(fwd); if (short < 0) g.addScaledVector(fwd, -short); // (out to full reach)
+        return reachLimb(t, k.part, g, F.isPlayer ? 0.5 : 0.35);
+      });
       // the one being struck sees it coming: a guard or a dodge, or it takes it
       if (opp) defend(opp, F, k);
       if (opp) targets = targets.map(t => { const r = clonePose(t); gaze(r, head); return rig.fixRigid(r); });
@@ -1343,6 +1368,7 @@ function land(A, B, energy, dir, at, isHead, onArm = false) {
     jolt(B, at, flat(dir).normalize().multiplyScalar(Math.sqrt(2 * e0 * 6) * 0.4), 0.6, 0.25);
     pushPart(B, at, dir, Math.max(energy, 12));
     jolt(A, at, flat(dir).normalize().multiplyScalar(-Math.sqrt(2 * e0 * 6) * 0.3), 0.6, 0.3); // (the blow bounces off)
+    shove(B, dir, clamp(0.06 + e0 / 500, 0.08, 0.2)); shove(A, dir.clone().negate(), clamp(0.04 + e0 / 700, 0.06, 0.15));
     if (A.attack) A.attack.landed = true;
     spark(at, e0 * 0.5, 0x9fd3ff);
     shake = Math.max(shake, 0.03);
@@ -1365,7 +1391,7 @@ function land(A, B, energy, dir, at, isHead, onArm = false) {
   if (A.isPlayer && asp === 'front' && !vital && !counter) energy = Math.min(energy, 45);
   // a player off balance takes more (it is open), but is not flattened for it
   if (B.isPlayer && broken) energy *= 1.4;
-  if (B.isPlayer) energy = Math.min(energy, 150); // (no blow throws the player across the floor)
+  if (B.isPlayer) energy = Math.min(energy, asp === 'rear' ? 140 : 100); // (no blow throws the player across the floor; only one from behind floors it)
   // a touch (a glancing contact, little in it): a small mark, a small sway of the body; no stop, no shake, no
   // reaction motion - the striker carries on through
   if (energy < 12 && B.hp - energy * (A.isPlayer ? settings.damage.player : settings.damage.enemy) > 0) {
@@ -1373,6 +1399,7 @@ function land(A, B, energy, dir, at, isHead, onArm = false) {
     spark(at, energy * 0.3, 0xd8d8d8);
     const J = flat(dir).normalize().multiplyScalar(Math.sqrt(2 * energy * 6) * 0.6);
     jolt(B, at, J, 0.7, 0.25);
+    shove(B, dir, 0.05 + energy * 0.004);
     lastHit = { energy, dmg: 0, isHead, by: A.isPlayer ? 'あなた' : '相手', t: clock, touch: true, tier: 'touch', victim: B.id, striker: A.id, pressId: A.attack?.pressId ?? 0 };
     if (B.isPlayer) { hurt = Math.max(hurt, 0.2); shake = Math.max(shake, 0.02); }
     pushPart(B, at, dir, energy);
@@ -1384,6 +1411,7 @@ function land(A, B, energy, dir, at, isHead, onArm = false) {
     energy *= 0.2;
     B.blocked = true;
     jolt(B, at, flat(dir).normalize().multiplyScalar(Math.sqrt(2 * energy * 6)), 0.5, 0.3);
+    shove(B, dir, clamp(0.1 + energy / 100, 0.1, 0.22));
     pushPart(B, at, dir, Math.max(energy, 12)); // (the guarding arm is knocked aside)
     if (A.attack) A.attack.landed = true;
     spark(at, energy, 0x9fd3ff);
@@ -1395,7 +1423,7 @@ function land(A, B, energy, dir, at, isHead, onArm = false) {
   }
   B.hitAt = clock;
   {
-    const down0 = B.hp - energy * (A.isPlayer ? settings.damage.player : settings.damage.enemy) <= 0 || energy > settings.knockdown * (B.isPlayer ? 1.3 : 1);
+    const down0 = B.hp - energy * (A.isPlayer ? settings.damage.player : settings.damage.enemy) <= 0 || energy > settings.knockdown * (B.isPlayer ? 1.4 : 1);
     const J = flat(dir).normalize().multiplyScalar(Math.sqrt(2 * energy * 6)); // the momentum the blow puts in (kg m/s)
     J.y = (isHead ? 0.25 : 0.1) * J.length();
     jolt(B, at, J, clamp(0.35 - energy / 300, down0 ? 0.04 : 0.08, 0.3), clamp(0.3 + energy / 120, 0.3, 0.9), down0);
@@ -1408,7 +1436,7 @@ function land(A, B, energy, dir, at, isHead, onArm = false) {
   postureHit(B, energy * (B.isPlayer ? 0.5 : 0.09) * balance, vital ? vital[0] : asp); // (an opponent's balance breaks after a few good blows, not every exchange)
   const push = flat(dir).normalize().multiplyScalar(clamp(0.35 * Math.sqrt(energy), 0.6, 2.6));
   B.knock.copy(push);
-  const down = B.hp <= 0 || energy > settings.knockdown * (B.isPlayer ? 1.3 : 1) * (broken && !B.isPlayer ? 0.5 : 1);
+  const down = B.hp <= 0 || energy > settings.knockdown * (B.isPlayer ? 1.4 : 1) * (broken && !B.isPlayer ? 0.5 : 1);
   // an opponent already throwing its blow takes a light one through it (it sways, the blow goes on): a trade
   const charging = !B.isPlayer && B.charge && clock - B.charge.t0 < 1.4 && asp === 'front'; // (from the side or behind, a charge is no armour)
   const armored = !counter && !B.isPlayer && !down && ((charging && energy < 45) || (B.state === 'attack' && B.attack?.spliced && clock - B.attack.t0 > 0.3 && energy < 25));
@@ -1427,7 +1455,7 @@ function land(A, B, energy, dir, at, isHead, onArm = false) {
   }
   // the body is carried off at once (until the generated reaction takes over)
   // (every damaging blow: even one taken through a blow of its own sways the body back a little)
-  if (energy >= 12) B.knockFx = { t0: clock, dir: flat(dir).normalize(), v0: clamp(Math.sqrt(2 * energy / 70) * (down ? 1.3 : 0.7), 0.75, 3) * (armored ? 0.8 : 1), until: armored ? clock + 0.3 : null, fade: armored ? 0.35 : 0.15 };
+  if (energy >= 12) B.knockFx = { t0: clock, dir: flat(dir).normalize(), v0: clamp(Math.sqrt(2 * energy / 70) * (down ? 1.3 : 0.7), 0.75, 3) * (armored ? 0.8 : 1), until: null, fade: 0.15 };
   if (A.attack) {
     if (A.attack.followed && !A.attack.landed && !A.attack.sweep && !A.attack.chained) A.track.request(followReq(A, 'now'));
     A.attack.landed = true;
@@ -1449,7 +1477,7 @@ function land(A, B, energy, dir, at, isHead, onArm = false) {
   damageNumber(at, counter ? `カウンター -${Math.round(dmg)}` : `-${Math.round(dmg)}`, B.isPlayer ? '#ff5050' : counter ? '#ffd040' : '#ffffff', (B.isPlayer ? 20 : 15) + Math.min(16, energy / 5));
   if (counter) { spark(at, energy * 1.3, 0xffc030); spark(at, energy * 0.6, 0xffffff); hitstop = Math.max(hitstop, 0.1); slowUntil = Math.max(slowUntil, performance.now() + 250); camKick.addScaledVector(flat(dir).normalize(), 0.08); }
   if (down || energy > 60) slowUntil = performance.now() + clamp(energy * 4, 160, 420); // a heavy one: a moment of slow motion
-  if (!B.isPlayer && down) crew.watchUntil = clock + 0.6; // the others hold back a moment
+  if (!B.isPlayer && down) crew.watchUntil = clock + 0.25; // the others hold back a moment (a beat, not a pause)
   if (!armored && (B.state === 'attack' || B.attack)) B.attack = null; // a hit cancels the one hit's own strike
   if (B.isPlayer && B.attackQueued != null) plog?.pressResult(B.queuedPress, 'lost:hit');
   if (B.isPlayer && B.strikeInput?.id) plog?.pressResult(B.strikeInput.id, 'lost:hit');
@@ -1506,7 +1534,7 @@ function think(E, dt) {
   const B = E.brain ??= { range: rand(1.1, 1.4), bob: Math.random() * 6, circle: Math.random() < 0.5 ? 1 : -1, nextAttack: clock + rand(0.4, 1.0), combo: 0, lungeUntil: 0, evadeUntil: 0, evDir: 1 };
   // who fights: the two nearest that are on their feet
   const up = enemies().filter(e => FIGHT.includes(e.state)).sort((a, b) => flat(a.P[0]).distanceTo(pp) - flat(b.P[0]).distanceTo(pp));
-  const fighting = up.indexOf(E) < 3;
+  const fighting = up.indexOf(E) < 2;
   crew.attacker = up[0] ?? null;
   // keep off each other
   const apart = new Vector3();
@@ -1530,7 +1558,7 @@ function think(E, dt) {
     // waiting: a place a little apart, circling slowly
     E.mode = 'wait';
     const at = Math.atan2(-to.x, -to.z) + 0.6 * dt * B.circle;
-    goal = pp.clone().add(new Vector3(Math.sin(at), 0, Math.cos(at)).multiplyScalar(2.6));
+    goal = pp.clone().add(new Vector3(Math.sin(at), 0, Math.cos(at)).multiplyScalar(2.3));
   } else {
     // footwork. The pincer: the nearer presses from the front (in and out of its range), the other works round to
     // the player's flank or back (an arc off the player's facing)
@@ -1566,7 +1594,7 @@ function think(E, dt) {
       E.aim = { enemy: P, part, joint: part === 'head' ? I.Head : part === 'body' ? I.Spine2 : I.LeftShin, off: new Vector3() };
       // head-on: now and then a feint (the load, then nothing) in place of the real charge
       startCharge(E, kind, Math.random() < 0.15);
-      B.nextCharge = clock + rand(1.6, 2.6) + 1.0; B.nextAttack = clock + 1.4;
+      B.nextCharge = clock + rand(1.2, 2.0) + 0.6; B.nextAttack = clock + 1.2;
       crew.chargeFreeUntil = clock + 0.9; crew.lastStrikeAt = clock; crew.lastStriker = E;
     }
     // the load: back the hips go; the lunge: through
@@ -1574,7 +1602,7 @@ function think(E, dt) {
     else if (E.charge && E.attack?.charged && !E.attack.followed) { goal = pp.clone().addScaledVector(to, 0.3); E.mode = 'lunge'; }
     // quick blows: from the side or behind, or when the player is committed (head-on otherwise: only a jab now and then)
     const facingP = aspect(E, P) === 'front';
-    const turn = E.state === 'free' && facingP && clock > B.nextAttack && clock > B.evadeUntil && (fromSide || committed || clock > (B.nextJab ??= clock + rand(0.6, 1.0)));
+    const turn = E.state === 'free' && facingP && clock > B.nextAttack && clock > B.evadeUntil && (fromSide || committed || clock > (B.nextJab ??= clock + rand(0.45, 0.75)));
     // its turn but a little out of reach (1.3-2 m): it drives in first, so the blow begins within reach and lands
     if (turn && d >= 1.3 && d < 2.0 && clock > B.lungeUntil + 0.5 && !E.charge) { B.lungeUntil = clock + 0.3; goal = pp.clone().addScaledVector(to, 0.3); E.mode = 'lunge'; }
     // the tell: a quick step back, then in with the blow
@@ -1585,16 +1613,16 @@ function think(E, dt) {
         if (E.state === 'free' && strike(E, k) === 'started') {
           B.announced = false;
           crew.lastStrikeAt = clock; crew.lastStriker = E;
-          E.antic = { t0: clock, side: Math.random() < 0.5 ? 1 : -1 };
-          B.combo = Math.random() < 0.4 ? (Math.random() < 0.4 ? 2 : 1) : 0;
-          B.nextAttack = clock + rand(0.2, 0.45);
-          if (!fromSide && !committed) B.nextJab = clock + rand(0.6, 1.0);
-        } else B.nextAttack = clock + 0.2;
+          E.antic ??= { t0: clock, side: Math.random() < 0.5 ? 1 : -1 };
+          B.combo = Math.random() < 0.5 ? (Math.random() < 0.4 ? 2 : 1) : 0;
+          B.nextAttack = clock + rand(0.15, 0.35);
+          if (!fromSide && !committed) B.nextJab = clock + rand(0.45, 0.75);
+        } else { B.nextAttack = clock + 0.2; if (E.antic?.big && !E.antic.baked) E.antic.until ??= clock; }
       }
     }
     if (turn && d < 1.3 && !B.tellAt) {
       {
-        const kind = d > 1.1 ? (Math.random() < 0.6 ? 'kick' : 'punch') : Math.random() < 0.8 ? 'punch' : 'kick';
+        const kind = d > 1.1 ? (Math.random() < 0.65 ? 'kick' : 'punch') : Math.random() < 0.55 ? 'punch' : 'kick';
         const u = Math.random(), part = kind === 'kick' && u < 0.3 ? 'legs' : u < 0.6 ? 'head' : 'body';
         E.aim = { enemy: P, part, joint: part === 'head' ? I.Head : part === 'body' ? I.Spine2 : I.LeftShin, off: new Vector3() };
         // one at a time: the other waits a moment after one starts (a one-two from two sides, never together)
@@ -1603,7 +1631,7 @@ function think(E, dt) {
         else if (!inView(P, E) && !B.announced) {
           // out of the player's sight: it announces itself first (a warning at the player's feet), then strikes
           B.announced = true; E.warnUntil = clock + 0.45; B.nextAttack = clock + 0.45;
-        } else { B.tellAt = clock + 0.22; B.tellKind = kind; crew.lastStrikeAt = clock; crew.lastStriker = E; } // (the tell first)
+        } else { B.tellAt = clock + 0.32; B.tellKind = kind; crew.lastStrikeAt = clock; crew.lastStriker = E; E.antic = { t0: clock, side: Math.random() < 0.5 ? 1 : -1, big: true, kind }; } // (the tell first: a chamber held)
       }
     }
     // the rest of a combination: kept while the blow is out (it is chained from the top)
@@ -1751,6 +1779,7 @@ function anticipate(F) {
   if (!A) return;
   const t = clock - A.t0;
   if (F.track.tag.kind === 'attack' && !A.until) A.until = clock;
+  if (A.big) { chamber(F, A, t); return; }
   const w = A.until ? Math.max(0, 1 - (clock - A.until) / 0.12) : Math.min(1, t / 0.12);
   if ((A.until && w <= 0) || t > 1.2) { F.antic = null; return; }
   const p = clonePose(F.shown);
@@ -1758,6 +1787,90 @@ function anticipate(F) {
   rotateSubtree(rig, p, I.Spine2, new Quaternion().setFromAxisAngle(UP, A.side * 0.12 * w));
   p.root.y -= 0.03 * w;
   F.shown = rig.fixRigid(p);
+}
+/**
+ * An opponent's wind-up, plain in the pose (not only in the glow): over a quarter second the trunk turns well away
+ * and leans back, the hips sink, and for a punch the rear arm is drawn back and up, folded (for a kick the arms come
+ * up and the trunk leans back further, the weight on the back leg); it is held until the strike's motion shows,
+ * then let go in 0.08 s - the snap.
+ */
+function windWeight(A, t) { const u = Math.min(1, Math.max(0, t) / (A.fast ? 0.1 : 0.25)); return u * u * (3 - 2 * u); }
+function chamber(F, A, t) {
+  const win = windWeight(A, t);
+  let w;
+  if (A.baked && A.a != null) {
+    // a strike generated from the wound-up body (windPose in its context): the layer gives way over the frame
+    // where that motion begins
+    w = win * clamp(A.a + 1 - F.track.now, 0, 1);
+    if (w <= 0 || clock - A.t0 > 2) { F.antic = null; return; }
+  } else {
+    if (F.track.tag.kind === 'attack' && !A.until) A.until = clock;
+    // (4) a wind-up for a strike that never came (or held too long): let go over 0.08 s, never a snap
+    if (!A.until && (t > 1.4 || !['free', 'attack', 'guard'].includes(F.state))) A.until = clock;
+    w = A.until ? win * Math.max(0, 1 - (clock - A.until) / 0.08) : win;
+    if (A.until && w <= 0) { F.antic = null; return; }
+  }
+  F.shown = windPose(F.shown, A, w);
+}
+/**
+ * The wind-up: the trunk turned well away from the strike and leaning back, the hips sunk, for a punch the arm on the
+ * turned-back side drawn back and up, folded (for a kick the arms up and the trunk back further, the weight on the
+ * back leg). The swing then goes from the other side through to the target - the load that shows the blow coming.
+ */
+function windPose(pose, A, w) {
+  if (w <= 0) return pose;
+  const p = clonePose(pose);
+  const P0 = rig.positions(p), h = rig.heading(P0), fwd = new Vector3(Math.sin(h), 0, Math.cos(h)), lat = new Vector3().crossVectors(UP, fwd).normalize();
+  const kick = A.kind === 'kick';
+  const feet = ['Left', 'Right'].map(sd => P0[I[sd + 'Foot']].clone());
+  rotateSubtree(rig, p, I.Spine1, new Quaternion().setFromAxisAngle(UP, A.side * 0.34 * w));
+  rotateSubtree(rig, p, I.Spine2, new Quaternion().setFromAxisAngle(UP, A.side * 0.22 * w));
+  const lean = (kick ? 0.28 : 0.14) * w;
+  // (which way each turn goes is tried at full strength once, then kept for this wind-up)
+  const S = A.signs ??= {};
+  const sgn = (key, j, axis, ang, score) => { if (S[key] == null) { let bs = -Infinity; for (const sg of [1, -1]) { const q = clonePose(p); rotateSubtree(rig, q, j, new Quaternion().setFromAxisAngle(axis, sg * ang)); const v = score(rig.positions(q)); if (v > bs) { bs = v; S[key] = sg; } } } return S[key]; };
+  const full = kick ? 0.28 : 0.14;
+  rotateSubtree(rig, p, I.Spine1, new Quaternion().setFromAxisAngle(lat, sgn('lean', I.Spine1, lat, full, Q => -Q[I.Head].dot(fwd)) * lean));
+  p.root.y -= 0.07 * w;
+  if (!S.rear) { const P1 = rig.positions(p); S.rear = P1[I.LeftArm].dot(fwd) < P1[I.RightArm].dot(fwd) ? 'Left' : 'Right'; }
+  for (const side of kick ? ['Left', 'Right'] : [S.rear]) {
+    const arm = I[side + 'Arm'], fore = I[side + 'ForeArm'], hand = I[side + 'Hand'];
+    const aA = kick ? 0.5 : 0.95;
+    rotateSubtree(rig, p, arm, new Quaternion().setFromAxisAngle(lat, sgn('arm' + side, arm, lat, aA, Q => kick ? Q[hand].y : -Q[hand].dot(fwd) + 0.5 * Q[hand].y) * aA * w));
+    rotateSubtree(rig, p, fore, new Quaternion().setFromAxisAngle(lat, sgn('fore' + side, fore, lat, 0.6, Q => Q[hand].y - 0.3 * Q[hand].dot(fwd) * (kick ? -1 : 1)) * 0.6 * w));
+  }
+  // the feet stay where they were (the hips sink into bent knees, not the feet into the floor)
+  ['Left', 'Right'].forEach((sd, i) => legTo(p, sd, feet[i]));
+  return rig.fixRigid(p);
+}
+/**
+ * The top of a strike made bigger: a punch or an elbow turns the trunk on into it (the striking shoulder forward), a
+ * kick or a knee leans the trunk back against it - the silhouette reads from across the floor.
+ */
+function bigTop(pose, k, fwd, gain = 1) {
+  const p = clonePose(pose), tipJ = I[k.part];
+  if (k.kind === 'punch' || k.kind === 'elbow') {
+    const a = 0.26 * gain;
+    const fwdOf = sg => { const q = clonePose(p); rotateSubtree(rig, q, I.Spine1, new Quaternion().setFromAxisAngle(UP, sg * a)); return rig.positions(q)[tipJ].dot(fwd); };
+    rotateSubtree(rig, p, I.Spine1, new Quaternion().setFromAxisAngle(UP, (fwdOf(1) > fwdOf(-1) ? 1 : -1) * a));
+  } else {
+    const lat = new Vector3().crossVectors(UP, fwd).normalize(), a = 0.16 * gain;
+    const headFwd = sg => { const q = clonePose(p); rotateSubtree(rig, q, I.Spine1, new Quaternion().setFromAxisAngle(lat, sg * a)); return rig.positions(q)[I.Head].dot(fwd); };
+    rotateSubtree(rig, p, I.Spine1, new Quaternion().setFromAxisAngle(lat, (headFwd(1) < headFwd(-1) ? 1 : -1) * a));
+  }
+  return rig.fixRigid(p);
+}
+/** A body knocked a little way along the floor: the motion itself moves (and goes on from there), over a moment. */
+function shove(F, dir, dist, dur = 0.12) {
+  const d = flat(dir.clone()); if (d.lengthSq() < 1e-6 || !(dist > 0)) return;
+  F.shove = { dir: d.normalize(), dist: Math.min(dist + (F.shove ? F.shove.dist - F.shove.done : 0), 0.6), t0: clock, dur, done: 0 };
+}
+function shoveOn(F) {
+  const S = F.shove;
+  if (!S) return;
+  const u = Math.min(1, (clock - S.t0) / S.dur), want = S.dist * (1 - (1 - u) ** 2), step = want - S.done;
+  if (step > 0) { F.track.shift(S.dir.x * step, S.dir.z * step); S.done = want; }
+  if (u >= 1) F.shove = null;
 }
 /**
  * Feet that the motion plants stay where they were put down (the generated motion slides them a little, most of
@@ -1891,7 +2004,7 @@ function knockOn(F) {
   // that gets no reaction of its own (a sway through a strike, a body freed to move, a body already reeling from the
   // last blow) eases back after half a second
   // (not from the motion's tag: a body struck while still in the last blow's reaction must still be carried off)
-  if (!K.until && clock - K.t0 > 0.5) { K.until = clock; K.fade = Math.max(K.fade ?? 0.15, 0.35); }
+  if (!K.until && clock - K.t0 > 0.45 && !(F.track.busy && ['hit', 'fall'].includes(F.state) && clock - K.t0 < 1.4)) { const d0 = K.v0 * 0.35; F.track.shift(K.dir.x * d0, K.dir.z * d0); F.knockFx = null; return; }
   const t = (K.until ?? clock) - K.t0;
   const w = K.until ? Math.max(0, 1 - Math.max(0, clock - K.until) / (K.fade ?? 0.15)) : 1;
   if ((K.until && w <= 0) || clock - K.t0 > 1.5) { F.knockFx = null; return; }
@@ -1974,7 +2087,7 @@ function strike(F, kind = null, pressId = 0) {
   // the load-up shows at once: turning away from the hand nearer the opponent (that one jabs, the other one winds)
   if (F.isPlayer && F.opponent) {
     const h = rig.heading(F.P), left = new Vector3(Math.cos(h), 0, -Math.sin(h)), to = flat((F.aim?.enemy ?? F.opponent).P[0].clone().sub(F.P[0]));
-    F.antic = { t0: clock, side: Math.sign(to.dot(left) || 1) };
+    F.antic = { t0: clock, side: Math.sign(to.dot(left) || 1), big: true, fast: true, kind: kind ?? 'punch' };
   }
   F.state = 'attack'; F.until = clock + 1.0;
   return 'started';
@@ -2336,6 +2449,9 @@ function simulate(dt) {
       else if (F.attackQueued != null && F.isPlayer) { plog?.pressResult(F.queuedPress, 'lost:late'); F.attackQueued = null; }
       else F.track.request(followReq(F));
     }
+    // a strike whose motion has run out with nothing asked for after it: free again at once (never a body held still
+    // in its last frame, waiting for the strike's time to pass)
+    if (F.state === 'attack' && !F.charge && !F.track.busy && F.track.remaining < 1 && clock - (F.windAt ?? -9) > 0.3) { F.state = 'free'; F.planTimer = 0; }
     // plans while free
     F.planTimer -= dt;
     // the player is not held by its own follow-through or a light blow: pulled, it moves on (close in, nothing
@@ -2352,10 +2468,10 @@ function simulate(dt) {
       const pulling = !!F.spring?.target;
       const changed = F.isPlayer ? pulling !== !!F.wasPulling : F.want.distanceTo(F.lastWant) > 0.4;
       F.wasPulling = pulling;
-      if (active && (F.planTimer <= 0 || changed)) { F.track.request(planReq(F, 'move')); F.planTimer = settings.replan; F.lastWant.copy(F.want); }
+      if (active && (F.planTimer <= 0 || changed)) { F.track.request(planReq(F, 'move')); F.planTimer = settings.replan * (F.isPlayer ? 1 : F.mode === 'wait' || F.mode === 'hold' ? 2 : 1.5); F.lastWant.copy(F.want); }
       else if (!active && F.track.remaining / FPS < scheduler.latency + 0.25) F.track.request(planReq(F, 'move', 'end'));
     }
-    slideOn(F);
+    slideOn(F); shoveOn(F);
     F.track.advance(dt);
   }
   scheduler.tick(fighters.filter(f => f.state !== 'out').map(f => f.track));
@@ -2505,16 +2621,18 @@ worker.onmessage = ({ data }) => {
   } else if (data.type === 'error') {
     if (data.id) scheduler.onFail(data.id);
     label.textContent = `エラー: ${data.message}`;
-    $('start').disabled = false;
+    $('start').disabled = false; $('start').hidden = false; $('start').textContent = 'もう一度読み込む';
   }
 };
-$('start').addEventListener('click', () => {
-  const choice = document.querySelector('input[name=model]:checked').value;
-  const url = new URL(params.get('model') ?? MODELS[choice], location.href).href;
-  $('start').disabled = true;
+// (the small model only, loaded as the page opens; the button is there again only to retry after an error)
+function loadModel() {
+  const url = new URL(params.get('model') ?? MODELS.fp16, location.href).href;
+  $('start').disabled = true; $('start').hidden = true;
   $('progress').classList.add('show');
   worker.postMessage({ type: 'load', url, ep: params.get('ep') ?? 'webgpu', batch: BATCH });
-});
+}
+$('start').addEventListener('click', loadModel);
+loadModel();
 // the "how many opponents" links keep the other settings of the address (the model, the trigger)
 for (const el of document.querySelectorAll('a[href^="?enemies="]')) {
   const u = new URLSearchParams(location.search);

@@ -5,7 +5,7 @@ import { FPS, clonePose, lerpPose, placePose, emptyBatch, encodeRequest, decodeR
 const LOCK = new Set(['attack', 'hit', 'down']);
 const PRIORITY = { idle: 0, move: 1, attack: 2, hit: 3, down: 4 };
 const ZERO = new Vector3();
-export const BATCH = Number(globalThis.location ? new URLSearchParams(location.search).get('batch') : 0) || 2; // the model session is built for this fixed batch size (?batch=4: more fighters' requests in one GPU pass)
+export const BATCH = Number(globalThis.location ? new URLSearchParams(location.search).get('batch') : 0) || 4; // the model session is built for this fixed batch size: 4 fighters' requests in one GPU pass (measured on WebGPU: batch 4 takes the same ~0.14 s as batch 2, so twice the motion)
 
 export class Track {
   constructor(rig, book) {
@@ -46,7 +46,9 @@ export class Track {
   advance(dt) {
     const n = this.frames.length;
     const i = Math.min(n - 1, Math.floor(this.t));
-    this.t = Math.min(n - 1, this.t + dt * FPS * this.frames[i].rate);
+    // (motion asked for and not here yet: the last frames are eked out - slowing into the wait, not stopping dead)
+    const left = n - 1 - this.t, ease = this.busy && left < 4 ? Math.max(0.2, left / 4) : 1;
+    this.t = Math.min(n - 1, this.t + dt * FPS * this.frames[i].rate * ease);
     const i0 = Math.floor(this.t), i1 = Math.min(n - 1, i0 + 1);
     lerpPose(this.frames[i0].pose, this.frames[i1].pose, this.t - i0, this.display);
     if (this.blend) {
@@ -77,6 +79,7 @@ export class Track {
   request(req) {
     if (this.pending && PRIORITY[this.pending.kind] > PRIORITY[req.kind]) return false;
     if (req.interrupt) this.serial++;
+    if (!this.pending) this.pendingSince = performance.now();
     this.pending = req;
     return true;
   }
@@ -131,8 +134,14 @@ export class Scheduler {
 
   tick(tracks) {
     if (!this.ready || this.busy) return;
+    // (the one about to run out of motion goes first, the player a little ahead: in fighters' order the last
+    // ones starved and stood frozen when everyone asked at once)
     const ready = tracks.filter(t => t.pending);
     if (!ready.length) return;
+    if (ready.length > BATCH) {
+      const urgency = t => (t.pending.interrupt ? 0 : t.timeLeft()) - (t.priority ?? 0) - 0.5 * Math.min(1, (performance.now() - (t.pendingSince ?? performance.now())) / 1000);
+      ready.sort((a, b) => urgency(a) - urgency(b));
+    }
     const lat = this.latency * 1.15 + 0.02;
     const batch = emptyBatch(BATCH);
     const metas = ready.slice(0, BATCH).map((track, b) => {
@@ -144,7 +153,8 @@ export class Scheduler {
       const ctx = req.context ? req.context(track, a) : track.context(a);
       const spec = req.build(track, a, ctx);
       const align = encodeRequest(this.rig, batch, b, ctx, spec.targets, spec.tokens);
-      return { track, req, serial: track.serial, a, ctx, spec, align };
+      const origin = req.context ? track.frame(a).pose.root.clone() : null;
+      return { track, req, serial: track.serial, a, ctx, spec, align, origin };
     });
     for (let b = metas.length; b < BATCH; b++) encodeRequest(this.rig, batch, b, metas[0].ctx, metas[0].spec.targets, metas[0].spec.tokens); // padding
     const id = this.nextId++;
@@ -166,6 +176,7 @@ export class Scheduler {
     job.metas.forEach((m, b) => {
       if (m.track.inflight === m.req) m.track.inflight = null;
       if (m.track.serial !== m.serial) return; // superseded (hit, reset)
+      if (m.origin) { const r = m.track.frame(m.a).pose.root, dx = r.x - m.origin.x, dz = r.z - m.origin.z; if (dx || dz) for (const p of m.ctx) { p.root.x += dx; p.root.z += dz; } }
       const dec = decodeRequest(this.rig, motions, tokens, b, m.align);
       if (!dec.frames.length || !dec.frames.every(f => Number.isFinite(f.root.x) && f.rot.every(q => Number.isFinite(q.w)))) return; // degenerate output
       const fixed = correctEndpoints(this.rig, dec.frames, m.ctx[3], m.spec.targets[0], m.spec.fixEnd ?? true);
