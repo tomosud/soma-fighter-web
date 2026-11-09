@@ -1501,7 +1501,9 @@ function land(A, B, energy, dir, at, isHead, onArm = false) {
   {
     const down0 = B.hp - energy * (A.isPlayer ? settings.damage.player : settings.damage.enemy) <= 0 || energy > settings.knockdown * (B.isPlayer ? 1.4 : 1);
     const J = flat(dir).normalize().multiplyScalar(Math.min(42, Math.sqrt(2 * energy * 6))); // the momentum the blow puts in (kg m/s; capped - a 300 J counter must not explode the physics)
-    J.y = (isHead ? 0.25 : 0.1) * J.length();
+    // a felling blow lifts as it throws: the body leaves its feet AT the contact (it used to slide flat first and
+    // only then fly, which read as ice, not impact)
+    J.y = (down0 ? (isHead ? 0.5 : 0.35) : isHead ? 0.25 : 0.1) * J.length();
     jolt(B, at, J, clamp(0.35 - energy / 300, down0 ? 0.04 : 0.08, 0.3), clamp(0.3 + energy / 120, 0.3, 0.9), down0);
     jolt(A, at, J.clone().multiplyScalar(-0.18), 0.75, 0.2); // (the striker feels its own blow: contact with weight in it)
   }
@@ -1533,7 +1535,7 @@ function land(A, B, energy, dir, at, isHead, onArm = false) {
   }
   // the body is carried off at once (until the generated reaction takes over)
   // (every damaging blow: even one taken through a blow of its own sways the body back a little)
-  if (energy >= 12) B.knockFx = { t0: clock, dir: flat(dir).normalize(), v0: clamp(Math.sqrt(2 * energy / 55) * (down ? 1.7 : 0.8), 0.7, 4.3) * (armored ? 0.8 : 1), heavy: down, until: null, fade: 0.15 }; // (the carry grows with the joules all the way up: a heavy blow reads heavier, not the same)
+  if (energy >= 12) B.knockFx = { t0: clock, dir: flat(dir).normalize(), v0: clamp(Math.sqrt(2 * energy / 55) * (down ? 1.7 : 0.8), 0.7, 4.3) * (armored ? 0.8 : 1), heavy: down, start: B.P[0].clone(), until: null, fade: 0.15 }; // (the carry grows with the joules all the way up: a heavy blow reads heavier, not the same)
   if (A.attack) {
     if (A.attack.followed && !A.attack.landed && !A.attack.sweep && !A.attack.chained) A.track.request(followReq(A, 'now'));
     A.attack.landed = true;
@@ -2305,10 +2307,22 @@ function knockOn(F) {
   // used to end sharp while the generated fall was still on its way - a flight in two pieces)
   const glide = K.heavy ? 0.5 : 0.38;
   const dFor = tt => K.v0 * (0.099 * (1 - Math.exp(-tt / 0.09)) + glide * (1 - Math.exp(-tt / glide)));
+  // while the freed ragdoll is the one flying the body, the carry only BOOKKEEPS how far it got (for placing the
+  // fall); adding its own shift on top dragged the whole tripping body - the slide-then-fly read
+  if (F.state === 'fall' && F.ragOn && !F.ragFade && F.track.tag.kind !== 'down' && !K.baked && K.start) {
+    K.d = Math.max(K.d ?? 0, flat(F.rag.x[0].clone().sub(K.start)).dot(K.dir));
+    return;
+  }
   if (K.baked) {
-    // the reaction's frames carry d0 of the flight from `from` on; until the playhead gets there the body KEEPS
-    // GLIDING (it used to hang mid-air on a frozen offset over the old, standing frames), and whatever it glided
-    // beyond d0 eases out once the reaction is the motion playing
+    // a felling blow: the ragdoll flew the body and the fall's frames were placed that far along - nothing to add,
+    // only the bookkeeping while it still flies
+    if (K.heavy) {
+      if (F.state === 'fall' && F.ragOn && !F.ragFade && K.start) K.d = Math.max(K.d ?? 0, flat(F.rag.x[0].clone().sub(K.start)).dot(K.dir));
+      else F.knockFx = null;
+      return;
+    }
+    // a lighter blow: the reaction's frames carry d0 of the shove from `from` on; until the playhead gets there the
+    // body KEEPS GLIDING (it used to hang on a frozen offset over the old frames), and the glide beyond d0 eases out
     const d = dFor(clock - K.t0);
     const d0 = K.baked.d0 ??= Math.hypot(K.baked.o.x, K.baked.o.z);
     let add;
@@ -2679,7 +2693,9 @@ function ragStep(F, dt) {
   F.ragT += dt;
   const down = F.state === 'fall';
   const kicked = lying && clock - (F.groundJolt ?? -9) < 1.0;
-  R.gravity = lying || down; R.friction = lying ? (kicked ? 0.35 : 0.2) : 0;
+  const fallingNow = down && F.track.tag.kind !== 'down';
+  // going down the feet CATCH the floor while the momentum carries the body over them - a trip, not a slide on ice
+  R.gravity = lying || down; R.friction = lying ? (kicked ? 0.35 : 0.2) : fallingNow ? 0.55 : 0;
   // muscles firm up again (not while going down: the body stays loose until it lies)
   const u = down ? 0 : clamp(F.ragT / F.ragRecover, 0, 1);
   // firming muscles also damp: the body swallows the jolt and settles instead of ringing against the motion
@@ -2688,12 +2704,12 @@ function ragStep(F, dt) {
   // the trunk gives too: its muscles are far stiffer than the arms', so an even loosening left the arms flailing
   // on an upright statue - the spine takes an extra share of the blow while reeling, and firms back with the rest
   const tf = i => (RAG_TRUNK.has(R.names[i]) ? 0.45 + 0.55 * u : 1);
-  R.k = F.ragK.map((k, i) => k * (down ? Math.max(F.ragLoose, 0.25) : loose * tf(i)));
-  // going down, before the generated fall is the motion playing, the body is the PHYSICS': the root nearly free,
-  // so the blow's momentum tips and carries it (it used to be pinned to the old standing frames - a statue sliding
-  // until the fall arrived); once the fall's frames play, the muscles take the body over to them
+  // going down, before the generated fall is the motion playing, the body is the PHYSICS': the root nearly free
+  // and the muscles slack, so the blow's momentum LIFTS and tips it off its feet at the contact (pinned or firm,
+  // it slid flat on its soles first and only then flew); once the fall's frames play, the muscles take it to them
   const falling = down && F.track.tag.kind !== 'down';
-  R.rootK = kicked ? 60 + 2440 * ((clock - F.groundJolt) / 1.0) ** 2 : falling ? 150 : down || F.state === 'down' || F.state === 'getup' ? 2500 : 600 + 2400 * u;
+  R.k = F.ragK.map((k, i) => k * (falling ? Math.max(F.ragLoose, 0.13) : down ? Math.max(F.ragLoose, 0.25) : loose * tf(i)));
+  R.rootK = kicked ? 60 + 2440 * ((clock - F.groundJolt) / 1.0) ** 2 : falling ? 40 : down || F.state === 'down' || F.state === 'getup' ? 2500 : 600 + 2400 * u;
   R.resetDist = falling || down ? 3.2 : 1.5; // (a flight is SUPPOSED to leave the old frames behind: no snap back mid-air)
   const contact = F.ragFeetFree || down ? [0, 0, 0, 0] : null;
   // (the ragdoll keeps its own state: a reset, should it drift far from the motion, is not shown as a jump)
